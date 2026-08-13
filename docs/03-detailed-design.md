@@ -261,7 +261,7 @@ let options = SpeechAnalyzer.Options(
 
 → **モジュールは発話ごとに作り直す。** `prepare` が保持するのはロケール・種別・音声形式だけである。
 モデル本体は `modelRetention: .processLifetime` がプロセス内に保持するため、
-作り直しの費用はモジュール生成のみで、確定までのレイテンシには現れない（V-2 実測 62 ms）。
+作り直しの費用はモジュール生成のみで、確定までのレイテンシには現れない（V-2 実測 53〜87 ms）。
 
 **`module.results` は単一消費者しか許さない。** 2 つ目の消費者を立てると
 `attempt to await next() on more than one task` で異常終了する。
@@ -588,13 +588,13 @@ public protocol PermissionChecking: Sendable {
 | 計測 ID | 区間 | 目標 |
 |---|---|---|
 | `M1` | キー押下 → 最初のバッファ供給 | 50 ms（NFR-P1） |
-| `M2` | キー解放 → `final` 受信 | **実測 55〜63 ms**（V-2 実施済み。当初の推定値 300 ms を置き換えた） |
+| `M2` | キー解放 → `final` 受信 | **実測 53〜87 ms**（中央値 約 65 ms。V-2 実施済み。当初の推定値 300 ms を置き換えた） |
 | `M3` | `final` → 整形完了 | 500 ms（NFR-P4） |
 | `M4` | 整形完了 → 挿入完了 | 50 ms（NFR-P5） |
 | `M5` | キー解放 → 挿入完了（M2+M3+M4） | **1000 ms（NFR-P6）** |
 
 M2 の計測条件: 6 秒の日本語音声を 100 ms ごとに実時間で供給し、最後のバッファ供給から
-`.final` を受け取るまで。`DictationTranscriber` / `.progressiveShortDictation` /
+`.final` を受け取るまで（8 回計測）。`DictationTranscriber` / `.progressiveShortDictation` /
 `modelRetention: .processLifetime`（MacBook Pro M3 / macOS 26.5.2 / Xcode 26.6）。
 
 **M2 が想定の 1/5 で済んだぶん、M5 の予算 1000 ms はほぼ全て M3（LLM 整形）に充てられる。**
@@ -666,7 +666,7 @@ HUD のライブ表示（FR-2）に暫定結果が要るため、これが製品
 暫定結果を出さないプリセットなら `DictationTranscriber` は 3.7〜5.4 秒、
 `SpeechTranscriber` は 1.0〜1.4 秒で済む（要件定義書 §2.2 の数値はこちらに相当する）。
 **暫定結果は一括変換の所要を 2〜4 倍にする。** PTT の 1 発話は数秒であり、
-確定までのレイテンシは V-2 のとおり 62 ms なので、実用上の問題はない。
+確定までのレイテンシは V-2 のとおり中央値 65 ms なので、実用上の問題はない。
 
 ゴールデンテストの閾値は Dictation 10 % / Speech 15 %、一括変換は 30 秒とする。
 閾値は「桁で壊れたこと」を捕まえる線であり、性能目標そのものではない。
@@ -710,7 +710,7 @@ HUD のライブ表示（FR-2）に暫定結果が要るため、これが製品
 | ID | 内容 | 実施時期 | 結果 |
 |---|---|---|---|
 | V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 実装 §12-2 | **未完（肉声）**。合成音声のみ実施し CER 3.02 % vs 3.21 %（§11.2）。既定は `.dictation` を維持。肉声の録音が要るため保留 |
-| V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 | **完了**。55〜63 ms（推定値 300 ms を置き換え。§10） |
+| V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 | **完了**。53〜87 ms / 中央値 約 65 ms（推定値 300 ms を置き換え。§10） |
 | V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 | 未実施 |
 | V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-6 | 未実施 |
 | V-5 | DynamicNotchKit の表示先固定制御 | 実装 §12-8 | 未実施 |
