@@ -71,6 +71,10 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
 
     public var isEngineRunning: Bool { engine.isRunning }
 
+    /// タップが装着されているか（＝いま録っているか）。
+    /// `stopTap()` の後は必ず false になる。
+    public var isTapping: Bool { lock.withLock { isTapped } }
+
     /// 設定変更を処理した回数。デバイス切断の再構成が実際に走ったかの確認用。
     var reconfigurationCount: Int { lock.withLock { reconfigurations } }
 

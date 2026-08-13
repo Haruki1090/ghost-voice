@@ -153,6 +153,27 @@ struct AudioCaptureConversionTests {
         #expect(abs(Int(peak) - 16_384) < 820, "peak=\(peak)")
     }
 
+    @Test("8 kHz → 16 kHz のアップサンプリングでも失わない")
+    func upsample() {
+        // Bluetooth の HFP は 8 kHz で入ってくる。ここはレート比が 1 を超える唯一の経路で、
+        // 出力容量を「フレーム数 × レート比 + 1」で取れていないと切り詰められる。
+        #expect(totalFrames(from: source(8_000, 1), chunkFrames: 800, chunks: 10) == 16_000)
+    }
+
+    @Test("入力形式がコンバータと違うバッファは nil を返す（黙って壊れた音を通さない）")
+    func rejectsMismatchedInput() {
+        let converter = AVAudioConverter(from: source(48_000, 1), to: target)!
+        var phase = 0.0
+        // 44.1 kHz のバッファを 48 kHz 用のコンバータへ渡す。
+        // AVAudioConverter は error を立てつつ出力バッファを埋めて返すため、
+        // error を見ないと中身の壊れたバッファをそのまま下流へ流すことになる。
+        let mismatched = makeToneBuffer(format: source(44_100, 1), frames: 4_410, phase: &phase)
+        #expect(EngineAudioCapture.convert(mismatched, using: converter, to: target) == nil)
+
+        let stereo = makeToneBuffer(format: source(48_000, 2), frames: 4_800, phase: &phase)
+        #expect(EngineAudioCapture.convert(stereo, using: converter, to: target) == nil)
+    }
+
     @Test("無音を変換しても無音のまま")
     func silenceStaysSilent() {
         let format = source(48_000, 1)
@@ -203,6 +224,18 @@ struct AudioCaptureTapTests {
             capture.stopTap()
         }
         #expect(capture.isEngineRunning)
+    }
+
+    @Test("isTapping が実際の装着状態を表す")
+    func isTappingReflectsState() throws {
+        let rig = try ManualRenderingRig()
+        let capture = EngineAudioCapture(engine: rig.engine)
+        try capture.prepare()
+        #expect(!capture.isTapping)
+        _ = try capture.startTap(format: nil)
+        #expect(capture.isTapping)
+        capture.stopTap()
+        #expect(!capture.isTapping, "stopTap した後も装着中のままになっている")
     }
 
     @Test("stopTap を二重に呼んでも安全")
@@ -362,6 +395,47 @@ struct AudioCaptureTapTests {
         #expect(summary.finished)
         #expect(summary.count > 0)
         #expect(summary.frames > 9_600, "再構成の後で供給されたバッファが無い: \(summary.frames)")
+    }
+
+    @Test("設定変更でエンジンが止まっていたら、再構成で起動し直す")
+    func configurationChangeRestartsStoppedEngine() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = EngineAudioCapture(engine: rig.engine)
+        try capture.prepare()
+        let stream = try capture.startTap(format: nil)
+        try rig.render(frames: 9_600)
+
+        // 実機のデバイス切断では、通知が届く時点でエンジンは自ら停止している。
+        // 手動レンダリングでは自動では止まらないので、その状態を作ってから通知する。
+        rig.engine.stop()
+        #expect(!capture.isEngineRunning)
+
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: rig.engine)
+        await capture.waitForReconfiguration()
+
+        #expect(capture.isEngineRunning, "停止したエンジンが再起動されていない")
+        try rig.render(frames: 9_600)
+        capture.stopTap()
+
+        let summary = await summarize(stream)
+        #expect(summary.finished)
+        #expect(summary.frames > 9_600, "再起動後に供給されたバッファが無い: \(summary.frames)")
+    }
+
+    @Test("prepare を呼び直しても供給中のバッファを失わない")
+    func repeatedPrepareDoesNotDisturbCapture() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = EngineAudioCapture(engine: rig.engine)
+        try capture.prepare()
+        let stream = try capture.startTap(format: nil)
+        try rig.render(frames: 24_000)
+        try capture.prepare()          // 発話中の再 prepare
+        try rig.render(frames: 24_000)
+        capture.stopTap()
+
+        let summary = await summarize(stream)
+        #expect(summary.finished)
+        #expect(summary.frames == 48_000, "取りこぼし \(48_000 - Int(summary.frames)) フレーム")
     }
 
     @Test("タップしていないときの設定変更でもエンジンは生きたまま")
