@@ -59,6 +59,21 @@ struct HistoryStoreTests {
         }
     }
 
+    /// `historyLimit` は人が手で編集する設定ファイルから来る（詳細設計書 §9.1）うえ、
+    /// `Settings` 側に範囲の検証が無い。負数がそのまま `removeLast` へ渡ると
+    /// 「Can't remove more items from a collection than it contains」で落ち、
+    /// 発話を失ううえアプリごと巻き添えになる。
+    @Test("不正な上限でも落ちず、履歴を持たない", arguments: [0, -1])
+    func survivesNonPositiveLimit(limit: Int) throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: limit)
+            try store.append(makeEntry(raw: "落ちないこと"))
+
+            #expect(store.entries.isEmpty)
+            #expect(HistoryStore(rootURL: root, limit: 50).entries.isEmpty)
+        }
+    }
+
     @Test("保存した履歴を読み戻せる")
     func persists() throws {
         try withTempRoot { root in

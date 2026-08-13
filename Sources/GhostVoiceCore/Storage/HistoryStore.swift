@@ -17,7 +17,10 @@ public final class HistoryStore: @unchecked Sendable {
             url: rootURL.appendingPathComponent("history.json"),
             fallback: []
         )
-        self.limit = limit
+        // 上限は人が手で編集する設定ファイル由来で、負数が来ても `Settings` は弾かない。
+        // そのまま `removeLast` へ渡すと配列の要素数を超えて落ちる。履歴を書く時点では
+        // 発話がもう手元にしか無いので、ここで落ちると発話ごと失う。
+        self.limit = max(0, limit)
         self.cached = file.load()
     }
 
