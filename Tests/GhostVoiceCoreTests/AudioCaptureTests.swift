@@ -176,17 +176,6 @@ struct AudioCaptureTapTests {
     private let target = AVAudioFormat(
         commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
 
-    /// 終了済みストリームを最後まで読み、フレーム数の合計と件数を返す。
-    private func drain(_ stream: AsyncStream<AVAudioPCMBuffer>) async -> (count: Int, frames: AVAudioFrameCount) {
-        var count = 0
-        var frames: AVAudioFrameCount = 0
-        for await buffer in stream {
-            count += 1
-            frames += buffer.frameLength
-        }
-        return (count, frames)
-    }
-
     @Test("prepare を二重に呼んでも例外を出さず、エンジンが動いている")
     func prepareIsIdempotent() throws {
         let rig = try ManualRenderingRig()
@@ -244,8 +233,9 @@ struct AudioCaptureTapTests {
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 9_600)
         capture.stopTap()
-        let (count, _) = await drain(stream)
-        #expect(count > 0)
+        let summary = await summarize(stream)
+        #expect(summary.finished, "stopTap してもストリームが終わらない")
+        #expect(summary.count > 0)
     }
 
     @Test("stopTap 無しで startTap を呼び直すと、前のストリームは終了する")
@@ -256,11 +246,11 @@ struct AudioCaptureTapTests {
         let first = try capture.startTap(format: nil)
         try rig.render(frames: 9_600)
         let second = try capture.startTap(format: nil)   // stopTap を経ずに再開
-        // 前のストリームが終了していなければ、この drain は返ってこない。
-        let (count, _) = await drain(first)
-        #expect(count > 0, "前のストリームは終了した上で、供給済みのバッファを配ること")
+        let previous = await summarize(first)
+        #expect(previous.finished, "前のストリームが終了していない")
+        #expect(previous.count > 0, "前のストリームは終了した上で、供給済みのバッファを配ること")
         capture.stopTap()
-        _ = await drain(second)
+        _ = await summarize(second)
     }
 
     @Test("素通しならレンダリングしたフレームを 1 つも失わない")
@@ -271,8 +261,9 @@ struct AudioCaptureTapTests {
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 48_000)
         capture.stopTap()
-        let (_, frames) = await drain(stream)
-        #expect(frames == 48_000, "取りこぼし \(48_000 - Int(frames)) フレーム")
+        let summary = await summarize(stream)
+        #expect(summary.finished)
+        #expect(summary.frames == 48_000, "取りこぼし \(48_000 - Int(summary.frames)) フレーム")
     }
 
     @Test("変換経路でもレンダリングしたぶんを失わない（末尾の flush 込み）")
@@ -283,9 +274,10 @@ struct AudioCaptureTapTests {
         let stream = try capture.startTap(format: target)
         try rig.render(frames: 48_000)
         capture.stopTap()
-        let (_, frames) = await drain(stream)
+        let summary = await summarize(stream)
+        #expect(summary.finished)
         // 48 kHz × 48000 フレーム → 16 kHz で 16000 フレーム
-        #expect(frames == 16_000, "取りこぼし \(16_000 - Int(frames)) フレーム")
+        #expect(summary.frames == 16_000, "取りこぼし \(16_000 - Int(summary.frames)) フレーム")
     }
 
     @Test("変換したバッファは要求した形式で届く")
@@ -296,10 +288,10 @@ struct AudioCaptureTapTests {
         let stream = try capture.startTap(format: target)
         try rig.render(frames: 14_400)
         capture.stopTap()
-        var formats: Set<String> = []
-        for await buffer in stream { formats.insert("\(buffer.format)") }
-        #expect(formats.count == 1)
-        #expect(formats.first?.contains("16000") == true, "\(formats)")
+        let summary = await summarize(stream)
+        #expect(summary.finished)
+        #expect(summary.sampleRates == [16_000], "\(summary.sampleRates)")
+        #expect(summary.channelCounts == [1], "\(summary.channelCounts)")
     }
 
     @Test("素通しなら入力ノードの形式のまま届く")
@@ -310,9 +302,9 @@ struct AudioCaptureTapTests {
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 14_400)
         capture.stopTap()
-        var rates: Set<Double> = []
-        for await buffer in stream { rates.insert(buffer.format.sampleRate) }
-        #expect(rates == [48_000])
+        let summary = await summarize(stream)
+        #expect(summary.finished)
+        #expect(summary.sampleRates == [48_000])
     }
 
     @Test("level には直近バッファの RMS が流れる")
@@ -325,10 +317,9 @@ struct AudioCaptureTapTests {
         try rig.render(frames: 9_600)
         capture.stopTap()
 
-        var iterator = capture.level.makeAsyncIterator()
-        let value = await iterator.next()
+        let value = await firstValue(of: capture.level)
         // 振幅 0.5 の正弦波 → RMS ≈ 0.354
-        #expect(value != nil)
+        #expect(value != nil, "level に値が流れてこない")
         #expect(abs((value ?? 0) - 0.354) < 0.02, "level=\(value ?? -1)")
     }
 
@@ -346,8 +337,7 @@ struct AudioCaptureTapTests {
         capture.stopTap()
 
         // 溜め込んでいれば最初に取り出せるのは古い「大きい音」の RMS になる。
-        var iterator = capture.level.makeAsyncIterator()
-        let value = await iterator.next()
+        let value = await firstValue(of: capture.level)
         #expect((value ?? 1) < 0.01, "最新の無音ではなく古い値が残っている: \(value ?? -1)")
     }
 
@@ -368,9 +358,10 @@ struct AudioCaptureTapTests {
         try rig.render(frames: 9_600)
         capture.stopTap()
 
-        let (count, frames) = await drain(stream)
-        #expect(count > 0)
-        #expect(frames > 9_600, "再構成の後で供給されたバッファが無い: \(frames)")
+        let summary = await summarize(stream)
+        #expect(summary.finished)
+        #expect(summary.count > 0)
+        #expect(summary.frames > 9_600, "再構成の後で供給されたバッファが無い: \(summary.frames)")
     }
 
     @Test("タップしていないときの設定変更でもエンジンは生きたまま")

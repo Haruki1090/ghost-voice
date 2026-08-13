@@ -92,6 +92,66 @@ final class ManualRenderingRig: @unchecked Sendable {
     }
 }
 
+/// バッファ列の要約。`AVAudioPCMBuffer` を持ち出さずに済むよう、必要な数値だけ抜く。
+struct StreamSummary: Sendable {
+    var count = 0
+    var frames: AVAudioFrameCount = 0
+    var sampleRates: Set<Double> = []
+    var channelCounts: Set<AVAudioChannelCount> = []
+    /// ストリームが期限内に終了したか。**時間切れなら false。**
+    var finished = false
+}
+
+private struct UnsafeBox<T>: @unchecked Sendable { let value: T }
+
+/// バッファ列を最後まで読んで要約する。
+///
+/// **必ず期限を切ること。** 期限を切らないと、ストリームを終了し忘れる不具合が
+/// 「テストの失敗」ではなく「テストの停止」になる。ミューテーションテストで
+/// 実際に踏んだ（`finish()` を消す変異でテスト実行ごと止まった）。
+func summarize(
+    _ stream: AsyncStream<AVAudioPCMBuffer>, timeout: Duration = .seconds(5)
+) async -> StreamSummary {
+    let box = UnsafeBox(value: stream)
+    return await withTaskGroup(of: StreamSummary?.self, returning: StreamSummary.self) { group in
+        group.addTask {
+            var summary = StreamSummary()
+            for await buffer in box.value {
+                summary.count += 1
+                summary.frames += buffer.frameLength
+                summary.sampleRates.insert(buffer.format.sampleRate)
+                summary.channelCounts.insert(buffer.format.channelCount)
+            }
+            summary.finished = true
+            return summary
+        }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first ?? StreamSummary()
+    }
+}
+
+/// `stream` に最初に流れてくる値を、期限付きで待つ。届かなければ nil。
+func firstValue(of stream: AsyncStream<Float>, timeout: Duration = .seconds(5)) async -> Float? {
+    await withTaskGroup(of: Float?.self, returning: Float?.self) { group in
+        group.addTask {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
+    }
+}
+
 /// 単調増加する正弦波で満たした Float32 バッファを作る（変換テスト用）。
 func makeToneBuffer(
     format: AVAudioFormat,
