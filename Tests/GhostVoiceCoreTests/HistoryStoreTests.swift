@@ -63,11 +63,31 @@ struct HistoryStoreTests {
     /// `Settings` 側に範囲の検証が無い。負数がそのまま `removeLast` へ渡ると
     /// 「Can't remove more items from a collection than it contains」で落ち、
     /// 発話を失ううえアプリごと巻き添えになる。
-    @Test("不正な上限でも落ちず、履歴を持たない", arguments: [0, -1])
-    func survivesNonPositiveLimit(limit: Int) throws {
+    ///
+    /// 落ちないことだけでなく、**既定値で動き続けること**を固定する。0 件へ丸めると
+    /// 履歴も Undo も挿入失敗時の退避先も無言で失われ、クラッシュと同じものを
+    /// 目に見えない形で失う。
+    @Test("負の上限は既定値へフォールバックする")
+    func fallsBackToDefaultLimitForNegativeLimit() throws {
         try withTempRoot { root in
-            let store = HistoryStore(rootURL: root, limit: limit)
-            try store.append(makeEntry(raw: "落ちないこと"))
+            let store = HistoryStore(rootURL: root, limit: -1)
+            for i in 1...(Settings.default.historyLimit + 1) {
+                try store.append(makeEntry(raw: "\(i)"))
+            }
+
+            #expect(store.entries.count == Settings.default.historyLimit)
+            #expect(store.entries.first?.rawText == "\(Settings.default.historyLimit + 1)")
+            #expect(store.undoCandidate() != nil)
+        }
+    }
+
+    /// 0 は「履歴を残さない」という正当な設定（クランプ無しでも落ちない値）なので、
+    /// 既定値へ倒さずそのまま尊重する。
+    @Test("上限 0 は尊重され、履歴を持たない")
+    func respectsZeroLimit() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 0)
+            try store.append(makeEntry(raw: "残らないこと"))
 
             #expect(store.entries.isEmpty)
             #expect(HistoryStore(rootURL: root, limit: 50).entries.isEmpty)
@@ -203,6 +223,32 @@ struct HistoryStoreTests {
             let store = HistoryStore(rootURL: root, limit: 50)
             let now = Date()
             try store.append(makeEntry(refined: nil, at: now))
+
+            #expect(store.undoCandidate(now: now) == nil)
+        }
+    }
+
+    /// 下限は 0 を含むこと。挿入直後に Undo を押した場合、記録時刻と現在時刻は
+    /// ほぼ同じになる。上限側の境界テストと対になる。
+    @Test("記録時刻ちょうどの履歴は Undo 対象になる")
+    func undoCandidateAtSameInstant() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let now = Date()
+            try store.append(makeEntry(at: now))
+
+            #expect(store.undoCandidate(now: now) != nil)
+        }
+    }
+
+    /// `history.json` は手編集でき、システムクロックが巻き戻ることもある。猶予に
+    /// 下限が無いと、未来の日時を持つ履歴がいつまでも Undo 対象になり続ける。
+    @Test("未来の日時を持つ履歴は Undo 対象にならない")
+    func undoCandidateRejectsFutureTimestamp() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let now = Date()
+            try store.append(makeEntry(at: now.addingTimeInterval(60)))
 
             #expect(store.undoCandidate(now: now) == nil)
         }

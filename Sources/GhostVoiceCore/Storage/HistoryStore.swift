@@ -18,9 +18,16 @@ public final class HistoryStore: @unchecked Sendable {
             fallback: []
         )
         // 上限は人が手で編集する設定ファイル由来で、負数が来ても `Settings` は弾かない。
-        // そのまま `removeLast` へ渡すと配列の要素数を超えて落ちる。履歴を書く時点では
-        // 発話がもう手元にしか無いので、ここで落ちると発話ごと失う。
-        self.limit = max(0, limit)
+        // そのまま `removeLast` へ渡すと配列の要素数を超えて落ち、履歴を書く時点では
+        // 発話がもう手元にしか無いので、発話ごと失う。
+        //
+        // 丸め先を 0 にしないのは、0 が「履歴を残さない」という別の指示だから。負数を
+        // そこへ倒すと、打ち間違い 1 文字で履歴も Undo も挿入失敗時の退避先も無言で
+        // 消える（`undoCandidate` は `entries.first` を見るので Undo は恒久的に死ぬ）。
+        // 負数は `-1` を「無制限」と書いた可能性も含めて意図が読めないので、既定値で
+        // 動かす。0 は明示的な指示として尊重する（要素数ぴったりの `removeLast` は
+        // 落ちないので、クランプも要らない）。
+        self.limit = limit < 0 ? Settings.default.historyLimit : limit
         self.cached = file.load()
     }
 
@@ -29,6 +36,9 @@ public final class HistoryStore: @unchecked Sendable {
         lock.withLock { cached }
     }
 
+    /// - Important: ファイル I/O を同期で行う。発話終了から挿入完了まで 1 秒以内
+    ///   （要件定義書 NFR-P6）を守るため、呼び出し側は**挿入を終えたあと**に、
+    ///   クリティカルパスの外で呼ぶこと（詳細設計書 §8.2）。
     public func append(_ entry: HistoryEntry) throws {
         try lock.withLock {
             var next = cached
@@ -44,10 +54,13 @@ public final class HistoryStore: @unchecked Sendable {
     /// 直近が条件を満たさないときに 1 つ前まで遡ることはしない。Undo が戻すのは
     /// 直前に挿入した文字列であって、それ以外を書き換えるとユーザーが見ていない
     /// 箇所を壊すため。
+    ///
+    /// 猶予は下限も閉じる。`history.json` は手編集でき、システムクロックの巻き戻しも
+    /// あるので、未来の日時を許すとその履歴が恒久的に Undo 対象で居座る。
     public func undoCandidate(now: Date = Date()) -> HistoryEntry? {
         guard let latest = entries.first,
               latest.refinedText != nil,
-              now.timeIntervalSince(latest.timestamp) <= Self.undoWindow
+              (0...Self.undoWindow).contains(now.timeIntervalSince(latest.timestamp))
         else { return nil }
         return latest
     }
