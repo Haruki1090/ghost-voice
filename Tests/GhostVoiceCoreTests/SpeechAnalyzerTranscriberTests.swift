@@ -41,6 +41,19 @@ struct SpeechAnalyzerTranscriberContractTests {
         }
     }
 
+    /// `SpeechTranscriber` は 30 ロケール、`DictationTranscriber` は 54 ロケールに対応する。
+    /// `supportedLocale(equivalentTo:)` は識別子を正規化するだけで所属を見ないため、
+    /// これに頼ると非対応の組み合わせが素通りし、ロケール枠（上限 5）を 1 つ消費した上で
+    /// 不透明な失敗になる。種別ごとの対応表で弾くこと。
+    @Test("そのモジュールが対応していないロケールは localeUnsupported")
+    func rejectsLocaleUnsupportedByTheSelectedModule() async throws {
+        // nl-NL は DictationTranscriber のみ対応（SpeechTranscriber の 30 ロケールに無い）
+        let transcriber = SpeechAnalyzerTranscriber()
+        await #expect(throws: TranscriptionError.localeUnsupported("nl-NL")) {
+            try await transcriber.prepare(locale: Locale(identifier: "nl-NL"), kind: .speech)
+        }
+    }
+
     /// 種別の取り違えは CER が変わるだけで例外にならず、気付きにくい。
     @Test("種別ごとに対応するモジュールを作る")
     func makesModuleMatchingKind() {
@@ -92,6 +105,15 @@ struct SpeechAnalyzerTranscriberStreamingTests {
         let format = try #require(await transcriber.requiredAudioFormat)
         #expect(format.sampleRate == 16000)
         #expect(format.channelCount == 1)
+    }
+
+    /// `AssetInventory.status` はロケールを確保するまで、導入済みでも `.supported` を返す。
+    /// 状態確認を確保より先に置くと、導入済みの ja-JP に対してもダウンロードを要求する。
+    /// 起動のたびにモデル取得を走らせる（オフラインでは失敗する）ため、順序を固定する。
+    @Test("導入済みのモデルにダウンロードを要求しない")
+    func doesNotRequestDownloadForInstalledModel() async throws {
+        let transcriber = try await prepared()
+        #expect(await transcriber.didRequestAssetInstallation == false)
     }
 
     /// `isFinal` による振り分けを、実際の結果列で確かめる。

@@ -17,6 +17,12 @@ public actor SpeechAnalyzerTranscriber: Transcribing {
     private var audioFormat: AVAudioFormat?
     private var session: Session?
 
+    /// 直近の `prepare` がモデルのダウンロードを要求したか。
+    /// 導入済みのロケールに対して要求してしまう順序の誤りを検出するために公開する
+    /// （`AssetInventory.status` は確保前だと常に `.supported` を返すため、
+    /// 確保より先に状態を見ると導入済みでもダウンロード経路へ入る）。
+    public private(set) var didRequestAssetInstallation = false
+
     private struct Session {
         let analyzer: SpeechAnalyzer
         let continuation: AsyncStream<AnalyzerInput>.Continuation
@@ -40,7 +46,7 @@ public actor SpeechAnalyzerTranscriber: Transcribing {
         try await Self.reserve(normalized)
 
         let module = TranscriptionModule.make(locale: normalized, kind: kind)
-        try await Self.installAssetsIfNeeded(for: module)
+        didRequestAssetInstallation = try await Self.installAssetsIfNeeded(for: module)
 
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module.speechModule])
         else { throw TranscriptionError.modelUnavailable }
@@ -69,11 +75,13 @@ public actor SpeechAnalyzerTranscriber: Transcribing {
         }
     }
 
-    private static func installAssetsIfNeeded(for module: TranscriptionModule) async throws {
-        guard await AssetInventory.status(forModules: [module.speechModule]) != .installed else { return }
+    /// 戻り値はダウンロードを要求したか。導入済みなら false。
+    private static func installAssetsIfNeeded(for module: TranscriptionModule) async throws -> Bool {
+        guard await AssetInventory.status(forModules: [module.speechModule]) != .installed else { return false }
         guard let request = try await AssetInventory.assetInstallationRequest(supporting: [module.speechModule])
         else { throw TranscriptionError.modelUnavailable }
         try await request.downloadAndInstall()
+        return true
     }
 
     // MARK: - ストリーミング

@@ -32,11 +32,27 @@ enum TranscriptionModule {
     }
 
     /// 種別ごとに対応するロケール正規形（`ja-JP` → `ja_JP`）。未対応なら nil。
+    ///
+    /// `supportedLocale(equivalentTo:)` は識別子を正規化するだけで、そのモジュールが
+    /// 対応しているかを見ていない。`SpeechTranscriber` は 30 ロケールしか対応しないが、
+    /// 非対応の `nl-NL` に対しても `nl_NL` を返す（実測）。
+    /// このまま進めるとロケール枠を 1 つ消費した上で不透明な失敗になるため、
+    /// 対応表への所属を明示的に確かめる。
     static func supportedLocale(equivalentTo locale: Locale, kind: TranscriberKind) async -> Locale? {
+        let normalized: Locale?
+        let supported: [Locale]
         switch kind {
-        case .dictation: await DictationTranscriber.supportedLocale(equivalentTo: locale)
-        case .speech: await SpeechTranscriber.supportedLocale(equivalentTo: locale)
+        case .dictation:
+            normalized = await DictationTranscriber.supportedLocale(equivalentTo: locale)
+            supported = await DictationTranscriber.supportedLocales
+        case .speech:
+            normalized = await SpeechTranscriber.supportedLocale(equivalentTo: locale)
+            supported = await SpeechTranscriber.supportedLocales
         }
+        guard let normalized,
+              supported.contains(where: { $0.identifier == normalized.identifier })
+        else { return nil }
+        return normalized
     }
 
     /// 結果列を `TranscriptionUpdate` へ変換する。

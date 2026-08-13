@@ -50,6 +50,19 @@ struct CharacterErrorRateTests {
         #expect(CharacterErrorRate.compute(reference: "あいうえおかきくけこ", hypothesis: "あいうえおこ") == 0.4)
     }
 
+    /// PTT ではキー押下が発話に間に合わず、頭が丸ごと落ちることがある。
+    /// DP の行頭コストを距離 i でなく 0 にすると参照の先頭を無料で捨てられてしまい、
+    /// この最も起こりやすい誤りを 0 と評価してしまう。
+    @Test("先頭がまるごと欠けた場合も欠落として数える")
+    func leadingDeletionCounts() {
+        #expect(CharacterErrorRate.compute(reference: "あいうえおかきくけこ", hypothesis: "かきくけこ") == 0.5)
+    }
+
+    @Test("末尾がまるごと欠けた場合も欠落として数える")
+    func trailingDeletionCounts() {
+        #expect(CharacterErrorRate.compute(reference: "あいうえおかきくけこ", hypothesis: "あいうえお") == 0.5)
+    }
+
     // MARK: - 端
 
     @Test("参照も仮説も空なら 0")
