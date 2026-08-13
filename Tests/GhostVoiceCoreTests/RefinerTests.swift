@@ -432,6 +432,12 @@ struct FoundationModelRefinerDeviceTests {
     ///
     /// 命令文に読める発話は計測に入れない。逸脱した生成は長文を吐いて実測 1.3〜3.4 秒
     /// 掛かるため、混ぜると「整形に要る時間」ではなく「逸脱の発生率」を測ってしまう。
+    ///
+    /// **閾値判定は中央値に掛ける。最大値には掛けない。** レビュアーが独立に実行した際、
+    /// 1 サンプルが 0.586 秒へ跳ねた（`[0.358, 0.368, 0.586, 0.400, 0.381]`）。
+    /// 最大値で判定するとこの手の外れ値で落ちる不安定なテストになる。そのうえ落ちても
+    /// 対処のしようが無い（500ms を超えた発話は生テキストへ縮退するのが正しい振る舞い）。
+    /// 代わりに**分布を毎回出力する**。既定値の見直しは Task 10 が実機の分布で判断する。
     @Test("ウォーム後の整形が 500ms 以内")
     func warmLatency() async {
         let refiner = await warmedRefiner()
@@ -443,6 +449,11 @@ struct FoundationModelRefinerDeviceTests {
             "その、資料は明日までに送りますので、確認をお願いします",
             "えーっと、次のミーティングは水曜日の午後三時からでお願いします",
             "えー、エラーハンドリングが抜けているので、そこを直します",
+            "あの、明日の打ち合わせは十時から会議室でお願いします",
+            "えー、この件は田中さんに引き継ぎましたので、確認をお願いします",
+            "その、まあ、先月の実績は目標を少し下回りました",
+            "えーっと、契約書の草案を今週中に共有します",
+            "あの、テスト環境の準備が終わったので連絡します",
         ] {
             let start = ContinuousClock.now
             _ = await refiner.refine(raw, locale: .jaJP, terms: [], timeout: .seconds(10))
@@ -450,10 +461,12 @@ struct FoundationModelRefinerDeviceTests {
         }
 
         let sorted = samples.sorted()
+        let median = sorted[sorted.count / 2]
         print("warm refine samples: \(samples)")
-        print("warm refine median : \(sorted[sorted.count / 2])")
+        print("warm refine median : \(median)")
         print("warm refine max    : \(sorted.last!)")
+        print("warm refine 500ms 超: \(samples.filter { $0 >= .milliseconds(500) }.count)/\(samples.count)")
 
-        #expect(sorted[sorted.count / 2] < .milliseconds(500), "中央値: \(sorted[sorted.count / 2])")
+        #expect(median < .milliseconds(500), "中央値: \(median)")
     }
 }

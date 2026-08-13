@@ -60,10 +60,11 @@ public final class FoundationModelRefiner: Refining {
         return RefinementGuard.accept(output, refinementOf: raw)
     }
 
-    /// 1 リクエスト = 1 セッション。セッションはここを出た時点で誰からも参照されない。
+    /// 1 リクエスト = 1 セッション。次の発話は別のセッションを使う。
     ///
-    /// 打ち切った生成がこのセッションを掴んだまま残ることはありうるが、次の発話は
-    /// 別のセッションを使うので `concurrentRequests` にはならない。
+    /// 打ち切った生成がこのセッションを掴んだまま残ることはありうる（`withTimeout` は
+    /// 待たない）が、そのセッションは二度と参照されないので `concurrentRequests` に
+    /// はならない。
     private func generate(prompt: String, locale: Locale, timeout: Duration) async -> String? {
         let session = LanguageModelSession(
             instructions: RefinementPrompt.instructions(for: locale)
