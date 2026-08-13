@@ -314,13 +314,25 @@ for try await result in module.results {
 ### 5.1 インターフェース
 
 ```swift
-public protocol Refining: AnyObject, Sendable {
+public protocol Refining: Sendable {
+    /// LLM が使えるか。Apple Intelligence が無効な環境では false。
     var isAvailable: Bool { get }
-    func prewarm()
-    /// タイムアウト時は nil を返す（呼び出し側が生テキストへ縮退する）
-    func refine(_ raw: String, locale: Locale, timeout: Duration) async -> String?
+
+    /// モデルを事前ロードする。起動時に一度呼ぶ（§5.2 のとおり捨て推論を通すので
+    /// コールド時は数秒掛かる。投げっぱなしで呼び、発話の待ち合わせには使わない）。
+    func prewarm() async
+
+    /// 整形する。タイムアウトまたは失敗時は nil を返し、呼び出し側が生テキストへ縮退する。
+    ///
+    /// `timeout` は実時間の上限として守られる（§5.5）。
+    func refine(
+        _ raw: String, locale: Locale, terms: [VocabularyTerm], timeout: Duration
+    ) async -> String?
 }
 ```
+
+`terms` はユーザー辞書（FR-6）。`AnyObject` 制約は付けない — 実装
+（`FoundationModelRefiner`）は可変状態を持たず、テスト用の `StubRefiner` は構造体である。
 
 ### 5.2 セッション管理
 
