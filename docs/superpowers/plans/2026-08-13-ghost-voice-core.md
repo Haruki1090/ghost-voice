@@ -1630,6 +1630,15 @@ git commit -m "feat: FoundationModels による整形とタイムアウト縮退
 
 ## Task 7: マイク入力
 
+> **⚠️ 注意（Task 5 の検証で判明 / 2026-08-14）— 計画書の欠陥ではなく、実装時に踏みうる落とし穴**
+>
+> **`installTap` のブロックは、それを設置した文脈の actor 隔離を引き継ぐ。**
+> MainActor 文脈（`@main` の `main()`、SwiftUI のビュー、`@MainActor` を付けたテスト等）から設置すると、
+> 実時間オーディオスレッドで隔離チェックに失敗し **SIGTRAP で落ちる**
+> （`_swift_task_checkIsolatedSwift` → `dispatch_assert_queue_fail`）。症状は「起動直後に落ちる」だけで原因に辿り着きにくい。
+> **設置は非隔離の型の中で行うこと。** 下記の `EngineAudioCapture`（`final class`、非隔離）はこれを満たしている。
+> フェーズ 2 の HUD は MainActor なので、そこから触るときに踏みやすい。
+
 **Files:**
 - Create: `Sources/GhostVoiceCore/Audio/AudioCapturing.swift`
 - Create: `Sources/GhostVoiceCore/Audio/EngineAudioCapture.swift`
