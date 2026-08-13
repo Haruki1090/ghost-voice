@@ -57,6 +57,53 @@ struct RefinementPromptTests {
         #expect(prompt.contains("整形対象:\nネクサデータの件です"))
     }
 
+    /// 誤認識表記こそが FR-6 の「誤認識を修正させる」手段そのもの。
+    /// 「X と聞こえたら Y」という方向付きの写像で渡す（裸の候補列挙より置換範囲が狭い）。
+    @Test("誤認識表記は 誤 → 正 の向きで渡す")
+    func mapsMisheardToCanonicalDirectionally() {
+        let terms = [
+            VocabularyTerm(canonical: "Nexadata"),
+            VocabularyTerm(canonical: "microCMS", misheard: ["マイクロシーエムエス", "マイクロCMS"]),
+        ]
+        let prompt = RefinementPrompt.prompt(rawText: "発話", terms: terms)
+
+        #expect(prompt.contains("マイクロシーエムエス, マイクロCMS → microCMS"))
+        // 向きが逆でも正誤の区別が付かない並列列挙でもないこと
+        #expect(!prompt.contains("microCMS → マイクロシーエムエス"))
+        // 誤認識表記を持たない語は写像に現れない
+        #expect(!prompt.contains("→ Nexadata"))
+    }
+
+    /// 誤認識表記が 1 つも無ければ写像ブロックごと出さない。
+    /// 完全一致で固定して、空の見出しや余計な空行が紛れ込む余地を消す。
+    @Test("誤認識表記が無ければ写像ブロックを付けない")
+    func omitsCorrectionBlockWithoutMisheard() {
+        let prompt = RefinementPrompt.prompt(
+            rawText: "ネクサデータの件です",
+            terms: [VocabularyTerm(canonical: "Nexadata"), VocabularyTerm(canonical: "microCMS")]
+        )
+
+        #expect(prompt == """
+        以下の固有名詞が含まれる可能性があります。音が近い箇所はこの表記に直してください。
+        Nexadata, microCMS
+
+        整形対象:
+        ネクサデータの件です
+        """)
+    }
+
+    /// `vocabulary.json` は人が手で編集する前提のファイル。空文字の誤認識表記が
+    /// 書かれていても「 → microCMS」のような無意味な指示を LLM へ渡さないこと。
+    @Test("空白のみの誤認識表記は写像に載せない")
+    func ignoresBlankMisheardEntries() {
+        let prompt = RefinementPrompt.prompt(
+            rawText: "発話",
+            terms: [VocabularyTerm(canonical: "microCMS", misheard: ["  ", ""])]
+        )
+
+        #expect(!prompt.contains("→"))
+    }
+
     /// 辞書は毎回プロンプトへ載るのでレイテンシに直結する。
     /// 「100 語まで」を件数で数え、上限が 99 でも 150 でも落ちるようにする。
     @Test("辞書が 100 語を超えても 100 語までしか出力しない")

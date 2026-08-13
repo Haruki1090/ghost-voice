@@ -71,6 +71,11 @@ public final class AtomicJSONFile<T: Codable & Sendable>: @unchecked Sendable {
     }
 
     /// 直前の読み込みが `.unreadable` だった場合は、書く前に実ファイルを退避する。
+    ///
+    /// - Important: 退避が働くのは、この `save` より前に `load()` / `loadOutcome()` を
+    ///   呼んでいる場合だけ。退避の要否は読み込み結果から決まるので、一度も読まずに
+    ///   書いた呼び出し側は、破損ファイルを退避せずに上書きする（初期値は「退避不要」）。
+    ///   ストアは init で必ず読み込んでからキャッシュを持つ形にすること。
     public func save(_ value: T) throws {
         try lock.withLock {
             if needsQuarantine {

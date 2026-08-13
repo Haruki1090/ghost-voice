@@ -23,20 +23,44 @@ public enum RefinementPrompt {
     /// 発話ごとに組み立てるプロンプト。辞書が空なら辞書ブロックを省く。
     ///
     /// 固有名詞の精度対策はここだけが効く。`AnalysisContext.contextualStrings` は
-    /// 実測で出力を 1 文字も変えなかったため、認識側にヒントを渡す手段は無い。
+    /// 実測で出力を 1 文字も変えなかったため、認識側にヒントを渡す手段は無い（要件定義書 FR-6）。
+    ///
+    /// 誤認識表記は「誤 → 正」の**方向付きの写像**として渡す。正規表記を並べるだけだと
+    /// どの語をどう直すかの判断が LLM 側に残るが、写像なら置換の対象が名指しされる。
+    /// `misheard` はユーザーが実際に誤変換を観測して書いたものなので、候補としての精度も高い。
     public static func prompt(rawText: String, terms: [VocabularyTerm]) -> String {
         guard !terms.isEmpty else { return rawText }
 
-        let listed = terms.prefix(VocabularyStore.maxTerms)
-            .map(\.canonical)
-            .joined(separator: ", ")
+        let capped = terms.prefix(VocabularyStore.maxTerms)
 
-        return """
-        以下の固有名詞が含まれる可能性があります。音が近い箇所はこの表記に直してください。
-        \(listed)
+        var blocks = [
+            """
+            以下の固有名詞が含まれる可能性があります。音が近い箇所はこの表記に直してください。
+            \(capped.map(\.canonical).joined(separator: ", "))
+            """
+        ]
 
+        // 辞書はユーザーが手で編集する前提なので、空文字の誤認識表記が書かれうる。
+        // 「 → microCMS」のような指示先の無い写像を LLM へ渡さない。
+        let corrections = capped.compactMap { term -> String? in
+            let variants = term.misheard
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !variants.isEmpty else { return nil }
+            return "\(variants.joined(separator: ", ")) → \(term.canonical)"
+        }
+        if !corrections.isEmpty {
+            blocks.append("""
+            次の誤認識は、矢印の右の表記へ直してください。
+            \(corrections.joined(separator: "\n"))
+            """)
+        }
+
+        blocks.append("""
         整形対象:
         \(rawText)
-        """
+        """)
+
+        return blocks.joined(separator: "\n\n")
     }
 }
