@@ -438,6 +438,30 @@ struct AudioCaptureTapTests {
         #expect(summary.frames == 48_000, "取りこぼし \(48_000 - Int(summary.frames)) フレーム")
     }
 
+    @Test("startTap の武装コスト（NFR-P1 の下限値。実 HAL は回っていない）")
+    func armingCostLowerBound() throws {
+        // **これは NFR-P1 の実測値ではない。** 手動レンダリングではハードウェアの
+        // 再構成が起きないため、ここで測れるのは installTap まわりの純粋な呼び出しコスト、
+        // すなわち実機での値の「下限」だけである。実機での計測は V-9（要マイク権限）。
+        let rig = try ManualRenderingRig()
+        let capture = EngineAudioCapture(engine: rig.engine)
+        try capture.prepare()
+
+        var samples: [Double] = []
+        for _ in 0..<50 {
+            let start = ContinuousClock.now
+            _ = try capture.startTap(format: target)
+            let elapsed = ContinuousClock.now - start
+            capture.stopTap()
+            samples.append(Double(elapsed.components.attoseconds) / 1e15)   // ms
+        }
+        let sorted = samples.sorted()
+        print(String(
+            format: "startTap 武装コスト（手動レンダリング / 下限値）: 中央値 %.4f ms / 最大 %.4f ms（50 回）",
+            sorted[sorted.count / 2], sorted.last!))
+        #expect(sorted.last! < 50, "下限値ですら NFR-P1 の予算を超えている: \(sorted.last!) ms")
+    }
+
     @Test("タップしていないときの設定変更でもエンジンは生きたまま")
     func configurationChangeWhileIdle() async throws {
         let rig = try ManualRenderingRig()

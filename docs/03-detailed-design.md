@@ -123,17 +123,29 @@ let tap = CGEvent.tapCreate(
 ### 3.1 インターフェース
 
 ```swift
+public enum MicrophoneAuthorization: Sendable, Equatable {
+    case notDetermined, restricted, denied, authorized
+}
+
+public enum AudioCaptureError: Error, Equatable {
+    case notPrepared
+    case engineUnavailable
+    case microphoneAccessNotGranted(MicrophoneAuthorization)
+}
+
 public protocol AudioCapturing: AnyObject, Sendable {
     /// エンジンを起動し、常時ウォーム状態にする（アプリ起動時に一度だけ呼ぶ）
     func prepare() throws
-    /// タップを装着し、バッファの供給を開始する
-    func startTap(format: AVAudioFormat) -> AsyncStream<AVAudioPCMBuffer>
+    /// タップを装着し、バッファの供給を開始する。nil なら入力ノードの形式をそのまま流す
+    func startTap(format: AVAudioFormat?) throws -> AsyncStream<AVAudioPCMBuffer>
     /// タップを外す。エンジンは止めない
     func stopTap()
-    /// 直近バッファの RMS（HUD の音量インジケータ用）
+    /// 直近バッファの RMS（HUD の音量インジケータ用）。**消費者は 1 つに限る**
     var level: AsyncStream<Float> { get }
 }
 ```
+
+`startTap` が `throws` なのは、`prepare()` を経ずに入力ノードへ触れさせないためである（§3.3）。
 
 ### 3.2 実装上の要点
 
@@ -149,6 +161,55 @@ let format = await SpeechAnalyzer.bestAvailableAudioFormat(
 ```
 
 - デバイス切断（`AVAudioEngineConfigurationChange` 通知）を監視し、再構成する。
+  **再構成では発話中のストリームを終了させない。** ここで `finish()` すると、
+  デバイスが切り替わった瞬間に発話が丸ごと失われる。通知は CoreAudio 側のスレッドから
+  届くため、処理は自前の直列キューへ逃がす（実時間スレッドでロックを取らないため）。
+
+### 3.3 マイク権限と入力ノード（実測 / 2026-08-14）
+
+**マイク権限が `.authorized` でないプロセスで `AVAudioEngine.inputNode` に触れると、
+実測 510 秒ブロックしてから返る**（M3 / macOS 26.5.2 / バンドルされていない CLI プロセス）。
+権限は付与されないまま返るため、そのまま進めても無音を録り続けることになる。
+
+→ `prepare()` は**入力ノードへ触れる前に** `AVCaptureDevice.authorizationStatus(for: .audio)` を
+確かめ、`.authorized` でなければ `microphoneAccessNotGranted` を投げる。順序を入れ替えてはならない。
+権限の**要求**は `AudioCapture` の仕事ではなく `PermissionFlow`（§9）の仕事である。
+
+**手動レンダリング（`enableManualRenderingMode`）はハードウェアを一切開かない。**
+エンジン生成から停止まで権限状態は `notDetermined` のまま変化せず、ダイアログも出ない。
+テストはこの経路でタップの着脱・形式変換・状態遷移を実物として検証する
+（`Tests/GhostVoiceCoreTests/Support/ManualRenderingRig.swift`）。
+このとき `enableManualRenderingMode` は **`inputNode` に触れる前に**呼ぶこと。順序が逆だと上記の 510 秒を踏む。
+
+### 3.4 発話の末尾を落とさないための順序（実測）
+
+`stopTap()` は **`removeTap` → コンバータの `drain` → `finish`** の順でなければならない。
+
+| 事実 | 実測値 |
+|---|---|
+| `removeTap` は保留中の端数バッファをブロックへ一度配ってから返る | 48000 フレームを流して `removeTap` 前 43200 / 後 48000 |
+| リサンプラは内部に遅延ぶんを抱え、`.endOfStream` を通知しないと返さない | 48 kHz→16 kHz で 231 フレーム（14.4 ms）、44.1 kHz→16 kHz で 111 フレーム |
+| `AsyncStream` は `finish()` 後もバッファ済み要素を配る | 5 件 yield → finish → 5 件とも受信 |
+| `finish()` 後の `yield` は `.terminated` を返して捨てられる | 捨てられた要素は届かない |
+
+→ `finish()` を先に呼ぶと、上記 2 段ぶんの末尾がすべて捨てられる。
+
+`AVAudioConverter` の出力容量は `フレーム数 × レート比 + 1` で足りる（1〜4000 フレームで超過 0 件。
+ちょうど容量に達する n が存在するため **+1 は削れない**）。生成コストは中央値 0.013 ms（20 回）で、
+発話ごとに作り直しても NFR-P1 の予算には影響しない。
+
+### 3.5 タップのバッファ長は要求どおりにならない（実測）
+
+`installTap(bufferSize:)` は**要求値であって実際の長さではない**。手動レンダリング / 48 kHz での実測:
+
+| 要求 | 実際に届いた長さ |
+|---|---|
+| 1024 | 4800（100 ms） |
+| 4800 | 4800 |
+| 16000 | 16000 |
+
+**4800 フレーム未満は切り上げられた。** 小さく要求しておくと系が許す限り細かく届くため、
+実装は 1024 を要求している。この下限は M1（§10）の意味に直接効く。
 
 ---
 
@@ -713,6 +774,9 @@ public protocol PermissionChecking: Sendable {
 | 音声認識 | `SFSpeechRecognizer.authorizationStatus()` | `requestAuthorization(_:)` |
 | アクセシビリティ | `AXIsProcessTrusted()` | `AXIsProcessTrustedWithOptions` にプロンプト表示オプションを付与 |
 
+**マイク権限の判定は、マイクを掴む前に行うこと。** 未許可のまま `AVAudioEngine.inputNode` へ
+触れると実測 510 秒ブロックする（§3.3）。判定 API 自体はハードウェアを開かないので安全である。
+
 **アクセシビリティ権限はプログラムから付与できない。** 未付与時は設定アプリの該当ペインを開き、手順を HUD／ウィンドウで案内する（FR-10）。付与後はアプリの再起動が必要になる場合があるため、その旨も案内する。
 
 ---
@@ -723,11 +787,26 @@ public protocol PermissionChecking: Sendable {
 
 | 計測 ID | 区間 | 目標 |
 |---|---|---|
-| `M1` | キー押下 → 最初のバッファ供給 | 50 ms（NFR-P1）。うち `begin()` は**実測 1.2〜1.4 ms** |
+| `M1a` | キー押下 → **タップ武装**（取りこぼしが止まる時点） | 50 ms（NFR-P1）。うち `begin()` は**実測 1.2〜1.4 ms**。**実マイクでの実測は未実施**（V-9） |
+| `M1b` | キー押下 → 最初のバッファ**到達** | **50 ms では届かない。** タップの粒度が下限（手動レンダリング実測 100 ms / §3.5）。M5 の内訳として扱う |
 | `M2` | キー解放 → `final` 受信 | **実測 40〜177 ms**（中央値 約 70 ms / 13 回。V-2 実施済み。当初の推定値 300 ms を置き換えた） |
 | `M3` | `final` → 整形完了 | 500 ms（NFR-P4）。**実測 中央値 0.389 秒（低負荷）／ 0.461 秒（負荷下、10 件中 1 件が 500ms 超）**。余裕は薄い（下記） |
 | `M4` | 整形完了 → 挿入完了 | 50 ms（NFR-P5） |
 | `M5` | キー解放 → 挿入完了（M2+M3+M4） | **1000 ms（NFR-P6）** |
+
+### M1 を 2 つに分けた理由（Task 7 の実測）
+
+初版は M1 を「キー押下 → 最初のバッファ供給」1 本で定義していたが、**この定義では 50 ms を満たせない。**
+`installTap` のバッファ長には下限があり、48 kHz では 1024 を要求しても 4800 フレーム（100 ms）ぶきざみでしか
+届かない（§3.5）。
+
+ただし**音は失われていない。** タップ設置以降の音はすべて最初のバッファに含まれており、
+遅れるのは「配達」だけである。取りこぼしが止まる時点＝タップ武装（M1a）と、
+配達の遅れ（M1b）を分けて扱う。NFR-P1 が守るべきは M1a である。
+
+**M1b はパイプライン遅延として M5 に効く。** キー解放時点で最大 100 ms ぶんの音がタップ内に
+残っている可能性があるが、`removeTap` がそれを吐き出す（§3.4）ため、失われるのではなく
+M2 の前に積み上がる。
 
 ### M3（整形）の計測条件と外れ値
 
@@ -929,7 +1008,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 |---|---|---|
 | 1 | Package 骨格とプロトコル定義 | ビルドが通り、モック実装で単体テストが動く |
 | 2 | `TranscriptionEngine`（ファイル入力） | ゴールデンテストが通る。**V-1 / V-2 をここで実測する** |
-| 3 | `AudioCapture` + マイク入力の結合 | CLI で発話 → 標準出力へ書き起こしが出る |
+| 3 | `AudioCapture` + マイク入力の結合 | CLI で発話 → 標準出力へ書き起こしが出る。**ここで V-9 / V-10 を実測する**（マイク権限が要る） |
 | 4 | `Refiner` | 整形あり／なし、タイムアウト、Apple Intelligence 無効時の縮退が動く |
 | 5 | `TextInserter`（二段構え） | **V-3 を実施し、経路の実績を記録する** |
 | 6 | `HotkeyMonitor` | **V-4 を実施する** |
@@ -954,3 +1033,5 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-6 | `.nonactivatingPanel` がフォーカスを奪わないこと | 実装 §12-8 | 未実施 |
 | V-7 | ウォームアップ常駐時のアイドルメモリ（NFR-S3） | 実装 §12-10 | 未実施 |
 | V-8 | `SFCustomLanguageModelData` による固有名詞精度改善の可否 | LLM 整形で不足が判明した場合 | 未実施 |
+| V-9 | **実マイクでの NFR-P1**（M1a のタップ武装、M1b の初回バッファ到達、タップ長の実際値） | 実装 §12-3 | **未実施。マイク権限が要る。** 手動レンダリングでは原理的に測れない（レンダリングを自分で駆動するため）。権限が `.authorized` の環境では `AudioCapture の実マイク` スイートが自動で走る |
+| V-10 | デバイス切断（`AVAudioEngineConfigurationChange`）の実挙動 | 実機での確認時 | **未実施。** 合成通知での再構成は検証済みだが、実際のデバイス抜き差しでは通知の到達スレッド・`isRunning` の状態・タップの残存が異なりうる |
