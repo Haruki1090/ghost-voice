@@ -7,5 +7,8 @@ DerivedData/
 .swiftpm/
 .worktrees/
 .superpowers/
+# 音声だけを無視する。読み上げ原稿（live-voice.txt）は共有してよい
 Tests/Fixtures/*.aiff
-Tests/Fixtures/live-voice.*
+Tests/Fixtures/*.wav
+Tests/Fixtures/*.m4a
+Tests/Fixtures/*.caf

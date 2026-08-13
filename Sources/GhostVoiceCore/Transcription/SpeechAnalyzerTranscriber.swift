@@ -109,6 +109,12 @@ public actor SpeechAnalyzerTranscriber: Transcribing {
         return module.updates()
     }
 
+    /// 音声バッファを供給する。
+    ///
+    /// **`begin()` が返る前に来たバッファは黙って捨てられる**（セッションがまだ無いため）。
+    /// エラーにも記録にもならない。`begin()` の実測は 1.2〜1.4 ms なので通常は問題にならないが、
+    /// 呼び出し側は `begin()` の完了を待ってからタップを装着すること。
+    /// 待たずに流すと発話の頭が落ちる（PTT で最も起こりやすい失敗）。
     public func feed(_ buffer: sending AVAudioPCMBuffer) async {
         session?.continuation.yield(AnalyzerInput(buffer: buffer))
     }

@@ -83,19 +83,19 @@ struct SpeechAnalyzerTranscriberContractTests {
     }
 }
 
-/// 実際にモデルを回す経路。資産が無い環境ではスキップする。
+extension SpeechDependentTests {
+
+/// 実際にモデルを回す経路。`.serialized` は親スイートに掛かっている
+/// （スイート間の並行が確保状態を壊すため。`SpeechDependentTests` の解説を参照）。
 @Suite(
     "SpeechAnalyzerTranscriber のストリーミング",
-    .serialized,
-    .enabled("音声フィクスチャと ja-JP のモデル資産が要る") { await SpeechFixtures.isReady }
+    .enabled("音声フィクスチャが要る") { SpeechFixtures.audioExists }
 )
-struct SpeechAnalyzerTranscriberStreamingTests {
-
-    private static let ja = Locale(identifier: "ja-JP")
+struct Streaming {
 
     private func prepared() async throws -> SpeechAnalyzerTranscriber {
         let transcriber = SpeechAnalyzerTranscriber()
-        try await transcriber.prepare(locale: Self.ja, kind: .dictation)
+        try await transcriber.prepare(locale: .jaJP, kind: .dictation)
         return transcriber
     }
 
@@ -112,15 +112,17 @@ struct SpeechAnalyzerTranscriberStreamingTests {
     /// 起動のたびにモデル取得を走らせる（オフラインでは失敗する）ため、順序を固定する。
     @Test("導入済みのモデルにダウンロードを要求しない")
     func doesNotRequestDownloadForInstalledModel() async throws {
-        // 確保はプロセス内に残る。同じスイートの別テストが先に確保していると
-        // 2 回目以降は順序が誤っていても `.installed` が返り、誤りが隠れてしまう。
-        // アプリ起動直後と同じ「未確保」の状態から始める。
+        // 確保はプロセス内に残る。他のテストが先に確保していると、順序が誤っていても
+        // `.installed` が返って誤りが隠れる。アプリ起動直後と同じ「未確保」から始める。
+        //
+        // この解放はプロセス全体の状態を触るため、資産を回す他のスイートと並行しては
+        // ならない。直列化は親スイート `SpeechDependentTests` の `.serialized` が担う。
         let normalized = try #require(
-            await DictationTranscriber.supportedLocale(equivalentTo: Self.ja))
+            await DictationTranscriber.supportedLocale(equivalentTo: .jaJP))
         _ = await AssetInventory.release(reservedLocale: normalized)
 
         let transcriber = SpeechAnalyzerTranscriber()
-        try await transcriber.prepare(locale: Self.ja, kind: .dictation)
+        try await transcriber.prepare(locale: .jaJP, kind: .dictation)
         #expect(await transcriber.didRequestAssetInstallation == false)
     }
 
@@ -221,7 +223,11 @@ struct SpeechAnalyzerTranscriberStreamingTests {
     }
 
     /// V-2: キー解放（最後のバッファ供給）から確定結果を受け取るまで。
-    /// 詳細設計書 §10 の M2 は推定値 300 ms。ここで実測へ置き換える。
+    /// 詳細設計書 §10 の M2。当初の推定値 300 ms をここで実測へ置き換えた。
+    ///
+    /// **消費は `begin()` 直後に始める。** `finish()` の後に消費を始めると
+    /// 「`finish()` 復帰 ≦ `.final` 受信」が構造上保証されてしまい、
+    /// 到着時刻ではなく自分の待ち順を測ることになる。
     @Test("V-2: 最後のバッファ供給から確定までの所要")
     func measuresFinalizationLatency() async throws {
         let transcriber = try await prepared()
@@ -230,6 +236,17 @@ struct SpeechAnalyzerTranscriberStreamingTests {
             from: SpeechFixtures.audioURL, to: format, limitSeconds: 6)
 
         let stream = try await transcriber.begin()
+
+        let log = UpdateLog()
+        let consumer = Task {
+            for try await update in stream {
+                switch update {
+                case .final: await log.recordFinal(at: ContinuousClock.now)
+                case .volatile: await log.recordVolatile()
+                }
+            }
+        }
+
         // 実時間で供給する。まとめて流し込むと未処理分の消化時間まで測ってしまう。
         for buffer in buffers {
             await transcriber.feed(SpeechFixtures.detachedCopy(of: buffer))
@@ -239,15 +256,53 @@ struct SpeechAnalyzerTranscriberStreamingTests {
         let released = ContinuousClock.now
         try await transcriber.finish()
         let finishReturned = ContinuousClock.now
+        try await consumer.value          // 結果ストリームの終了まで待つ
 
-        var firstFinalAt: ContinuousClock.Instant?
-        for try await update in stream {
-            if case .final = update, firstFinalAt == nil { firstFinalAt = ContinuousClock.now }
-        }
-        let finalAt = try #require(firstFinalAt)
+        let finals = await log.finals
+        let volatiles = await log.volatileCount
+        // キー解放より前に届いた確定結果は当該発話の確定ではない（長い発話では途中で確定が出る）
+        let finalAt = try #require(finals.first { $0 >= released },
+                                   "キー解放以降に確定結果が届いていない（確定 \(finals.count) 件）")
 
-        print("V-2 finish() 復帰まで: \(finishReturned - released)")
+        print("V-2 供給した暫定 \(volatiles) 件 / 確定 \(finals.count) 件"
+              + "（うちキー解放前 \(finals.filter { $0 < released }.count) 件）")
+        print("V-2 キー解放 → finish() 復帰: \(finishReturned - released)")
         print("V-2 キー解放 → .final 受信: \(finalAt - released)")
-        #expect(finalAt - released < .seconds(1), "NFR-P3 の予算 1000 ms を超えた")
+
+        // 閾値 300 ms の根拠: 13 回の実測は 40〜177 ms（中央値 約 70 ms）。
+        // 最大値はビルドと並走した際の外れ値であり、要件（NFR-P3 200 ms）の 1.5 倍を
+        // 検査線に取る。要件そのものより緩いが、桁の異なる回帰は確実に捕まえる。
+        #expect(finalAt - released < .milliseconds(300), "NFR-P3 の予算 200 ms を大きく超えた")
     }
+
+    /// M1 の一部: `begin()` の所要（キー押下 → バッファを供給できる状態）。
+    ///
+    /// V-2 の計測窓はキー解放から開くため、`begin()` の費用は**定義上そこに現れない**。
+    /// 発話ごとにモジュールを作り直す設計（§4.3.1）の費用はここに出る。
+    /// NFR-P1（キー押下 → 録音開始 50 ms）の予算をこれと AudioCapture 側で分け合う。
+    @Test("M1: begin() の所要")
+    func measuresBeginLatency() async throws {
+        let transcriber = try await prepared()
+
+        for pass in 1...3 {
+            let start = ContinuousClock.now
+            let stream = try await transcriber.begin()
+            let elapsed = ContinuousClock.now - start
+            print("M1 begin() 所要 #\(pass): \(elapsed)")
+            #expect(elapsed < .milliseconds(50), "NFR-P1 の予算 50 ms を begin() だけで使い切った")
+
+            try await transcriber.finish()
+            for try await _ in stream {}
+        }
+    }
+}
+}
+
+/// 更新の到着時刻を実時間で記録する。計測用。
+actor UpdateLog {
+    private(set) var finals: [ContinuousClock.Instant] = []
+    private(set) var volatileCount = 0
+
+    func recordFinal(at instant: ContinuousClock.Instant) { finals.append(instant) }
+    func recordVolatile() { volatileCount += 1 }
 }

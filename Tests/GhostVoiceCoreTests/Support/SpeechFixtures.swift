@@ -31,9 +31,13 @@ enum SpeechFixtures {
     /// 実利用の精度を代表しない。録音は個人の音声データであり、リポジトリには含めない。
     ///
     /// 手順:
-    /// 1. `Tests/Fixtures/live-voice.txt` に読み上げる原稿を書く（1 分程度）
+    /// 1. `cp Tests/Fixtures/live-voice-script.example.txt Tests/Fixtures/live-voice.txt`
+    ///    （雛形は約 1 分ぶん。自分で書き換えてもよい）
     /// 2. その原稿を読み上げて `Tests/Fixtures/live-voice.aiff` として録音する
+    ///    （例: QuickTime Player の「新規オーディオ収録」→ 書き出し）
     /// 3. `swift test --filter LiveVoice` を実行する
+    ///
+    /// 音声は `.gitignore` 済み。原稿は共有してよい。
     static var liveVoiceAudioURL: URL { directory.appendingPathComponent("live-voice.aiff") }
     static var liveVoiceTextURL: URL { directory.appendingPathComponent("live-voice.txt") }
 
