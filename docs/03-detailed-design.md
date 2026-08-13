@@ -223,17 +223,24 @@ public let alternatives: [AttributedString]
 
 ```swift
 // 事前準備（アプリ起動時、およびロケール変更時）
-guard let locale = await DictationTranscriber.supportedLocale(equivalentTo: requested)
+
+// 1. 種別ごとの対応表で弾く。`supportedLocale(equivalentTo:)` は識別子を
+//    正規化するだけで対応可否を見ないため、それ単独では判定に使えない（§4.2 の注記）
+guard let locale = await TranscriptionModule.supportedLocale(equivalentTo: requested, kind: kind)
 else { throw TranscriptionError.localeUnsupported(requested.identifier) }
 
-try await AssetInventory.reserve(locale: locale)   // 上限 5 ロケール。先に呼ぶ
+// 2. 確保が先。逆順にすると status が `.supported` を返し、導入済みでもダウンロードへ入る
+try await AssetInventory.reserve(locale: locale)   // 上限 5 ロケール
 
-let module = makeModule(locale: locale, kind: kind)
-if await AssetInventory.status(forModules: [module]) != .installed {
-    if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
-        // request.progress を HUD に表示（FR-10）
-        try await request.downloadAndInstall()
-    }
+// 3. 資産の確認。`assetInstallationRequest` は非対応でも非 nil を返しうるので、
+//    nil 判定を「未対応の検出」に使ってはならない（検出は 1 で済ませてある）
+let module = TranscriptionModule.make(locale: locale, kind: kind)
+if await AssetInventory.status(forModules: [module.speechModule]) != .installed {
+    guard let request = try await AssetInventory
+        .assetInstallationRequest(supporting: [module.speechModule])
+    else { throw TranscriptionError.modelUnavailable }
+    // request.progress を HUD に表示（FR-10）
+    try await request.downloadAndInstall()
 }
 
 let options = SpeechAnalyzer.Options(
@@ -241,6 +248,9 @@ let options = SpeechAnalyzer.Options(
     modelRetention: .processLifetime      // NFR-P3。§6 のメモリ計測次第で .lingering へ
 )
 ```
+
+`AssetInventory.reserve` は `SFSpeechError` を投げる。呼び出し側が扱える型へ翻訳すること
+（code 11 → `localeReservationLimitReached` / code 15 → `localeUnsupported`）。
 
 `AssetInventory` の実測（macOS 26.5.2 / Xcode 26.6）:
 
@@ -663,10 +673,24 @@ CER はレーベンシュタイン距離 ÷ 参照文字数。句読点と空白
 
 **所要時間の注記**: 上表の所要は暫定結果（`volatileResults`）を有効にした値である。
 HUD のライブ表示（FR-2）に暫定結果が要るため、これが製品の構成である。
-暫定結果を出さないプリセットなら `DictationTranscriber` は 3.7〜5.4 秒、
-`SpeechTranscriber` は 1.0〜1.4 秒で済む（要件定義書 §2.2 の数値はこちらに相当する）。
-**暫定結果は一括変換の所要を 2〜4 倍にする。** PTT の 1 発話は数秒であり、
-確定までのレイテンシは V-2 のとおり中央値 65 ms なので、実用上の問題はない。
+**暫定結果は一括変換の所要を 2〜4 倍にする。**
+
+| モジュール / プリセット | 所要（3 回の最小〜最大） |
+|---|---|
+| `DictationTranscriber` / `.progressiveShortDictation`（製品構成） | 8.9〜15.3 秒 |
+| `DictationTranscriber` / `.progressiveLongDictation` | 9.6〜10.1 秒 |
+| `DictationTranscriber` / `.longDictation` | 3.7〜5.4 秒 |
+| `DictationTranscriber` / `.shortDictation` | 3.7〜6.2 秒（**テキストを返さない**。長尺には使えない） |
+| `SpeechTranscriber` / `.progressiveTranscription` | 1.4〜3.1 秒 |
+| `SpeechTranscriber` / `.transcription` | 1.0〜1.4 秒 |
+
+要件定義書 §2.2 の初版値（`SpeechTranscriber` 0.76〜1.73 秒 / `DictationTranscriber` 2.72〜3.07 秒）は、
+**暫定結果なしの構成に近いが一致はしていない。** `SpeechTranscriber` は `.transcription` の
+1.0〜1.4 秒と重なるが、`DictationTranscriber` の 2.72〜3.07 秒は**どの構成でも再現しなかった**
+（最も近い `.longDictation` でも最小 3.67 秒）。§2.2 は製品構成の値へ差し替え済みである。
+
+PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 のとおり中央値 65 ms なので、
+一括変換の所要は製品の体感には効かない。
 
 ゴールデンテストの閾値は Dictation 10 % / Speech 15 %、一括変換は 30 秒とする。
 閾値は「桁で壊れたこと」を捕まえる線であり、性能目標そのものではない。
