@@ -88,7 +88,7 @@ extension SpeechDependentTests {
         /// 2.72〜3.07 秒は暫定結果を出さない構成に近い値であり、暫定結果
         /// （HUD のライブ表示に必須）を有効にすると 2〜4 倍かかる。
         /// ここは「桁で壊れたこと」を捕まえる線であり、性能目標そのものではない。
-        /// PTT の実際の予算はストリーミング側の V-2（実測 53〜87 ms）で見る。
+        /// PTT の実際の予算はストリーミング側の V-2（実測 40〜177 ms / 中央値 約 70 ms）で見る。
         @Test("103 秒の音声を 30 秒以内に処理できる")
         func throughput() async throws {
             let transcriber = SpeechAnalyzerTranscriber()

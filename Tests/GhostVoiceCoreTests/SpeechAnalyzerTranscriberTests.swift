@@ -248,6 +248,10 @@ struct Streaming {
         }
 
         // 実時間で供給する。まとめて流し込むと未処理分の消化時間まで測ってしまう。
+        //
+        // ただしこの形は楽観側に寄る。最後のバッファ供給から 100 ms 待った時点を
+        // キー解放としているため、解析器に 1 バッファぶんの先行処理を許している。
+        // 実機は 10〜15 ms 程度これより大きくなる見込み（詳細設計書 §10）。
         for buffer in buffers {
             await transcriber.feed(SpeechFixtures.detachedCopy(of: buffer))
             try await Task.sleep(for: .milliseconds(100))
