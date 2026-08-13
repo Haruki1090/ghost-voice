@@ -22,6 +22,15 @@ public enum RefinementPrompt {
 
     /// 発話ごとに組み立てるプロンプト。辞書が空なら辞書ブロックを省く。
     ///
+    /// **`整形対象:` の枠は辞書の有無に関わらず必ず付ける。** 発話を裸で渡すと、
+    /// 命令文に読める発話（「この関数にエラー処理を追加したい」等）でモデルが整形ではなく
+    /// **その依頼への回答**を返す。実測（新規セッション・temperature 0・5 発話）では、
+    /// 裸で渡すと 4/5 が逸脱し、枠で包むと 1/5 に下がった。
+    ///
+    /// 枠を付けても逸脱は残る。原因は「1 ターンのユーザーメッセージとして命令文を渡せば、
+    /// `instructions` よりその場の指示が勝つことがある」という LLM 一般の性質にあり、
+    /// 枠はその寄与を減らすだけで消しはしない。**残りは `RefinementGuard` が受け止める。**
+    ///
     /// 固有名詞の精度対策はここだけが効く。`AnalysisContext.contextualStrings` は
     /// 実測で出力を 1 文字も変えなかったため、認識側にヒントを渡す手段は無い（要件定義書 FR-6）。
     ///
@@ -29,16 +38,15 @@ public enum RefinementPrompt {
     /// どの語をどう直すかの判断が LLM 側に残るが、写像なら置換の対象が名指しされる。
     /// `misheard` はユーザーが実際に誤変換を観測して書いたものなので、候補としての精度も高い。
     public static func prompt(rawText: String, terms: [VocabularyTerm]) -> String {
-        guard !terms.isEmpty else { return rawText }
-
         let capped = terms.prefix(VocabularyStore.maxTerms)
 
-        var blocks = [
-            """
+        var blocks: [String] = []
+        if !capped.isEmpty {
+            blocks.append("""
             以下の固有名詞が含まれる可能性があります。音が近い箇所はこの表記に直してください。
             \(capped.map(\.canonical).joined(separator: ", "))
-            """
-        ]
+            """)
+        }
 
         // 辞書はユーザーが手で編集する前提なので、空文字の誤認識表記が書かれうる。
         // 「 → microCMS」のような指示先の無い写像を LLM へ渡さない。

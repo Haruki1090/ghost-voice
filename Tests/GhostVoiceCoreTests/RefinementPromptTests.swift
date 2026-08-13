@@ -36,12 +36,18 @@ struct RefinementPromptTests {
         #expect(instructionLines("en-US").contains { $0.contains("入力は English です") })
     }
 
-    /// 辞書ブロックを付けないとは、余計な枠を一切足さないということ。
+    /// 省くのは辞書ブロックだけで、`整形対象:` の枠は残る。
+    ///
+    /// 枠まで落として発話を裸で渡すと、命令文に読める発話でモデルが整形ではなく
+    /// **その依頼への回答**を返す（実測で 5 発話中 4 発話が逸脱。枠を付けると 1/5）。
     /// 完全一致で固定しないと「常に何も足さない」実装でも通ってしまう
     /// （`includesCanonicalTerms` が対になって、その実装を落とす）。
-    @Test("辞書が空なら整形対象をそのまま渡す")
+    @Test("辞書が空でも整形対象の枠は付ける")
     func omitsVocabularyBlockWhenEmpty() {
-        #expect(RefinementPrompt.prompt(rawText: "テスト発話", terms: []) == "テスト発話")
+        #expect(RefinementPrompt.prompt(rawText: "テスト発話", terms: []) == """
+        整形対象:
+        テスト発話
+        """)
     }
 
     @Test("辞書があれば正規表記を列挙する")

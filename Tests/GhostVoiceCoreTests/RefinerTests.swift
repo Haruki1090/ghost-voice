@@ -3,6 +3,15 @@ import Foundation
 import FoundationModels
 @testable import GhostVoiceCore
 
+/// キャンセルを尊重しない作業。打ち切りに応じない生成を模す。
+/// `Task.sleep` はキャンセルで即座に抜けるため、待ち合わせの検証には使えない。
+private func uncancellableWork(seconds: Double, returning value: String) async -> String? {
+    await withUnsafeContinuation { (continuation: UnsafeContinuation<Void, Never>) in
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds) { continuation.resume() }
+    }
+    return value
+}
+
 @Suite("Refiner")
 struct RefinerTests {
 
@@ -51,24 +60,22 @@ struct RefinerTests {
         }
     }
 
-    /// 打ち切った生成タスクを待たずに返ると、次の発話で `LanguageModelSession` が
-    /// `concurrentRequests`（前の応答が終わる前の再呼び出し）を投げてセッションが詰まる。
-    @Test("打ち切った作業が終わるのを待ってから返る")
-    func awaitsCancelledWork() async {
-        actor Recorder {
-            var finished = false
-            func mark() { finished = true }
-        }
-        let recorder = Recorder()
-
+    /// **`timeout` は実時間の上限。** 打ち切った作業の完了を待つ実装だと、作業が
+    /// キャンセルに応じない場合に呼び出しが `timeout` を超え、その間ユーザーへの
+    /// 文字入力が止まる。実測では、待つ実装は 2.132 秒、待たない実装は 0.059 秒で返った。
+    ///
+    /// `Task.sleep` はキャンセルに応じてしまうので、この性質の検証には使えない
+    /// （待つ実装でも速く返り、区別が付かない）。応じない作業を用意している。
+    @Test("打ち切りに応じない作業でも時間内に返る")
+    func doesNotWaitForUncancellableWork() async {
+        let start = ContinuousClock.now
         let out = await withTimeout(.milliseconds(50)) {
-            try? await Task.sleep(for: .seconds(3))
-            await recorder.mark()
-            return "遅れて完了"
+            await uncancellableWork(seconds: 2, returning: "遅れて完了")
         }
+        let elapsed = ContinuousClock.now - start
 
         #expect(out == nil)
-        #expect(await recorder.finished, "打ち切った作業を待たずに返っている")
+        #expect(elapsed < .milliseconds(500), "打ち切った作業の完了を待っている: \(elapsed)")
     }
 
     @Test("時間内に終わった作業の値を withTimeout が返す")
@@ -160,6 +167,16 @@ struct RefinementGuardTests {
         let raw = String(repeating: "あ", count: 4)          // 上限は 4 + 16 = 20 字
         let output = String(repeating: "い", count: 20)
         #expect(RefinementGuard.accept(output + "\n\n\n", refinementOf: raw) == output)
+    }
+
+    /// 長さの検査だけでは、入力と同程度の短いコード片が素通りする。
+    @Test("入力と同程度の長さでもコードフェンスを含む出力は受け入れない")
+    func rejectsCodeFenceWithinLengthBudget() {
+        let raw = "えーっと、まあ、この配列をソートする関数を作りたい"  // 25 字 → 上限 41 字
+        let short = "```\narr.sort()\n```"                              // 19 字
+
+        #expect(RefinementGuard.isPlausible(short, refinementOf: raw), "長さでは落ちない前提")
+        #expect(RefinementGuard.accept(short, refinementOf: raw) == nil)
     }
 
     @Test("膨らんだ出力は受け入れない")

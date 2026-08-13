@@ -61,11 +61,11 @@ public final class FoundationModelRefiner: Refining {
     }
 
     /// 1 リクエスト = 1 セッション。セッションはここを出た時点で誰からも参照されない。
+    ///
+    /// 打ち切った生成がこのセッションを掴んだまま残ることはありうるが、次の発話は
+    /// 別のセッションを使うので `concurrentRequests` にはならない。
     private func generate(prompt: String, locale: Locale, timeout: Duration) async -> String? {
-        // `LanguageModelSession` は Sendable ではない。ここで作ったセッションは
-        // このスコープの外へ出ず、`withTimeout` が打ち切った生成の完了を待ってから
-        // 返るため、この関数を抜けた時点で触っているタスクは残っていない。
-        nonisolated(unsafe) let session = LanguageModelSession(
+        let session = LanguageModelSession(
             instructions: RefinementPrompt.instructions(for: locale)
         )
         session.prewarm()
