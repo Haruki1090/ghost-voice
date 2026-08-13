@@ -511,13 +511,44 @@ struct AudioCapturePermissionTests {
     }
 }
 
-// MARK: - 実マイク（権限がある環境でのみ走る）
+// MARK: - 実マイク（権限 + 明示的な opt-in が揃ったときだけ走る）
+
+/// 実マイクを開くテストの実行条件。
+///
+/// **権限があるだけでは走らせない。** 権限を一度付与すると、以後
+/// `swift test` を回すたびに黙ってマイクが開くことになる。ユーザーが許可したのは
+/// 「NFR-P1 の計測」であって「毎回の録音」ではないので、環境変数による明示的な
+/// opt-in を併せて要求する。
+///
+/// ```
+/// GHOST_VOICE_MIC_TESTS=1 swift test --filter "実マイク"
+/// ```
+enum MicrophoneTestGate {
+    static let variable = "GHOST_VOICE_MIC_TESTS"
+
+    static var isEnabled: Bool {
+        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            && ProcessInfo.processInfo.environment[variable] == "1"
+    }
+
+    static let reason: Comment = "実マイクを開く。マイク権限と GHOST_VOICE_MIC_TESTS=1 の両方が要る"
+}
 
 @Suite(
     "AudioCapture の実マイク", .serialized,
-    .enabled(if: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized)
+    .enabled(if: MicrophoneTestGate.isEnabled, MicrophoneTestGate.reason)
 )
 struct AudioCaptureMicrophoneTests {
+
+    /// 経過時間をミリ秒で返す。
+    private func milliseconds(_ duration: Duration) -> Double {
+        Double(duration.components.attoseconds) / 1e15
+    }
+
+    private func stats(_ samples: [Double]) -> (median: Double, min: Double, max: Double) {
+        let sorted = samples.sorted()
+        return (sorted[sorted.count / 2], sorted.first ?? 0, sorted.last ?? 0)
+    }
 
     @Test("マイクからバッファが届く")
     func receivesBuffers() async throws {
@@ -535,23 +566,74 @@ struct AudioCaptureMicrophoneTests {
         #expect(count >= 3)
     }
 
-    @Test("NFR-P1: startTap がタップを武装するまで 50 ms 以内")
+    @Test("実機の入力形式とタップ長を記録する（§3.5 の 4800 フレーム下限の検証）")
+    func actualInputFormatAndTapSize() async throws {
+        let capture = EngineAudioCapture()
+        try capture.prepare()
+        let stream = try capture.startTap(format: nil)
+
+        var lengths: [AVAudioFrameCount] = []
+        var rate: Double = 0
+        var channels: AVAudioChannelCount = 0
+        let deadline = ContinuousClock.now + .seconds(3)
+        for await buffer in stream {
+            lengths.append(buffer.frameLength)
+            rate = buffer.format.sampleRate
+            channels = buffer.format.channelCount
+            if lengths.count >= 5 || ContinuousClock.now > deadline { break }
+        }
+        capture.stopTap()
+
+        let unique = Set(lengths).sorted()
+        print("実機の入力形式: \(rate) Hz / \(channels) ch")
+        print("実機のタップ長: \(unique)（要求 \(EngineAudioCapture.tapBufferSize)）"
+              + " = \(unique.map { String(format: "%.1f ms", Double($0) / rate * 1000) })")
+        #expect(!lengths.isEmpty)
+    }
+
+    @Test("NFR-P1 / M1a: キー押下 → タップ武装")
     func armingLatency() throws {
         let capture = EngineAudioCapture()
         try capture.prepare()
 
         var samples: [Double] = []
-        for _ in 0..<20 {
+        for _ in 0..<30 {
             let start = ContinuousClock.now
             _ = try capture.startTap(format: nil)
-            let elapsed = ContinuousClock.now - start
+            samples.append(milliseconds(ContinuousClock.now - start))
             capture.stopTap()
-            samples.append(Double(elapsed.components.attoseconds) / 1e15)   // ms
         }
-        let sorted = samples.sorted()
-        let median = sorted[sorted.count / 2]
-        print(String(format: "NFR-P1 startTap 武装: 中央値 %.3f ms / 最大 %.3f ms（20 回）",
-                     median, sorted.last!))
-        #expect(sorted.last! < 50, "最大 \(sorted.last!) ms")
+        let s = stats(samples)
+        print(String(format: "M1a タップ武装: 中央値 %.4f ms / 最小 %.4f / 最大 %.4f（30 回・実 HAL）",
+                     s.median, s.min, s.max))
+        #expect(s.max < 50, "最大 \(s.max) ms")
+    }
+
+    @Test("NFR-P1 / M1b: キー押下 → 最初の実バッファ到達")
+    func firstBufferLatency() async throws {
+        let capture = EngineAudioCapture()
+        try capture.prepare()
+
+        var samples: [Double] = []
+        var frameLengths: [AVAudioFrameCount] = []
+        for _ in 0..<15 {
+            let start = ContinuousClock.now
+            let stream = try capture.startTap(format: nil)
+            var iterator = stream.makeAsyncIterator()
+            guard let first = await iterator.next() else {
+                capture.stopTap()
+                continue
+            }
+            samples.append(milliseconds(ContinuousClock.now - start))
+            frameLengths.append(first.frameLength)
+            capture.stopTap()
+        }
+        let s = stats(samples)
+        print(String(format: "M1b 最初のバッファ到達: 中央値 %.2f ms / 最小 %.2f / 最大 %.2f（%d 回・実 HAL）",
+                     s.median, s.min, s.max, samples.count))
+        print("M1b 最初のバッファのフレーム長: \(Set(frameLengths).sorted())")
+        // 到達時間はタップの粒度で決まるため、要件の 50 ms は満たせない見込み。
+        // ここでは「壊れていないこと」だけを見る（1 秒以内には来る）。
+        #expect(s.max < 1_000, "最大 \(s.max) ms")
     }
 }
