@@ -112,8 +112,57 @@ struct SpeechAnalyzerTranscriberStreamingTests {
     /// 起動のたびにモデル取得を走らせる（オフラインでは失敗する）ため、順序を固定する。
     @Test("導入済みのモデルにダウンロードを要求しない")
     func doesNotRequestDownloadForInstalledModel() async throws {
-        let transcriber = try await prepared()
+        // 確保はプロセス内に残る。同じスイートの別テストが先に確保していると
+        // 2 回目以降は順序が誤っていても `.installed` が返り、誤りが隠れてしまう。
+        // アプリ起動直後と同じ「未確保」の状態から始める。
+        let normalized = try #require(
+            await DictationTranscriber.supportedLocale(equivalentTo: Self.ja))
+        _ = await AssetInventory.release(reservedLocale: normalized)
+
+        let transcriber = SpeechAnalyzerTranscriber()
+        try await transcriber.prepare(locale: Self.ja, kind: .dictation)
         #expect(await transcriber.didRequestAssetInstallation == false)
+    }
+
+    /// ESC による中断では `finish()` を経ずに次の発話が始まる。
+    /// 前のセッションを畳まないと、その結果ストリームは終わらないまま残り、
+    /// HUD 側の消費ループが永久に待つ。
+    @Test("finish を経ずに次の発話を始めても前のストリームは終了する")
+    func abandonedSessionIsTornDown() async throws {
+        let transcriber = try await prepared()
+        let format = try #require(await transcriber.requiredAudioFormat)
+        let buffers = try SpeechFixtures.buffers(
+            from: SpeechFixtures.audioURL, to: format, limitSeconds: 2)
+
+        let abandoned = try await transcriber.begin()
+        for buffer in buffers { await transcriber.feed(SpeechFixtures.detachedCopy(of: buffer)) }
+
+        // finish() を呼ばずに次の発話へ
+        let next = try await transcriber.begin()
+
+        let ended = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do { for try await _ in abandoned {} } catch {}
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(5))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(ended, "中断された発話のストリームが終了しない")
+
+        // 次の発話は正常に完結できる
+        for buffer in buffers { await transcriber.feed(SpeechFixtures.detachedCopy(of: buffer)) }
+        try await transcriber.finish()
+        var finalText = ""
+        for try await update in next {
+            if case .final(let text) = update { finalText += text }
+        }
+        #expect(!finalText.isEmpty)
     }
 
     /// `isFinal` による振り分けを、実際の結果列で確かめる。
