@@ -193,12 +193,26 @@ func makeCapture(
 ///
 /// 「権限を確かめる**前に** `inputNode` へ触れない」——実測 510 秒ブロックを防ぐ
 /// 順序そのもの——を検査するために使う。
+///
+/// > **必ず `enableManualRenderingMode()` を通してから使うこと。**
+/// > 順序を壊す変異を当てたとき、実 HAL のままだと `prepare()` がハードウェアを掴みにいく。
+/// > **権限が `notDetermined` の機体（CI・新しい開発機）では、まさにこの finding が
+/// > 問題にした 510 秒ブロックにテスト自身が入る。** 手動レンダリングなら、
+/// > 変異下でもハードウェアに触れず「順序の表明が落ちる」だけで済む。
 final class InputNodeSpyEngine: AVAudioEngine, @unchecked Sendable {
     private(set) var didTouchInputNode = false
 
     override var inputNode: AVAudioInputNode {
         didTouchInputNode = true
         return super.inputNode
+    }
+
+    /// ハードウェアを開かない状態にする。`didTouchInputNode` は false へ戻す
+    /// （準備そのものが `inputNode` に触れても、計測対象は `prepare()` の中だけなので）。
+    func enableManualRendering() throws {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        try enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4_096)
+        didTouchInputNode = false
     }
 }
 

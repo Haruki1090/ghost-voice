@@ -438,7 +438,7 @@ struct FoundationModelRefinerDeviceTests {
     /// 最大値で判定するとこの手の外れ値で落ちる不安定なテストになる。そのうえ落ちても
     /// 対処のしようが無い（500ms を超えた発話は生テキストへ縮退するのが正しい振る舞い）。
     /// 代わりに**分布を毎回出力する**。既定値の見直しは Task 10 が実機の分布で判断する。
-    @Test("ウォーム後の整形が 500ms 以内")
+    @Test("ウォーム後の整形が壊れ検知の線を割らない（要件は NFR-P4 500ms、検査線は 750ms）")
     func warmLatency() async {
         let refiner = await warmedRefiner()
 

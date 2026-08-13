@@ -272,23 +272,24 @@ struct AudioCaptureTapTests {
         #expect(counter.count == 0)
     }
 
-    @Test("変換できなかったバッファは数として残る（黙って消さない）")
-    func dropsAreCounted() async throws {
+    /// タップ経由の**正常な**変換では捨てが起きないこと。
+    /// 捨てが起きる側は `変換に失敗したバッファは捨てた数として残る` が見ている。
+    @Test("正常な変換ではタップ経由でも捨てが計上されない")
+    func normalConversionDropsNothing() async throws {
         let rig = try ManualRenderingRig()
         let capture = makeCapture(on: rig)
         try capture.prepare()
         #expect(capture.droppedBufferCount == 0)
 
-        // 入力ノードの形式（48 kHz / 1 ch）とは食い違う形式のコンバータを使わせる。
-        // 変換は失敗し、壊れた音は下流へ流れず、代わりに数が残る。
-        let mismatched = AVAudioFormat(
+        // 入力ノード（48 kHz / 1 ch）から 16 kHz / Int16 への変換は成立する経路。
+        let target = AVAudioFormat(
             commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
-        let stream = try capture.startTap(format: mismatched)
+        let stream = try capture.startTap(format: target)
         try rig.render(frames: 24_000)
         capture.stopTap()
-        _ = await summarize(stream)
+        let summary = await summarize(stream)
 
-        // 形式が合っている経路なので、ここでは捨てが起きないことを確かめる。
+        #expect(summary.frames > 0, "そもそもバッファが届いていない")
         #expect(capture.droppedBufferCount == 0, "正常な変換で捨てが計上されている")
     }
 
@@ -550,8 +551,13 @@ struct AudioCapturePermissionTests {
     /// 510 秒ブロックを防いでいるのは「権限判定が `inputNode` より前にある」ことだけである。
     /// 判定の**有無**ではなく**順序**を直接固定する。
     @Test("未許可のとき prepare は inputNode に一度も触れない（510 秒ブロックの防止）")
-    func doesNotTouchInputNodeWhenUnauthorized() {
+    func doesNotTouchInputNodeWhenUnauthorized() throws {
         let spy = InputNodeSpyEngine()
+        // 手動レンダリングにしておく。順序を壊す変異を当てたときでも、
+        // このテスト自身がハードウェアを掴んで 510 秒止まらないようにするため。
+        try spy.enableManualRendering()
+        #expect(spy.isInManualRenderingMode,
+                "手動レンダリングになっていない。順序を壊す変異の下でこのテストが 510 秒止まる")
         let capture = EngineAudioCapture(engine: spy, authorization: { .denied })
         #expect(throws: AudioCaptureError.microphoneAccessNotGranted(.denied)) {
             try capture.prepare()

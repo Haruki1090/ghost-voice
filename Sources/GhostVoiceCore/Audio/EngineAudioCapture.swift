@@ -3,18 +3,6 @@ import AVFoundation
 import Foundation
 import Synchronization
 
-/// `AVAudioEngine` を常時起動したまま、タップの着脱だけで録音を開始・停止する実装。
-///
-/// ## 設計の要点
-///
-/// - エンジンは `prepare()` で `start()` まで済ませ、以後停止しない（NFR-P1）。
-///   録音のたびに起動すると数十 ms を失う。
-/// - **この型は隔離されていない（`final class`）。** `installTap` のブロックは設置した
-///   文脈の actor 隔離を引き継ぐため、MainActor から設置すると実時間オーディオスレッドで
-///   隔離チェックに失敗し SIGTRAP で落ちる。設置は必ずこの型の中で行うこと。
-/// - **タップのブロックはロックを取らない。** `removeTap` は実時間スレッドと同期するため、
-///   ブロック側でも同じロックを取ると優先度逆転を招く。ブロックは値でキャプチャした
-///   継続とコンバータだけを触る。
 /// 実時間スレッドから増やせる破棄カウンタ。
 ///
 /// タップのブロックはロックを取ってはならないため、`Atomic` で数える。
@@ -47,6 +35,18 @@ struct BufferDelivery: @unchecked Sendable {
     }
 }
 
+/// `AVAudioEngine` を常時起動したまま、タップの着脱だけで録音を開始・停止する実装。
+///
+/// ## 設計の要点
+///
+/// - エンジンは `prepare()` で `start()` まで済ませ、以後停止しない（NFR-P1）。
+///   録音のたびに起動すると数十 ms を失う。
+/// - **この型は隔離されていない（`final class`）。** `installTap` のブロックは設置した
+///   文脈の actor 隔離を引き継ぐため、MainActor から設置すると実時間オーディオスレッドで
+///   隔離チェックに失敗し SIGTRAP で落ちる。設置は必ずこの型の中で行うこと。
+/// - **タップのブロックはロックを取らない。** `removeTap` は実時間スレッドと同期するため、
+///   ブロック側でも同じロックを取ると優先度逆転を招く。ブロックは値でキャプチャした
+///   継続とコンバータだけを触る。
 public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
 
     /// タップへ要求するバッファ長。
@@ -138,6 +138,10 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
     /// 入力形式がコンバータと食い違うと `convert` は nil を返す（壊れた音を下流へ流さないため）。
     /// デバイス切り替え直後の短い窓——設定変更の通知が直列キューを経由する間に、
     /// 旧タップが新しい形式のバッファを配る——で現実に起こりうる。
+    ///
+    /// - Important: **このインスタンスの生涯にわたる累計であり、発話ごとにはリセットされない。**
+    ///   `startTap` / `stopTap` でも 0 に戻らない。発話単位の値が要るなら、
+    ///   `startTap` の前後で読んで**差分を取ること**（Task 10 の計測はこれに当たる）。
     public var droppedBufferCount: Int { dropped.count }
 
     /// 設定変更を処理した回数。デバイス切断の再構成が実際に走ったかの確認用。
