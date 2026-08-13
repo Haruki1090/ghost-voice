@@ -5,3 +5,5 @@ xcuserdata/
 DerivedData/
 *.xcodeproj/project.xcworkspace/xcuserdata/
 .swiftpm/
+.worktrees/
+.superpowers/
