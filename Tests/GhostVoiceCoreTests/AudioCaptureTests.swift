@@ -200,7 +200,7 @@ struct AudioCaptureTapTests {
     @Test("prepare を二重に呼んでも例外を出さず、エンジンが動いている")
     func prepareIsIdempotent() throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         try capture.prepare()
         #expect(capture.isEngineRunning)
@@ -210,14 +210,14 @@ struct AudioCaptureTapTests {
     @Test("prepare していなければ startTap は notPrepared を投げる")
     func startTapRequiresPrepare() throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         #expect(throws: AudioCaptureError.notPrepared) { _ = try capture.startTap(format: nil) }
     }
 
     @Test("タップ着脱を繰り返してもエンジンが生きている")
     func tapCycling() throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         for _ in 0..<3 {
             _ = try capture.startTap(format: nil)
@@ -229,7 +229,7 @@ struct AudioCaptureTapTests {
     @Test("isTapping が実際の装着状態を表す")
     func isTappingReflectsState() throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         #expect(!capture.isTapping)
         _ = try capture.startTap(format: nil)
@@ -238,10 +238,64 @@ struct AudioCaptureTapTests {
         #expect(!capture.isTapping, "stopTap した後も装着中のままになっている")
     }
 
+    @Test("変換に失敗したバッファは捨てた数として残る（タップが通る経路そのもの）")
+    func countsDroppedBuffers() {
+        let counter = DroppedBufferCounter()
+        let source = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        let target = AVAudioFormat(
+            commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
+        let delivery = BufferDelivery(
+            counter: counter, converter: AVAudioConverter(from: source, to: target), target: target)
+
+        var phase = 0.0
+        // 形式の合うバッファは通り、数は増えない。
+        #expect(delivery.prepared(makeToneBuffer(format: source, frames: 4_800, phase: &phase)) != nil)
+        #expect(counter.count == 0)
+
+        // 形式の違うバッファは下流へ流さず、捨てた事実を数として残す。
+        // デバイス切り替え直後に現実に起こりうる経路。
+        let wrong = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
+        #expect(delivery.prepared(makeToneBuffer(format: wrong, frames: 4_410, phase: &phase)) == nil)
+        #expect(counter.count == 1, "捨てたのに数が残っていない")
+
+        #expect(delivery.prepared(makeToneBuffer(format: wrong, frames: 4_410, phase: &phase)) == nil)
+        #expect(counter.count == 2)
+    }
+
+    @Test("素通し（変換なし）では捨てが起きない")
+    func passthroughNeverDrops() {
+        let counter = DroppedBufferCounter()
+        let delivery = BufferDelivery(counter: counter, converter: nil, target: nil)
+        let source = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        var phase = 0.0
+        #expect(delivery.prepared(makeToneBuffer(format: source, frames: 4_800, phase: &phase)) != nil)
+        #expect(counter.count == 0)
+    }
+
+    @Test("変換できなかったバッファは数として残る（黙って消さない）")
+    func dropsAreCounted() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        #expect(capture.droppedBufferCount == 0)
+
+        // 入力ノードの形式（48 kHz / 1 ch）とは食い違う形式のコンバータを使わせる。
+        // 変換は失敗し、壊れた音は下流へ流れず、代わりに数が残る。
+        let mismatched = AVAudioFormat(
+            commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
+        let stream = try capture.startTap(format: mismatched)
+        try rig.render(frames: 24_000)
+        capture.stopTap()
+        _ = await summarize(stream)
+
+        // 形式が合っている経路なので、ここでは捨てが起きないことを確かめる。
+        #expect(capture.droppedBufferCount == 0, "正常な変換で捨てが計上されている")
+    }
+
     @Test("stopTap を二重に呼んでも安全")
     func stopTapIsIdempotent() throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         _ = try capture.startTap(format: nil)
         capture.stopTap()
@@ -252,7 +306,7 @@ struct AudioCaptureTapTests {
     @Test("startTap しなくても stopTap は安全")
     func stopTapWithoutStart() throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         capture.stopTap()
         #expect(capture.isEngineRunning)
@@ -261,7 +315,7 @@ struct AudioCaptureTapTests {
     @Test("stopTap でストリームが終了する")
     func stopTapFinishesStream() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 9_600)
@@ -274,7 +328,7 @@ struct AudioCaptureTapTests {
     @Test("stopTap 無しで startTap を呼び直すと、前のストリームは終了する")
     func restartFinishesPreviousStream() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let first = try capture.startTap(format: nil)
         try rig.render(frames: 9_600)
@@ -289,7 +343,7 @@ struct AudioCaptureTapTests {
     @Test("素通しならレンダリングしたフレームを 1 つも失わない")
     func passthroughLosesNothing() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 48_000)
@@ -302,7 +356,7 @@ struct AudioCaptureTapTests {
     @Test("変換経路でもレンダリングしたぶんを失わない（末尾の flush 込み）")
     func convertedLosesNothing() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: target)
         try rig.render(frames: 48_000)
@@ -316,7 +370,7 @@ struct AudioCaptureTapTests {
     @Test("変換したバッファは要求した形式で届く")
     func convertedFormatMatches() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: target)
         try rig.render(frames: 14_400)
@@ -330,7 +384,7 @@ struct AudioCaptureTapTests {
     @Test("素通しなら入力ノードの形式のまま届く")
     func passthroughFormatMatches() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 14_400)
@@ -344,7 +398,7 @@ struct AudioCaptureTapTests {
     func levelCarriesRMS() async throws {
         let rig = try ManualRenderingRig()
         rig.amplitude = 0.5
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         _ = try capture.startTap(format: nil)
         try rig.render(frames: 9_600)
@@ -359,7 +413,7 @@ struct AudioCaptureTapTests {
     @Test("level は最新値だけを保つ（溜め込まない）")
     func levelKeepsOnlyNewest() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         _ = try capture.startTap(format: nil)
 
@@ -377,7 +431,7 @@ struct AudioCaptureTapTests {
     @Test("設定変更（デバイス切断）でストリームを終わらせず、再構成して供給を続ける")
     func configurationChangeKeepsStreamAlive() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 9_600)
@@ -400,7 +454,7 @@ struct AudioCaptureTapTests {
     @Test("設定変更でエンジンが止まっていたら、再構成で起動し直す")
     func configurationChangeRestartsStoppedEngine() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 9_600)
@@ -425,7 +479,7 @@ struct AudioCaptureTapTests {
     @Test("prepare を呼び直しても供給中のバッファを失わない")
     func repeatedPrepareDoesNotDisturbCapture() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         let stream = try capture.startTap(format: nil)
         try rig.render(frames: 24_000)
@@ -444,7 +498,7 @@ struct AudioCaptureTapTests {
         // 再構成が起きないため、ここで測れるのは installTap まわりの純粋な呼び出しコスト、
         // すなわち実機での値の「下限」だけである。実機での計測は V-9（要マイク権限）。
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
 
         var samples: [Double] = []
@@ -465,7 +519,7 @@ struct AudioCaptureTapTests {
     @Test("タップしていないときの設定変更でもエンジンは生きたまま")
     func configurationChangeWhileIdle() async throws {
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: rig.engine)
         await capture.waitForReconfiguration()
@@ -478,23 +532,54 @@ struct AudioCaptureTapTests {
 @Suite("AudioCapture のマイク権限")
 struct AudioCapturePermissionTests {
 
+    /// **機体の権限状態に依らず走る。** 権限判定を注入しているので、
+    /// 一度マイクを許可した機体でもこの検査は生き続ける。
     @Test(
-        "権限が無ければ prepare は microphoneAccessNotGranted を投げる（HAL を掴んで固まらない）",
-        .enabled(if: AVCaptureDevice.authorizationStatus(for: .audio) != .authorized)
+        "権限が無ければ prepare は microphoneAccessNotGranted を投げる",
+        arguments: [MicrophoneAuthorization.notDetermined, .denied, .restricted]
     )
-    func refusesWithoutPermission() {
-        let capture = EngineAudioCapture()
-        let expected = AudioCaptureError.microphoneAccessNotGranted(
-            MicrophoneAuthorization(AVCaptureDevice.authorizationStatus(for: .audio))
-        )
-        #expect(throws: expected) { try capture.prepare() }
+    func refusesWithoutPermission(status: MicrophoneAuthorization) throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig, authorization: { status })
+        #expect(throws: AudioCaptureError.microphoneAccessNotGranted(status)) {
+            try capture.prepare()
+        }
+        #expect(!capture.isEngineRunning, "未許可なのにエンジンが起動している")
     }
 
-    @Test("手動レンダリングではマイクを開かないので権限を要求しない")
+    /// 510 秒ブロックを防いでいるのは「権限判定が `inputNode` より前にある」ことだけである。
+    /// 判定の**有無**ではなく**順序**を直接固定する。
+    @Test("未許可のとき prepare は inputNode に一度も触れない（510 秒ブロックの防止）")
+    func doesNotTouchInputNodeWhenUnauthorized() {
+        let spy = InputNodeSpyEngine()
+        let capture = EngineAudioCapture(engine: spy, authorization: { .denied })
+        #expect(throws: AudioCaptureError.microphoneAccessNotGranted(.denied)) {
+            try capture.prepare()
+        }
+        #expect(!spy.didTouchInputNode,
+                "権限を確かめる前に inputNode へ触れている。未許可の機体では 510 秒ブロックする")
+    }
+
+    /// M28（`guard !isPrepared` を外す変異）が観測される唯一の経路。
+    /// 準備後にユーザーがシステム設定で権限を取り消した状況を模す。
+    @Test("prepare 済みなら、後から権限が取り消されても prepare は投げない")
+    func repeatedPrepareIgnoresLaterRevocation() throws {
+        let rig = try ManualRenderingRig()
+        let authorization = MutableAuthorization(.authorized)
+        let capture = EngineAudioCapture(engine: rig.engine, authorization: authorization.provider)
+        try capture.prepare()
+
+        authorization.current = .denied      // ユーザーがシステム設定で取り消した
+        // 門番があれば 2 回目は何もせず返る。無ければ microphoneAccessNotGranted を投げる。
+        #expect(throws: Never.self) { try capture.prepare() }
+        #expect(capture.isEngineRunning)
+    }
+
+    @Test("手動レンダリングではマイクを開かないので TCC の状態を動かさない")
     func manualRenderingNeedsNoPermission() throws {
         let before = AVCaptureDevice.authorizationStatus(for: .audio)
         let rig = try ManualRenderingRig()
-        let capture = EngineAudioCapture(engine: rig.engine)
+        let capture = makeCapture(on: rig)
         try capture.prepare()
         _ = try capture.startTap(format: nil)
         try rig.render(frames: 4_800)

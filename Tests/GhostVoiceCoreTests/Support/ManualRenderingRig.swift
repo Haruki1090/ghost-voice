@@ -1,6 +1,8 @@
 import AVFAudio
 import Foundation
 
+@testable import GhostVoiceCore
+
 /// マイクを開かずに `AVAudioEngine` の入力ノードを本物として動かすための治具。
 ///
 /// `enableManualRenderingMode(.offline:)` を有効にした上で
@@ -173,4 +175,48 @@ func makeToneBuffer(
         if channel == Int(format.channelCount) - 1 { phase = local }
     }
     return buffer
+}
+
+
+/// 手動レンダリングの治具に対する `EngineAudioCapture` を作る。
+///
+/// **権限判定は注入する。** 手動レンダリングはマイクを開かないので、
+/// 機体の実際の TCC 状態とは無関係に `.authorized` として扱ってよい。
+func makeCapture(
+    on rig: ManualRenderingRig,
+    authorization: @escaping @Sendable () -> MicrophoneAuthorization = { .authorized }
+) -> EngineAudioCapture {
+    EngineAudioCapture(engine: rig.engine, authorization: authorization)
+}
+
+/// `inputNode` に触れたかどうかを記録するエンジン。
+///
+/// 「権限を確かめる**前に** `inputNode` へ触れない」——実測 510 秒ブロックを防ぐ
+/// 順序そのもの——を検査するために使う。
+final class InputNodeSpyEngine: AVAudioEngine, @unchecked Sendable {
+    private(set) var didTouchInputNode = false
+
+    override var inputNode: AVAudioInputNode {
+        didTouchInputNode = true
+        return super.inputNode
+    }
+}
+
+
+/// 実行中に権限状態を切り替えられる注入元。
+/// 「準備後にユーザーがシステム設定で取り消した」状況を作るために使う。
+final class MutableAuthorization: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: MicrophoneAuthorization
+
+    init(_ value: MicrophoneAuthorization) { self.value = value }
+
+    var current: MicrophoneAuthorization {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+    }
+
+    var provider: @Sendable () -> MicrophoneAuthorization {
+        { [self] in current }
+    }
 }
