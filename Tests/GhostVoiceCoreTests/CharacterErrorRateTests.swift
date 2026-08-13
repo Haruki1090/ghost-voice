@@ -90,8 +90,13 @@ struct CharacterErrorRateTests {
 
     // MARK: - 正規化
 
-    /// 句読点の有無は精度の本質ではない。`DictationTranscriber` は句読点を
-    /// 補って出力するため、正規化しないと補うほど CER が上がってしまう。
+    /// 句読点を無視するのは、認識器が付けた句読点が LLM 整形（FR-5）で
+    /// 書き換えられ、製品の出力品質に効かないためである。
+    ///
+    /// **「句読点の差は精度の本質ではない」からではない。** 実測では句読点を
+    /// 残すか除くかで 2 モジュールの優劣が逆転する（`CharacterErrorRate` の
+    /// doc コメントと詳細設計書 §11.2）。無視してよい差ではなく、
+    /// 「後段で直せる差」だからこの物差しの対象外にしている。
     @Test("句読点の差は無視する")
     func ignoresPunctuation() {
         #expect(CharacterErrorRate.compute(
