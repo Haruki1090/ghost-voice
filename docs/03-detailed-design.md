@@ -23,9 +23,9 @@ ghost-voice/
 │   │   ├── AudioCapturing.swift       プロトコル
 │   │   └── EngineAudioCapture.swift   AVAudioEngine 実装
 │   ├── Transcription/
-│   │   ├── Transcribing.swift         プロトコル
+│   │   ├── Transcribing.swift         プロトコルと TranscriptionError
 │   │   ├── SpeechAnalyzerTranscriber.swift
-│   │   └── TranscriptionModel.swift   モジュール種別とロケール
+│   │   └── TranscriptionModule.swift  2 モジュールの列挙・生成・結果変換
 │   ├── Refinement/
 │   │   ├── Refining.swift             プロトコル
 │   │   ├── FoundationModelRefiner.swift
@@ -42,9 +42,11 @@ ghost-voice/
 │   └── Support/
 │       ├── Permissions.swift
 │       └── Metrics.swift              性能計測点
-├── Tests/GhostVoiceCoreTests/
-│   ├── Fixtures/                      ゴールデンテスト用音声
-│   └── ...
+├── Tests/
+│   ├── Fixtures/                      ゴールデンテスト用の原稿と音声（音声は非コミット）
+│   └── GhostVoiceCoreTests/
+│       ├── Support/                   CER・フィクスチャ読み込み
+│       └── ...
 ├── App/GhostVoice/                    Xcode プロジェクト
 │   ├── GhostVoiceApp.swift
 │   ├── DictationSession.swift
@@ -155,19 +157,30 @@ let format = await SpeechAnalyzer.bestAvailableAudioFormat(
 ### 4.1 インターフェース
 
 ```swift
-public enum TranscriptionUpdate: Sendable {
+public enum TranscriptionUpdate: Sendable, Equatable {
     case volatile(String)   // 暫定結果。HUD 表示用
     case final(String)      // 確定結果
 }
 
 public protocol Transcribing: AnyObject, Sendable {
-    func prepare(locale: Locale) async throws
+    func prepare(locale: Locale, kind: TranscriberKind) async throws
     func begin() async throws -> AsyncThrowingStream<TranscriptionUpdate, Error>
-    func feed(_ buffer: AVAudioPCMBuffer) async
+    func feed(_ buffer: sending AVAudioPCMBuffer) async
     func finish() async throws
     var requiredAudioFormat: AVAudioFormat? { get async }
 }
+
+public enum TranscriptionError: Error, Equatable {
+    case notPrepared
+    case localeUnsupported(String)
+    case modelUnavailable
+    case localeReservationLimitReached
+}
 ```
+
+`AVAudioPCMBuffer` は `Sendable` ではない。実装をアクターにする以上、`feed` の引数は
+`sending` で所有権を渡す必要がある（Swift 6 の厳格な並行性検査）。実運用では
+AudioCapture がタップごとに新しいバッファを作るため、この制約は自然に満たされる。
 
 ### 4.2 モジュール選択
 
@@ -180,50 +193,88 @@ public protocol Transcribing: AnyObject, Sendable {
 
 `.progressiveShortDictation` を既定とする理由: PTT による 1 回の発話は数秒程度の短文であり、かつ暫定結果（volatile results）が HUD のライブ表示（FR-2）に必要なためである。
 
-両者の `Result` 型は異なるが、いずれも `SpeechModuleResult` に準拠し、以下を共通で持つ。
+両者の `Result` 型は異なる。`text` と `alternatives` は**各々の `Result` 型が持つもので、
+プロトコル `SpeechModuleResult` は公開していない。**
 
 ```swift
-public let range: CMTimeRange
-public let resultsFinalizationTime: CMTime
+// SpeechModuleResult が要求するのはこの 2 つだけ
+public var range: CMTimeRange { get }
+public var resultsFinalizationTime: CMTime { get }
+// extension が提供
+public var isFinal: Bool { get }
+
+// text / alternatives は DictationTranscriber.Result と SpeechTranscriber.Result が各々持つ
 public var text: AttributedString { get }
 public let alternatives: [AttributedString]
-// SpeechModuleResult の extension が提供
-public var isFinal: Bool { get }
 ```
 
-→ **`isFinal` により `volatile` / `final` を判別する。** 内部で `any SpeechModule` として保持し、`Result` の差異はこの共通部分のみを使うことで吸収する。
+→ **`any SpeechModule` として保持するとテキストが取り出せない。** 2 種類を列挙型
+（`TranscriptionModule`）で保持し、種別の取りこぼしをコンパイラに検出させる。
+`text` / `isFinal` を要求する内部プロトコルを両 `Result` 型に後付けし、
+結果列の変換だけをジェネリックにまとめる。
+
+→ **`isFinal` により `volatile` / `final` を判別する。**
 
 ### 4.3 セッション構築
 
+**確保（`reserve`）が資産確認（`status`）より先である。** `AssetInventory.status` は
+未確保のロケールに対して、モデルが導入済みでも `.supported` を返す（実測）。
+順序を逆にすると、導入済みの ja-JP に対してもダウンロードを試みることになる。
+
 ```swift
 // 事前準備（アプリ起動時、およびロケール変更時）
-let module = makeModule(locale: locale, kind: kind)
+guard let locale = await DictationTranscriber.supportedLocale(equivalentTo: requested)
+else { throw TranscriptionError.localeUnsupported(requested.identifier) }
 
+try await AssetInventory.reserve(locale: locale)   // 上限 5 ロケール。先に呼ぶ
+
+let module = makeModule(locale: locale, kind: kind)
 if await AssetInventory.status(forModules: [module]) != .installed {
     if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
         // request.progress を HUD に表示（FR-10）
         try await request.downloadAndInstall()
     }
 }
-try await AssetInventory.reserve(locale: locale)   // 上限 5 ロケール
 
 let options = SpeechAnalyzer.Options(
     priority: .userInitiated,
     modelRetention: .processLifetime      // NFR-P3。§6 のメモリ計測次第で .lingering へ
 )
-
-let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
-let analyzer = SpeechAnalyzer(inputSequence: stream, modules: [module], options: options)
-try await analyzer.prepareToAnalyze(in: audioFormat)
 ```
+
+`AssetInventory` の実測（macOS 26.5.2 / Xcode 26.6）:
+
+| 事実 | 内容 |
+|---|---|
+| `status` の意味 | 未確保なら常に `.supported`。確保後に `.installed` / `.supported`（＝要ダウンロード）へ分かれる |
+| `reserve` の冪等性 | 同一ロケールの 2 回目以降は `false` を返すだけで、枠を消費しない |
+| 確保の寿命 | プロセス内のみ。プロセスをまたいで残らない |
+| 未対応ロケール | `reserve` が `SFSpeechError` code 15 を投げる。`assetInstallationRequest` も同じく投げるため、nil 判定では捕まらない |
+| 上限超過 | `SFSpeechError` code 11。→ `TranscriptionError.localeReservationLimitReached` へ翻訳する |
+| `release(reservedLocale:)` | **正規形（`ja_JP`）でしか成功しない。** `ja-JP` を渡すと `false` を返して何もしない |
+
+### 4.3.1 モジュールの寿命（重要）
+
+**`SpeechModule` のインスタンスは、1 つの `SpeechAnalyzer` にしか装着できない。**
+2 つ目の `SpeechAnalyzer` へ同じインスタンスを渡すと、
+`SpeechAnalyzer.setWorkers(for:reusingFrom:preservingFunctionOf:)` の内部で異常終了する（実測）。
+
+→ **モジュールは発話ごとに作り直す。** `prepare` が保持するのはロケール・種別・音声形式だけである。
+モデル本体は `modelRetention: .processLifetime` がプロセス内に保持するため、
+作り直しの費用はモジュール生成のみで、確定までのレイテンシには現れない（V-2 実測 62 ms）。
+
+**`module.results` は単一消費者しか許さない。** 2 つ目の消費者を立てると
+`attempt to await next() on more than one task` で異常終了する。
+1 モジュールにつき結果列の消費は 1 箇所に限ること。
 
 ### 4.4 発話ごとのライフサイクル
 
 | タイミング | 処理 |
 |---|---|
-| キー押下 | `analyzer.start(inputSequence:)`（`prepareToAnalyze` 済みのため即座に開始） |
+| キー押下 | モジュールを生成 → `SpeechAnalyzer(inputSequence:)` → `prepareToAnalyze(in:)` |
 | 発話中 | `continuation.yield(AnalyzerInput(buffer: buffer))` |
 | キー解放 | `continuation.finish()` → `try await analyzer.finalizeAndFinishThroughEndOfInput()` |
+| 中断（ESC） | `continuation.finish()` → `await analyzer.cancelAndFinishNow()` |
 
 結果の受信は別 Task で行い、`isFinal` により振り分ける。
 
@@ -537,10 +588,16 @@ public protocol PermissionChecking: Sendable {
 | 計測 ID | 区間 | 目標 |
 |---|---|---|
 | `M1` | キー押下 → 最初のバッファ供給 | 50 ms（NFR-P1） |
-| `M2` | キー解放 → `final` 受信 | 300 ms（NFR-P3 / **V-2 で実測**） |
+| `M2` | キー解放 → `final` 受信 | **実測 55〜63 ms**（V-2 実施済み。当初の推定値 300 ms を置き換えた） |
 | `M3` | `final` → 整形完了 | 500 ms（NFR-P4） |
 | `M4` | 整形完了 → 挿入完了 | 50 ms（NFR-P5） |
 | `M5` | キー解放 → 挿入完了（M2+M3+M4） | **1000 ms（NFR-P6）** |
+
+M2 の計測条件: 6 秒の日本語音声を 100 ms ごとに実時間で供給し、最後のバッファ供給から
+`.final` を受け取るまで。`DictationTranscriber` / `.progressiveShortDictation` /
+`modelRetention: .processLifetime`（MacBook Pro M3 / macOS 26.5.2 / Xcode 26.6）。
+
+**M2 が想定の 1/5 で済んだぶん、M5 の予算 1000 ms はほぼ全て M3（LLM 整形）に充てられる。**
 
 デバッグビルドでは HUD に `M5` を表示し、リグレッションを即座に検知できるようにする。
 
@@ -562,22 +619,57 @@ public protocol PermissionChecking: Sendable {
 ### 11.2 ゴールデンテスト（認識）
 
 固定音声ファイルに対する認識結果を回帰確認する。テスト資産は `say` コマンドで再生成可能とする。
+音声はリポジトリに含めない（`.gitignore` 済み）。原稿テキストのみコミットする。
 
 ```bash
-say -v Kyoko -f Tests/Fixtures/jp-meeting.txt -o Tests/Fixtures/jp-meeting.aiff
+cd Tests/Fixtures && say -v Kyoko -f jp-meeting.txt -o jp-meeting.aiff
 ```
+
+> フィクスチャはテストターゲット（`Tests/GhostVoiceCoreTests/`）の**外**に置く。
+> 中に置くと SwiftPM が unhandled files を警告し、解消に `Package.swift` の変更が要る。
 
 **完全一致では判定しない。** OS 更新でモデルが変わりうるため、以下で判定する。
 
 - 文字誤り率（CER）が閾値以下であること
 - 重要語（辞書登録された固有名詞）が含まれること
 
-現時点の基準値（開発機での実測）:
+CER はレーベンシュタイン距離 ÷ 参照文字数。句読点と空白は除去して比較する
+（`DictationTranscriber` は句読点を補うため、正規化しないと補うほど不利になる）。
 
-| モジュール | 所要 | 主な誤り |
+#### 基準値（合成音声 `say -v Kyoko` / 103 秒 / MacBook Pro M3 / macOS 26.5.2）
+
+| モジュール | CER | 一括変換の所要 | 誤りの数（参照 529 字） |
+|---|---|---|---|
+| `DictationTranscriber`（既定） | **3.02 %** | 8.9〜15.5 秒 | 11 箇所 / 距離 16 |
+| `SpeechTranscriber` | **3.21 %** | 1.2〜3.1 秒 | 13 箇所 / 距離 17 |
+
+両者の差は 529 字中 1 文字ぶんであり、**合成音声では実質的に互角である。**
+要件定義書 §2.5 の「明確に優位」は、この計測では再現しなかった（→ §13 V-1）。
+
+質的な違いは残る。
+
+| 観点 | `DictationTranscriber` | `SpeechTranscriber` |
 |---|---|---|
-| `DictationTranscriber` | 2.72〜3.07 秒 / 103 秒音声 | 「従量課金」→「重量課金」、「高精度」→「高度な」、「ついて」→「にいて」 |
-| `SpeechTranscriber` | 0.76〜1.73 秒 / 103 秒音声 | 上記に加え「話者」→「社」、「要件定義」→「要件」等 |
+| 句読点・疑問符 | 付与する（「ございますか？」） | 付与しない |
+| 固有名詞 | 英字へ正規化（アップル→`Apple`） | かな維持（Mac→マック） |
+| 固有の誤り | 「という」→「と言う」、「セキュリティ」→「セキュリティー」 | 「話者」→「社」、「文字起こし」→「文字を起こし」、「挙げられ」→「上げられ」 |
+
+両モジュールに共通の誤り: 「従量課金」→「重量課金」、「高精度」→「高度」、
+「基本設計」→「基本設定」、「詳細設計」→「詳細設定」、「第三」→「第 3」、「一時間」→「1 時間」、
+「および」→「及び」。
+
+**誤りの過半は聞き違いではなく表記の正規化である**（漢数字→算用数字、かな→英字、かな→漢字）。
+これらは LLM 整形（FR-5）とユーザー辞書（FR-6）で吸収できる余地が大きい。
+
+**所要時間の注記**: 上表の所要は暫定結果（`volatileResults`）を有効にした値である。
+HUD のライブ表示（FR-2）に暫定結果が要るため、これが製品の構成である。
+暫定結果を出さないプリセットなら `DictationTranscriber` は 3.7〜5.4 秒、
+`SpeechTranscriber` は 1.0〜1.4 秒で済む（要件定義書 §2.2 の数値はこちらに相当する）。
+**暫定結果は一括変換の所要を 2〜4 倍にする。** PTT の 1 発話は数秒であり、
+確定までのレイテンシは V-2 のとおり 62 ms なので、実用上の問題はない。
+
+ゴールデンテストの閾値は Dictation 10 % / Speech 15 %、一括変換は 30 秒とする。
+閾値は「桁で壊れたこと」を捕まえる線であり、性能目標そのものではない。
 
 ### 11.3 手動検証（V-3）
 
@@ -615,13 +707,13 @@ say -v Kyoko -f Tests/Fixtures/jp-meeting.txt -o Tests/Fixtures/jp-meeting.aiff
 
 ## 13. 検証項目一覧
 
-| ID | 内容 | 実施時期 |
-|---|---|---|
-| V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 実装 §12-2 |
-| V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 |
-| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 |
-| V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-6 |
-| V-5 | DynamicNotchKit の表示先固定制御 | 実装 §12-8 |
-| V-6 | `.nonactivatingPanel` がフォーカスを奪わないこと | 実装 §12-8 |
-| V-7 | ウォームアップ常駐時のアイドルメモリ（NFR-S3） | 実装 §12-10 |
-| V-8 | `SFCustomLanguageModelData` による固有名詞精度改善の可否 | LLM 整形で不足が判明した場合 |
+| ID | 内容 | 実施時期 | 結果 |
+|---|---|---|---|
+| V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 実装 §12-2 | **未完（肉声）**。合成音声のみ実施し CER 3.02 % vs 3.21 %（§11.2）。既定は `.dictation` を維持。肉声の録音が要るため保留 |
+| V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 | **完了**。55〜63 ms（推定値 300 ms を置き換え。§10） |
+| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 | 未実施 |
+| V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-6 | 未実施 |
+| V-5 | DynamicNotchKit の表示先固定制御 | 実装 §12-8 | 未実施 |
+| V-6 | `.nonactivatingPanel` がフォーカスを奪わないこと | 実装 §12-8 | 未実施 |
+| V-7 | ウォームアップ常駐時のアイドルメモリ（NFR-S3） | 実装 §12-10 | 未実施 |
+| V-8 | `SFCustomLanguageModelData` による固有名詞精度改善の可否 | LLM 整形で不足が判明した場合 | 未実施 |
