@@ -9,27 +9,14 @@ public final class SettingsStore: @unchecked Sendable {
     private let file: AtomicJSONFile<Settings>
     private let lock = NSLock()
     private var cached: Settings
-    /// 復元できなかった実ファイルがまだ残っているか。
-    /// 次の保存で上書き消去する前に退避する必要がある。
-    private var needsQuarantine: Bool
 
     public init(rootURL: URL = StorageRoot.default) {
-        let file = AtomicJSONFile(
+        // 復元できなかったファイルの退避は `file` 側が覚えていて `save` が行う。
+        self.file = AtomicJSONFile(
             url: rootURL.appendingPathComponent("settings.json"),
             fallback: Settings.default
         )
-        self.file = file
-        switch file.loadOutcome() {
-        case .loaded(let settings):
-            self.cached = settings
-            self.needsQuarantine = false
-        case .absent:
-            self.cached = .default
-            self.needsQuarantine = false
-        case .unreadable:
-            self.cached = .default
-            self.needsQuarantine = true
-        }
+        self.cached = file.load()
     }
 
     public var settings: Settings {
@@ -49,10 +36,6 @@ public final class SettingsStore: @unchecked Sendable {
             mutate(&next)
             guard !next.hotkey.conflicts(with: next.undoHotkey) else {
                 throw SettingsError.hotkeyConflict
-            }
-            if needsQuarantine {
-                try file.quarantine()
-                needsQuarantine = false
             }
             try file.save(next)
             cached = next

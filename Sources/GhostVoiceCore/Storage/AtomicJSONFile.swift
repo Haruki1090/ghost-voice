@@ -26,9 +26,20 @@ public enum LoadOutcome<T: Sendable>: Sendable {
 /// 読み込み失敗（ファイル無し・破損）は握りつぶして `fallback` を返す。
 /// 設定や履歴が壊れてもアプリが起動しなくなることを避けるため。
 /// 失敗の種類が必要な呼び出し側は `loadOutcome()` を使うこと。
-public struct AtomicJSONFile<T: Codable & Sendable>: Sendable {
+///
+/// 復元できなかったファイルの退避もここが担う。読み込みで `.unreadable` だったことを
+/// 自分で覚えておき、次の `save` の直前に一度だけ `<name>.corrupt` へ逃がす。
+/// 呼び出し側は何も書かなくてよい（書き忘れによって保護が消えることが無い）。
+///
+/// 直前の読み込み結果という可変状態を持つため参照型。`Sendable` は `lock` が
+/// その状態を守ることで担保する。
+public final class AtomicJSONFile<T: Codable & Sendable>: @unchecked Sendable {
     private let url: URL
     private let fallback: T
+    private let lock = NSLock()
+    /// 復元できなかった実ファイルがまだ残っているか。
+    /// 次の保存で上書き消去する前に退避する必要がある。
+    private var needsQuarantine = false
 
     public init(url: URL, fallback: T) {
         self.url = url
@@ -44,7 +55,37 @@ public struct AtomicJSONFile<T: Codable & Sendable>: Sendable {
     }
 
     /// 失敗の種類を呼び出し側へ伝える読み込み。
+    ///
+    /// 副作用として、次の `save` が退避を要するかどうかを更新する。
     public func loadOutcome() -> LoadOutcome<T> {
+        lock.withLock {
+            let outcome = readWithoutLocking()
+            if case .unreadable = outcome {
+                needsQuarantine = true
+            } else {
+                // 読めた／消えた以上、逃がすべき中身はもう残っていない
+                needsQuarantine = false
+            }
+            return outcome
+        }
+    }
+
+    /// 直前の読み込みが `.unreadable` だった場合は、書く前に実ファイルを退避する。
+    public func save(_ value: T) throws {
+        try lock.withLock {
+            if needsQuarantine {
+                try quarantineWithoutLocking()
+                needsQuarantine = false
+            }
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Self.makeEncoder().encode(value).write(to: url, options: .atomic)
+        }
+    }
+
+    private func readWithoutLocking() -> LoadOutcome<T> {
         guard FileManager.default.fileExists(atPath: url.path) else { return .absent }
         do {
             let data = try Data(contentsOf: url)
@@ -54,20 +95,11 @@ public struct AtomicJSONFile<T: Codable & Sendable>: Sendable {
         }
     }
 
-    public func save(_ value: T) throws {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try Self.makeEncoder().encode(value).write(to: url, options: .atomic)
-    }
-
     /// 復元できなかったファイルを `<name>.corrupt` へ退避する。
     ///
     /// `save` は `.atomic` write なので、退避せずに書くと元の内容は復旧不能になる。
-    /// `loadOutcome()` が `.unreadable` を返したときに、最初の `save` の前に呼ぶこと。
     /// 退避先は 1 スロットで、既存の `.corrupt` は上書きする。対象が無ければ何もしない。
-    public func quarantine() throws {
+    private func quarantineWithoutLocking() throws {
         let manager = FileManager.default
         guard manager.fileExists(atPath: url.path) else { return }
         let destination = url.appendingPathExtension("corrupt")
