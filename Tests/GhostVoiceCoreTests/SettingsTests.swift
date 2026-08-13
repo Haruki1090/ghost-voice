@@ -30,5 +30,8 @@ struct SettingsTests {
         #expect(s.localeIdentifier == "en-US")
         #expect(s.transcriberKind == .speech)
         #expect(s.refinementTimeoutMs == 800)
+        // 複数フラグの修飾キーが実際に復元されること。
+        // 名前が一致しなくても throw せず空集合になるため、明示的に確かめる。
+        #expect(s.undoHotkey == .controlCommandZ)
     }
 }

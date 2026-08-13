@@ -38,4 +38,18 @@ struct HotkeyBindingTests {
         let decoded = try JSONDecoder().decode(HotkeyBinding.self, from: data)
         #expect(decoded == original)
     }
+
+    @Test("修飾キーを人間が読める文字列配列としてエンコードする")
+    func modifiersEncodeAsStringArray() throws {
+        // 設定ファイルを人間が読み書きできることが要件（詳細設計書 §9.1）。
+        // 合成実装の Int 表現に戻ると落ちる。
+        let json = String(decoding: try JSONEncoder().encode(HotkeyBinding.controlCommandZ), as: UTF8.self)
+        #expect(json.contains("\"command\"") && json.contains("\"control\""))
+    }
+
+    @Test("複数の修飾キーを含むバインドを往復できる")
+    func multipleModifiersRoundTrip() throws {
+        let data = try JSONEncoder().encode(HotkeyBinding.controlCommandZ)
+        #expect(try JSONDecoder().decode(HotkeyBinding.self, from: data) == .controlCommandZ)
+    }
 }
