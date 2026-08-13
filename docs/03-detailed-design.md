@@ -650,12 +650,27 @@ public enum InsertionMethod: String, Sendable, Codable {
     case ax, pasteboard, clipboardOnly
 }
 
-public protocol TextInserting: AnyObject, Sendable {
+public protocol TextInserting: Sendable {
     func insert(_ text: String) async -> InsertionMethod
+}
+
+/// 二段構えの各段。
+public protocol PrimaryInserting: Sendable {
+    func canInsert() -> Bool
+    func tryInsert(_ text: String) async -> Bool
+}
+
+/// 最後の砦。挿入が全滅したときに発話をクリップボードへ残す。
+public protocol ClipboardLeaving: Sendable {
+    @discardableResult func leave(_ text: String) -> Bool
 }
 ```
 
+実装はいずれも値型なので `AnyObject` は要求しない。
+
 戻り値の `InsertionMethod` は履歴に記録し、どのアプリでどの経路が使われたかの実地データとする（V-3）。
+
+**`ClipboardLeaving` を `PrimaryInserting` と分けてあるのには理由がある。** 両段が `canInsert()` で「適用外」を返した場合、`tryInsert` は一度も走らない。つまり Pasteboard 経路がクリップボードへ書く機会そのものが無い。残置を挿入経路の副作用として扱うと、そこで発話が消える。
 
 ### 6.2 AccessibilityInserter
 
@@ -677,10 +692,36 @@ let result = AXUIElementSetAttributeValue(
 | 判定 | 内容 |
 |---|---|
 | 1 | フォーカス要素が取得できたか |
-| 2 | `kAXRoleAttribute` が `AXTextField` / `AXTextArea` / `AXComboBox` のいずれかか |
-| 3 | `AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute)` が `true` か |
+| 2 | **要素の持ち主が自プロセスでないか**（実測で追加。下記） |
+| 3 | `kAXRoleAttribute` が `AXTextField` / `AXTextArea` / `AXComboBox` のいずれかか |
+| 4 | `AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute)` が `true` か |
 
-**3 つすべてを満たす場合のみ AX 経路を使う。** いずれかを満たさない場合は判定コストのみで即座に Pasteboard 経路へ移る。
+**4 つすべてを満たす場合のみ AX 経路を使う。** いずれかを満たさない場合は判定コストのみで即座に Pasteboard 経路へ移る。判定は**安い順**に並べる。判定 2 は `AXUIElementGetPid` だけで済み AX の往復を伴わないので、3 と 4 の問い合わせより先に置く。
+
+#### 判定 2（自プロセスの除外）を足した理由
+
+**自プロセスの要素へ `AXUIElementSetAttributeValue` をメインスレッド以外から投げると永久にブロックする。** 実測（macOS 26.5.2 / M3。AppKit を起動したプロセスが自分の `NSTextView` を狙う）:
+
+| 呼び出し元 | 属性 | 結果 |
+|---|---|---|
+| 背景スレッド | `kAXSelectedText` | 12 秒で戻らず打ち切り |
+| 背景スレッド | `kAXValue` | 12 秒で戻らず打ち切り |
+| 背景スレッド | 同上 + `AXUIElementSetMessagingTimeout(2.0)` | **タイムアウトが効かない。** 12 秒で戻らず打ち切り |
+| メインスレッド | `kAXSelectedText` | 52.9 ms で成功 |
+
+読み取り（役割・可書き込み性）は背景スレッドからでも 0.1〜5.5 ms で返る。**詰まるのは書き込みだけである。**
+
+挿入は非同期文脈＝協調スレッドプールで走るため、フォーカスが自分の HUD や設定画面にある瞬間に挿入が走ると、そのタスクが二度と返らない。メッセージングのタイムアウトでは救えないので、**狙わないことで避ける。** 自分自身へディクテーションする必要はそもそも無い。
+
+判定 2 は `canInsert()` と `tryInsert()` の両方で行う。両者はフォーカスを別々に取り直すので、その隙にフォーカスが移りうる。
+
+#### メッセージングの上限
+
+`AXUIElementSetMessagingTimeout` をシステムワイド要素へ 0.5 秒で設定する。既定は 6 秒で、前面のアプリが固まっていると**適用可否の判定だけで 6 秒ユーザーを待たせる**。挿入の予算は NFR-P5 の 50 ms しかない。正常な往復は実測 0.1〜5.5 ms なので 0.5 秒は十分に緩い。
+
+#### フォーカス要素の型検査
+
+`kAXFocusedUIElementAttribute` の値は**強制キャストしてはならない**。`AXUIElement` 以外が返った場合にプロセスが落ちる。ここは発話の出口であり、落ちれば発話は失われる。`CFGetTypeID` で確かめてから包む。
 
 ### 6.3 PasteboardInserter
 
@@ -703,11 +744,63 @@ restore(saved, to: pb)
 
 | 項目 | 設計判断 |
 |---|---|
-| 復元待ち時間 | 120 ms。短すぎると貼付前に復元してしまう。実測で調整する |
+| 復元待ち時間 | 120 ms。短すぎると貼付前に復元してしまう。**実測済み（下記）。値は据え置き** |
 | 複数タイプの保持 | 画像やリッチテキストを壊さないため、全 `PasteboardType` を退避する |
-| 復元失敗時 | 挿入したテキストをクリップボードに残す（ユーザーが失わないことを優先） |
+| 送出できないとき | **試さない。**`canInsert()` が `AXIsProcessTrusted()` を返す（下記） |
+| 送出に失敗したとき | **復元しない。** 挿入したテキストをクリップボードに残す（ユーザーが失わないことを優先） |
+| 元が空だったとき | 復元しない。空で上書きするとテキストが消えるだけなので残す方を選ぶ |
 
 ⌘V の送出は `CGEvent(keyboardEventSource:virtualKey:keyDown:)` に `.maskCommand` を設定し、`post(tap: .cgAnnotatedSessionEventTap)` で行う。
+
+#### 送出には AX の許可が要る（実測）
+
+macOS 26.5.2 / M3。`AXIsProcessTrusted() == false` のプロセスが自分の最前面ウィンドウへ ⌘V を送る。`Edit > Paste` を持つメインメニューを用意し「⌘V の結び先が無い」交絡を除いてある。
+
+| 送出方法 | 貼り付いた回数 |
+|---|---|
+| `CGEvent.post(tap: .cgAnnotatedSessionEventTap)` | **0 / 3** |
+| `CGEvent.post(tap: .cghidEventTap)` | **0 / 3** |
+| `NSApp.postEvent(_:atStart:)`（TCC を通らない） | 3 / 3 |
+| `textView.paste(nil)`（直接呼び出し） | 3 / 3 |
+
+**`CGEvent.post` は `Void` を返す。** 捨てられたことを後から知る術が無い。送出したつもりで成功を報告すると、履歴には `.pasteboard` と記録されるのにテキストはどこにも入っておらず、しかもクリップボードは復元済み——つまり**発話が消えたうえに成功として残る**。
+
+したがって `PasteboardInserter.canInsert()` は**常に `true` ではない**。`AXIsProcessTrusted()` を返し、届けられないと判っている場合は試さずに `.clipboardOnly` へ落とす。
+
+#### 復元待ち時間 120 ms の根拠（実測）
+
+⌘V の送出から実際に貼り付く（`NSTextViewDelegate.textDidChange` が呼ばれる）まで。各条件 50 回。
+
+| 条件 | p50 | p90 | 最大 |
+|---|---|---|---|
+| 低負荷（load average 約 2.5） | 33.3 ms | 35.4 ms | 36.0 ms |
+| 負荷下（`yes` 16 本、load average 約 13.5） | 31.4 ms | 34.8 ms | 35.3 ms |
+
+CPU 負荷では動かない。約 33 ms は 60 Hz の 2 フレームにあたる固定の間隔で、計算資源ではなくイベント配送の周期で決まっている。クリップボードへ書いた内容が別プロセスから見えるまでは p50 0.9 ms（負荷下 1.1 ms、最大 24.5 ms）で、支配項ではない。
+
+**この実測には上限として扱えない留保が 2 つある。**
+
+1. 計測は `NSApp.postEvent` で行った。計測機に AX 権限が無く `CGEvent.post` が黙って捨てられるため、**WindowServer を経由する分の遅延が入っていない。**
+2. 貼り付け先は自プロセスの `NSTextView` である。相手が重いアプリなら相手のランループ待ちが上乗せされる。
+
+つまり実測 35 ms は**下限**であり、120 ms はそれに対する約 3.4 倍の余裕である。**値は据え置きとし、実アプリでの妥当性は V-3（実装 §12-11）で確かめる。**
+
+なおこの待ち時間は NFR-P5（テキスト挿入 50 ms 以内）には数えない。挿入はテキストが貼り付いた時点で完了しており、復元はその後始末である。
+
+#### 退避時の AppKit 警告
+
+退避は挿入と同じ非同期文脈＝協調スレッドプールで走る。クリップボードに「約束」として載っている型があると、`data(forType:)` がその場で実体化を要求し、AppKit が `NSPasteboard: synchronous promise fulfillment requested from a background thread!` を出す。
+
+実測（新しいクリップボードへ内容を載せ、**最初の読み取りを**協調スレッドプールから行う）:
+
+| クリップボードの内容 | 警告 | 退避に要した時間 |
+|---|---|---|
+| 平文のみ | 出ない | 0.88 ms |
+| 画像 + 平文 | 出ない | 0.09 ms |
+| 平文の複数項目 | 出ない | 0.07 ms |
+| `NSAttributedString`（ブラウザ等からのコピー） | **出る** | 0.50 ms |
+
+**リッチテキストは日常的にコピーされる**ので警告は普通に出ると考えてよい。ただし実測ではハングせず（10 回で最大 1.43 ms）、データも欠けなかった。約束の提供元がプロセス内の AppKit だからである。**提供元が別プロセスの場合（他アプリのファイル約束など）は未検証**で、V-3 で見る。
 
 ### 6.4 CompositeInserter
 
@@ -715,10 +808,15 @@ restore(saved, to: pb)
 AccessibilityInserter が適用可能か判定
   ├─ 可 → 実行 → 成功: .ax / 失敗: 次へ
   └─ 不可 → 次へ
-PasteboardInserter を実行
-  ├─ 成功 → .pasteboard
-  └─ 失敗 → クリップボードへ残置 → .clipboardOnly（HUD 通知）
+PasteboardInserter が適用可能か判定
+  ├─ 可 → 実行 → 成功: .pasteboard / 失敗: 次へ
+  └─ 不可 → 次へ
+クリップボードへ残置 → .clipboardOnly（HUD 通知）
 ```
+
+**残置は合成器の責務であり、Pasteboard 経路の副作用ではない。** 両段が「適用外」を返した場合、`tryInsert` は一度も走らないので Pasteboard 経路がクリップボードへ書く機会が無い。合成器が `.clipboardOnly` を返す前に自分で `ClipboardLeaving.leave(_:)` を呼ぶ。**`.clipboardOnly` を返すときは、テキストが実際にクリップボードへ残っていること。**
+
+最後の砦は Pasteboard 経路と**同じ `NSPasteboard`** を見ていなければならない。別のものを掴ませると、残したテキストがユーザーには見えない場所へ行く。組み立て（`CompositeInserter.system`）は同一インスタンスを二役で渡す。
 
 **PTT キー解放から挿入までの間、フォーカスが移動しないことが前提である。** HUD は `.nonactivatingPanel` とし、フォーカスを奪ってはならない（V-6）。
 
@@ -1067,14 +1165,23 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 
 以下のアプリで挿入経路と結果を記録する。
 
-| アプリ | 想定される経路 |
-|---|---|
-| Slack | Electron のため AX 不可の可能性 → Pasteboard |
-| Google Chrome | 要素により変動 |
-| Xcode | AX 対応の見込み |
-| Notion | Electron → Pasteboard |
-| ターミナル / iTerm2 | Pasteboard |
-| メモ / メール | AX 対応の見込み |
+**前提: AX 権限（システム設定 > プライバシーとセキュリティ > アクセシビリティ）が要る。** 権限が無いと AX 経路は必ず適用外になり、⌘V も黙って捨てられるため、全アプリで `.clipboardOnly` になる（§6.2 / §6.3 の実測）。**したがって V-3 は権限を付与した状態でしか意味を持たない。**
+
+実施は Task 11（CLI での一気通貫）以降。それまで「結果」欄は空のまま残す。
+
+| アプリ | 想定される経路 | 結果 | 復元待ち 120 ms は足りたか |
+|---|---|---|---|
+| Slack | Electron のため AX 不可の可能性 → Pasteboard | | |
+| Google Chrome | 要素により変動 | | |
+| Xcode | AX 対応の見込み | | |
+| Notion | Electron → Pasteboard | | |
+| ターミナル / iTerm2 | Pasteboard | | |
+| メモ / メール | AX 対応の見込み | | |
+
+あわせて次の 2 点を確認する。いずれも権限の無い機体では確かめられなかったもの（§6.3）。
+
+1. **復元待ち 120 ms の妥当性。** 実測の 35 ms は WindowServer 経由の遅延を含まない下限である。貼り付けが空振りするアプリが 1 つでもあれば値を上げる。
+2. **リッチな内容を退避したときの `synchronous promise fulfillment` 警告。** 提供元が別プロセスの場合（他アプリのファイル約束など）に遅延や失敗が出ないか。
 
 ---
 
@@ -1086,7 +1193,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 2 | `TranscriptionEngine`（ファイル入力） | ゴールデンテストが通る。**V-1 / V-2 をここで実測する** |
 | 3 | `AudioCapture` + マイク入力の結合 | CLI で発話 → 標準出力へ書き起こしが出る。**V-9 は実施済み**。**V-10（実デバイス切断）はここで実測する** |
 | 4 | `Refiner` | 整形あり／なし、タイムアウト、Apple Intelligence 無効時の縮退が動く |
-| 5 | `TextInserter`（二段構え） | **V-3 を実施し、経路の実績を記録する** |
+| 5 | `TextInserter`（二段構え） | 二段構えが動く。**V-3 は AX 権限が要るため実装 §12-11 へ繰り延べ** |
 | 6 | `HotkeyMonitor` | **V-4 を実施する** |
 | 7 | `DictationSession`（状態機械） | CLI 版で PTT → 挿入まで一気通貫 |
 | 8 | `NotchHUD` | **V-5 / V-6 を実施する** |
@@ -1103,7 +1210,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 |---|---|---|---|
 | V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 実装 §12-2 | **未完（肉声）**。合成音声のみ実施し CER 3.02 % vs 3.21 %（§11.2）。既定は `.dictation` を維持。肉声の録音が要るため保留 |
 | V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 | **完了**。40〜177 ms / 中央値 約 70 ms（推定値 300 ms を置き換え。§10） |
-| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 | 未実施 |
+| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 | **未実施（AX 権限待ち）**。二段構えの実装と単体検査は完了。実挿入には AX 権限が要り、無いと全アプリで `.clipboardOnly` になる。実施は Task 11 以降（§11.3） |
 | V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-6 | 未実施 |
 | V-5 | DynamicNotchKit の表示先固定制御 | 実装 §12-8 | 未実施 |
 | V-6 | `.nonactivatingPanel` がフォーカスを奪わないこと | 実装 §12-8 | 未実施 |
