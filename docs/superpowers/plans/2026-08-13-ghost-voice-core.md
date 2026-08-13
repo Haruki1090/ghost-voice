@@ -1013,6 +1013,40 @@ git commit -m "feat: 履歴ストアと Undo 対象判定を追加"
 
 ## Task 5: 音声認識エンジン（V-1 / V-2 の実測を含む）
 
+> **⚠️ 訂正（Task 5 の実測による / 2026-08-14）**
+>
+> **以下の計画時のコードには、そのまま実装すると動かない箇所が 5 つある。**
+> 計画時の記述は履歴として残してあるが、**参照する順序は
+> ① `Sources/GhostVoiceCore/Transcription/` の現物 → ② `docs/03-detailed-design.md` §4 → ③ 本節**とすること。
+>
+> 1. **`SpeechModule` の使い回しはプロセスを落とす。** 計画では `prepare` で作った `module` を
+>    保持し、`begin()` ごとに新しい `SpeechAnalyzer` へ渡している。**2 つ目の `SpeechAnalyzer` へ
+>    同じインスタンスを渡すと `SpeechAnalyzer.setWorkers(for:reusingFrom:preservingFunctionOf:)` の
+>    内部で SIGTRAP で異常終了する。** PTT なら 2 発話目でアプリが落ちる。
+>    → **モジュールは発話ごとに作り直す。** `prepare` が保持するのはロケール・種別・音声形式だけ。
+>    作り直しの費用は実測 0.5〜1.4 ms で無視できる。
+> 2. **`module.results` は単一消費者しか許さない。** 計画の `Self.updates(from: module)` は
+>    `begin()` と `transcribeFile(at:)` の両方から呼ばれる。2 つ目の消費者を立てると
+>    **`attempt to await next() on more than one task` で異常終了する**（結果が分裂するのではなく落ちる）。
+>    → 1 モジュールにつき結果列の消費は 1 箇所だけにする。
+> 3. **`AssetInventory.status` は未確保のロケールに対して、導入済みでも常に `.supported` を返す。**
+>    計画は status を見てから `reserve` しているため、**導入済みの ja-JP でも毎回ダウンロードを試みる。**
+>    → **`reserve` を先に呼ぶ。** なお `assetInstallationRequest` は未対応ロケールで nil を返さず
+>    throw するので、計画の `guard let request ... else { throw .localeUnsupported }` は発火しない。
+>    未対応の検出は種別ごとの `supportedLocales` への所属確認で行うこと
+>    （`supportedLocale(equivalentTo:)` は識別子を正規化するだけで対応可否を見ない）。
+> 4. **`CharacterErrorRate.compute` は仮説が空文字のときクラッシュする。**
+>    `for j in 1...hyp.count` が `1...0` の空範囲になる。認識が失敗して空文字が返るのは実際に起こる。
+>    → `guard !hyp.isEmpty else { return 1 }` を先に置く。
+> 5. **`normalize` の doc コメント「句読点・空白の差は精度の本質ではないため」は実測で否定された。**
+>    句読点を残して測ると 2 モジュールの優劣が逆転する（`DictationTranscriber` 5.85 % 対
+>    `SpeechTranscriber` 4.96 %。除去すると 3.02 % 対 3.21 %）。句読点は結論を左右する。
+>    → 除去する正しい理由は「認識器が付けた句読点は後段の LLM 整形（FR-5）で書き換えられ、
+>    製品の出力品質に効かない」であり、この正規化下の CER は「LLM が直せない誤り」を測っている。
+>
+> 併せて、Step 8 の V-1 / V-2 の結論も更新されている。V-2 は 40〜177 ms（推定値 300 ms を置換）、
+> V-1 は**合成音声では有意差なし**（肉声は未実施）。詳細は要件定義書 §2.5 と詳細設計書 §11.2。
+
 **Files:**
 - Create: `Sources/GhostVoiceCore/Transcription/Transcribing.swift`
 - Create: `Sources/GhostVoiceCore/Transcription/SpeechAnalyzerTranscriber.swift`
