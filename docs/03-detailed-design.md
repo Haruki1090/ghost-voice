@@ -650,8 +650,20 @@ public enum InsertionMethod: String, Sendable, Codable {
     case ax, pasteboard, clipboardOnly
 }
 
+/// 挿入を試みた結果。
+public enum InsertionOutcome: Sendable, Equatable {
+    /// 挿入を試み、この経路で決着した。**履歴に記録してよい。**
+    case inserted(InsertionMethod)
+    /// secure input が有効だったため、どの経路も試さず拒否した。
+    /// クリップボードにも残していない。**履歴に記録してはならない。**
+    case refusedSecureInput
+
+    /// 履歴に記録してよい経路。拒否のときは nil。
+    var recordableMethod: InsertionMethod? { ... }
+}
+
 public protocol TextInserting: Sendable {
-    func insert(_ text: String) async -> InsertionMethod
+    func insert(_ text: String) async -> InsertionOutcome
 }
 
 /// 二段構えの各段。
@@ -668,7 +680,15 @@ public protocol ClipboardLeaving: Sendable {
 
 実装はいずれも値型なので `AnyObject` は要求しない。
 
-戻り値の `InsertionMethod` は履歴に記録し、どのアプリでどの経路が使われたかの実地データとする（V-3）。
+戻り値のうち **`.inserted(method)` の `method` だけ**を履歴に記録し、どのアプリでどの経路が使われたかの実地データとする（V-3）。
+
+**`.refusedSecureInput` は履歴に記録しない。** パスワード入力中の発話だからである（§6.4）。記録側は `recordableMethod` を開いてから `HistoryEntry` を作ること。
+
+```swift
+guard let method = outcome.recordableMethod else { return }  // 拒否は記録しない
+```
+
+`InsertionMethod` にケースを足さず別の型にしてあるのは、`HistoryEntry.insertionMethod` が `InsertionMethod` を**必須**で要求するためである。同じ enum に入れると「記録してはならないもの」が型として記録可能になる。
 
 **`ClipboardLeaving` を `PrimaryInserting` と分けてあるのには理由がある。** 両段が `canInsert()` で「適用外」を返した場合、`tryInsert` は一度も走らない。つまり Pasteboard 経路がクリップボードへ書く機会そのものが無い。残置を挿入経路の副作用として扱うと、そこで発話が消える。
 
@@ -681,7 +701,11 @@ guard AXUIElementCopyAttributeValue(
     system, kAXFocusedUIElementAttribute as CFString, &focused
 ) == .success else { return false }
 
-let element = focused as! AXUIElement
+// **強制キャストしてはならない**（`focused as! AXUIElement`）。
+// 属性が AXUIElement 以外を返すとプロセスが落ちる。ここは発話の出口である。
+guard let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+let element = unsafeBitCast(focused, to: AXUIElement.self)
+
 let result = AXUIElementSetAttributeValue(
     element, kAXSelectedTextAttribute as CFString, text as CFString
 )
@@ -847,7 +871,7 @@ PasteboardInserter が適用可能か判定
 
 したがって、**判定は合成器の入口に置き、どの経路も試さず、クリップボードにも残さない。** 判定は挿入のたびに行う（ユーザーはパスワード欄に出入りする。`IsSecureEventInputEnabled()` は実測 0.000 ms）。
 
-**ここはこの製品で唯一「発話を失う」ことを正とする分岐である。** 通常は発話を失わないことが最優先（基本設計書 §230）だが、パスワードは残す方が害が大きい。
+**ここはこの製品で唯一「発話を失う」ことを正とする分岐である。** 通常は発話を失わないことが最優先（基本設計書 §7）だが、パスワードは残す方が害が大きい。
 
 ### 戻り値を `InsertionOutcome` にした理由
 
