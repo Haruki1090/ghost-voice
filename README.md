@@ -5,6 +5,18 @@ macOS 26 のオンデバイス音声認識（`SpeechAnalyzer`）と `FoundationM
 
 右 Option を押している間だけ録音し、離すと整形してカーソル位置へ挿入する。
 
+> **右 Option が無いキーボードの場合。** 日本語配列の MacBook 本体キーボードには、
+> スペース右が「かな・command・fn」で**右 Option が存在しない配列がある**（要件定義書 L-8）。
+> その場合は **システム設定 > キーボード > キーボードショートカット… > 修飾キー** で
+> **caps lock を Option へ転用する**こと。**転用した caps lock は右 Option（`keyCode: 61`）
+> として報告される**ので、設定を変えずにそのまま PTT キーになる（実測）。
+>
+> **これは妥協ではなく、右 Option より望ましい。** caps lock は日本語配列でほぼ使わないので、
+> 「PTT キーを押しながら文字を打つと `å` が入る」（R-1）が実質的に起こらない。
+>
+> **`fn` と（転用前の）caps lock は使えない。** どちらも左右を区別するデバイス依存ビットを
+> 報告しないため、押しっぱなしの判定が成立しない。
+
 ## 動作要件
 
 - macOS 26.0 以降
@@ -71,7 +83,7 @@ swift build -c release
 
 | キー | 既定値 | 説明 |
 |---|---|---|
-| `hotkey` | 右 Option（`keyCode: 61`, `modifiers: ["option"]`） | PTT キー |
+| `hotkey` | 右 Option（`keyCode: 61`, `modifiers: ["option"]`） | PTT キー。**右 Option が無い配列では caps lock を Option へ転用する**（冒頭の注記。設定は変えなくてよい） |
 | `undoHotkey` | ⌃⌘Z | Undo キー（**フェーズ 1 では未実装**） |
 | `localeIdentifier` | `ja-JP` | 認識言語 |
 | `transcriberKind` | `dictation` | `dictation` / `speech`。日本語では `dictation` が優位（実測 CER 3.02 % 対 3.21 %） |
@@ -172,6 +184,12 @@ swift build
    → `[終了] 終了処理中です。…kill -9 …` が出て、**強制終了しない**こと
 
 ### 2. V-4: 右 Option の副作用（10 分）
+
+> **caps lock を転用している場合、#1 と #3 の意味が変わる。**
+> #1（PTT キーを押しながら `a`）は caps lock では起こらない副作用なので、
+> **本物の右 Option がある機体でのみ判定できる**——転用機では「該当なし」と記録する。
+> #3（左 Option を押したまま PTT を離す）は**転用機でこそ意味がある**。
+> 転用した caps lock が本物の左 Option と左右を取り違えないことの確認になる。
 
 `ghost-voice` を起動した状態で、テキストエディタを開いて順に試し、結果を記録する。
 
