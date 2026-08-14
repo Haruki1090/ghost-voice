@@ -208,6 +208,9 @@ public actor DictationSession {
     /// **整形器の捨て推論は投げっぱなしにする。** `prewarm()` はコールド時に数秒掛かる
     /// ので、これを待ってからホットキーを読み始めると**起動直後の数秒間、押しても
     /// 何も起きない**（基本設計書 §6）。
+    ///
+    /// **認識器の捨て往復も同じく投げっぱなしにする**（詳細設計書 §10）。
+    /// 詳細は `warmUpTranscriber()`。
     public func warmUp() async {
         // 【Task 8 申し送り】初回コスト（実測 16.7 ms / 23.8 ms）を最初の挿入から外す。
         refreshPermissions()
@@ -226,6 +229,7 @@ public actor DictationSession {
         let current = settings.settings
         do {
             try await transcriber.prepare(locale: current.locale, kind: current.transcriberKind)
+            warmUpTranscriber()
         } catch {
             emit(.failed(.transcriptionUnavailable))
             emit(.idle)
@@ -233,6 +237,44 @@ public actor DictationSession {
 
         let refiner = self.refiner
         Task.detached(priority: .utility) { await refiner.prewarm() }
+    }
+
+    /// 解析器を 1 つ作って畳む捨て往復。**起動後の最初の発話の頭を落とさないために要る。**
+    ///
+    /// `prepare()` までしか行わない実装では、`SpeechAnalyzer` の初回生成費用を
+    /// **起動後の最初の発話が払う**——実測で 低負荷 中央値 44.2 ms / 最大 540.4、
+    /// **負荷下 中央値 64.5 ms** で、**負荷下では中央値で NFR-P1 の予算 50 ms を超えた**
+    /// （詳細設計書 §10）。2 回目以降は 1.6〜2.2 ms と 3 桁小さい。
+    /// **その差は発話の頭の取りこぼしとして出る**（`begin()` 復帰前のバッファは黙って捨てられる）。
+    ///
+    /// ## 起動は待たない
+    ///
+    /// 待つと**起動直後、押しても何も起きない時間**ができる（基本設計書 §4.1 の 9）。
+    /// 整形器の捨て推論と同じく投げっぱなしにする。
+    ///
+    /// ## ただし本番の `begin()` と同時に生きてはならない
+    ///
+    /// **`SpeechModule` のインスタンスは 1 つの `SpeechAnalyzer` にしか装着できない**
+    /// （詳細設計書 §4.3.1）。捨て往復と次の発話が重なると解析器が 2 つ生きる窓ができる。
+    ///
+    /// そこで**`finalizeTask` の枠をそのまま使う。** `startRecording()` の頭は必ず
+    /// `drainFinalizeTask()` を通るので、**捨て往復が畳まれるまで次の `begin()` は始まらない。**
+    /// 新しい待ち合わせを足していないので、既にある直列性の保証をそのまま借りている。
+    ///
+    /// - Note: 起動直後に押された場合だけ、その押下は捨て往復の残りを待つ。
+    ///   **待つ量は「どのみち払う初回費用」なので増えていない**（増えるのは捨て往復の
+    ///   `finish()` ぶん。実測は本書のタスク報告と詳細設計書 §10）。
+    ///   起動から最初の押下までに往復が終わっていれば 0 ms である。
+    private func warmUpTranscriber() {
+        let transcriber = self.transcriber
+        finalizeTask = Task {
+            guard let stream = try? await transcriber.begin() else { return }
+            try? await transcriber.finish()
+            // **結果ストリームは読み捨てる。** `finish()` を跨いで生かしておくのは、
+            // 解放が先に走ると `onTermination` が結果の消費を畳んでしまうため。
+            // ここを抜けた時点で解放され、消費タスクも畳まれる。
+            withExtendedLifetime(stream) {}
+        }
     }
 
     /// ロケールや認識種別を変えたときに呼ぶ。
@@ -699,13 +741,17 @@ public actor DictationSession {
         }
     }
 
-    /// 前の発話の `finish()` が終わるのを待つ。
+    /// 前の発話の `finish()`（または起動時の捨て往復）が終わるのを待つ。
     ///
     /// - Important: **実際の呼び出し位置は次の押下の直後**（`startRecording()` の頭）であり、
     ///   そこは M1a（キー押下 → タップ武装、NFR-P1 の 50 ms）の計測区間の中である。
     ///   通常は前の発話の挿入が終わるまでに `finish()` も終わっているので 0 ms だが、
     ///   **Task 7 が実測した M1a にはこの待ちが入っていない。**
     ///   ここを動かすときは M1a を測り直すこと。
+    ///
+    ///   **起動直後の最初の押下だけは、ここで捨て往復（`warmUpTranscriber()`）を待つ。**
+    ///   往復が終わっていれば 0 ms。終わっていなければ残りを待つが、その待ちは
+    ///   「捨て往復を入れなければ直後の `begin()` が払っていた初回費用」と同じものである。
     private func drainFinalizeTask() async {
         guard let finalizeTask else { return }
         self.finalizeTask = nil

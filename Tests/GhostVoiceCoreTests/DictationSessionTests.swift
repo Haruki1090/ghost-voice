@@ -167,6 +167,10 @@ struct DictationSessionTests {
     /// **`begin()` はタップ装着より先。** `feed` は `begin()` 復帰前のバッファを
     /// 黙って捨てる（エラーにも記録にもならない）ので、順序を逆にすると
     /// **発話の頭が落ちる**（Task 5 申し送り）。
+    ///
+    /// 先頭の `begin` / `finish` は**起動時の捨て往復**である（`warmUpTranscriber()`）。
+    /// **捨て往復が畳まれてから本番の `begin()` が始まる**ことも、ここで併せて押さえる
+    /// ——解析器が 2 つ同時に生きると異常終了する（詳細設計書 §4.3.1）。
     @Test("認識を開始してからタップを張る")
     func beginsTranscriptionBeforeTappingAudio() async throws {
         try await withTempRoot { root in
@@ -177,7 +181,12 @@ struct DictationSessionTests {
 
             try await speak(rig)
 
-            #expect(order.calls == ["transcriber.begin", "audio.startTap"])
+            #expect(
+                order.calls == [
+                    "transcriber.begin", "transcriber.finish",  // 起動時の捨て往復
+                    "transcriber.begin", "audio.startTap",      // 1 発話目の開始
+                    "transcriber.finish",                       // 1 発話目の確定
+                ])
         }
     }
 
@@ -518,8 +527,11 @@ struct DictationSessionTests {
             try await waitUntil("2 発話目の録音が始まる") {
                 await Self.label(rig.session.state) == "recording"
             }
-            rig.transcriber.emitFinal("前の発話の残りです。", onStream: 0)
-            rig.transcriber.finishStream(0)
+            // **添字 0 は起動時の捨て往復のストリームである。** 1 発話目は 1。
+            // ここを 0 のままにすると、誰も消費していないストリームへ流すことになり、
+            // **この検査は何も駆動しないまま通る。**
+            rig.transcriber.emitFinal("前の発話の残りです。", onStream: 1)
+            rig.transcriber.finishStream(1)
             try await Task.sleep(for: .milliseconds(50))
 
             // 遅れた終了で確定待ちが解かれていれば、ここで既に処理が進んでしまっている。
@@ -805,7 +817,8 @@ struct DictationSessionTests {
             // 1 発話目は完走する（ESC はこちらには届いていない）。
             #expect(rig.inserter.inserted == ["整形後テキストです"])
             // 2 発話目は中断された（挿入されていない・履歴は .notInserted）。
-            #expect(rig.transcriber.beginCount == 2, "2 発話目が始まっていない")
+            // **3 は起動時の捨て往復ぶんを含む**（`warmUpTranscriber()`）。以下同じ。
+            #expect(rig.transcriber.beginCount == 3, "2 発話目が始まっていない")
             #expect(rig.history.entries.count == 2)
             #expect(rig.history.entries.first?.insertionMethod == .notInserted)
             #expect(await rig.session.state == .idle)
@@ -973,7 +986,8 @@ struct DictationSessionTests {
             try await waitUntil("失敗が届く") {
                 await log.states.contains(.failed(.audioUnavailable))
             }
-            try await waitUntil("認識セッションが閉じる") { rig.transcriber.finishCount == 1 }
+            // 1 件目は起動時の捨て往復。ここで見るのは 2 件目である。
+            try await waitUntil("認識セッションが閉じる") { rig.transcriber.finishCount == 2 }
         }
     }
 
@@ -1064,7 +1078,7 @@ struct DictationSessionTests {
             rig.hotkey.emit(.pressed)
             try await Task.sleep(for: .milliseconds(60))
 
-            #expect(rig.transcriber.beginCount == 1, "録音中に認識を張り直した")
+            #expect(rig.transcriber.beginCount == 2, "録音中に認識を張り直した（1 は起動時の捨て往復）")
             #expect(rig.audio.startCount == 1)
         }
     }
@@ -1102,8 +1116,9 @@ struct DictationSessionTests {
                 try await waitUntil("\(pass) 発話目が終わる") { rig.inserter.inserted.count == pass }
             }
 
-            #expect(rig.transcriber.beginCount == 2)
-            #expect(rig.transcriber.finishCount == 2)
+            // **どちらも起動時の捨て往復ぶん 1 を含む。**
+            #expect(rig.transcriber.beginCount == 3)
+            #expect(rig.transcriber.finishCount == 3)
             #expect(rig.history.entries.count == 2)
         }
     }
@@ -1197,6 +1212,79 @@ struct DictationSessionTests {
                 await log.states.contains(.failed(.audioUnavailable))
             }
             #expect(await rig.session.state == .idle)
+        }
+    }
+
+    /// **起動時に解析器を 1 往復させて捨てる**（詳細設計書 §10）。
+    ///
+    /// `prepare()` までしか行わないと、`SpeechAnalyzer` の初回生成費用
+    /// （低負荷 中央値 44.2 ms / 最大 540.4、**負荷下 中央値 64.5 ms**）を
+    /// **起動後の最初の発話が払う。** `begin()` の復帰前に来たバッファは黙って
+    /// 捨てられるので、**その費用は発話の頭の取りこぼしとして出る**（carry-ins 項目 7）。
+    @Test("起動時に認識セッションを 1 往復させて捨てる")
+    func warmUpRunsThrowawayTranscriptionRoundTrip() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root)
+
+            await rig.session.warmUp()
+
+            try await waitUntil("捨て往復が終わる") { rig.transcriber.finishCount == 1 }
+            #expect(rig.transcriber.beginCount == 1, "捨て往復で解析器を作っていない")
+            // **畳んだことまで見る。** `begin()` だけして `finish()` しないと、
+            // 解析器が 1 つ生きたまま次の発話の解析器が作られる（詳細設計書 §4.3.1）。
+            #expect(rig.transcriber.finishCount == 1, "捨て往復の解析器を畳んでいない")
+        }
+    }
+
+    /// **起動は捨て往復を待たない。** 待つと、起動直後に押しても何も起きない時間が
+    /// できる（基本設計書 §4.1 の 9）。整形器の捨て推論と同じ扱いにする。
+    @Test("起動は認識器の捨て往復を待たない")
+    func startupDoesNotBlockOnTranscriberWarmUp() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                // 実機の初回 `begin()` は最大 540 ms。ここは待っているかどうかを
+                // 弁別できるよう 5 秒に広げてある。
+                transcriber: StubTranscriber(StubTranscriber.Script(beginDelay: .seconds(5)))
+            )
+
+            let started = ContinuousClock.now
+            await rig.session.warmUp()
+            let elapsed = ContinuousClock.now - started
+
+            // **線は 2 秒（壊れ検知であって要件値ではない）。** 弁別するのは
+            // 「捨て往復を待たない（数 ms）」と「待つ（5 秒）」。
+            #expect(
+                elapsed < .seconds(2),
+                "捨て往復の完了を待っている（線は壊れ検知。要件値ではない。実測 \(elapsed)）")
+            // **待たないことと、投げないことは違う。**
+            try await waitUntil("捨て往復が始まっている") { rig.transcriber.beginEntered == 1 }
+        }
+    }
+
+    /// **捨て往復と本番の `begin()` を同時に生かさない。**
+    ///
+    /// `SpeechModule` のインスタンスは 1 つの `SpeechAnalyzer` にしか装着できず、
+    /// 2 つ目へ渡すと異常終了する（詳細設計書 §4.3.1）。捨て往復を投げっぱなしに
+    /// する以上、**起動直後に押されたら次の `begin()` は往復の完了を待たねばならない。**
+    @Test("捨て往復が畳まれるまで、次の発話の begin() を始めない")
+    func firstUtteranceWaitsForThrowawayRoundTrip() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                transcriber: StubTranscriber(
+                    StubTranscriber.Script(beginDelay: .milliseconds(200)))
+            )
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            // 捨て往復が終わる前に押す。実機では起動直後に押した場合に当たる。
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("本番の begin() に入る") { rig.transcriber.beginEntered == 2 }
+
+            #expect(
+                rig.transcriber.finishCount == 1,
+                "捨て往復を畳む前に 2 つ目の解析器を作った（詳細設計書 §4.3.1）")
         }
     }
 

@@ -149,6 +149,7 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
     }
 
     func finish() async throws {
+        order?.record("transcriber.finish")
         let continuation = state.withLock { state -> AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation? in
             state.finishCount += 1
             state.fedFramesAtFinish = state.fedFrames

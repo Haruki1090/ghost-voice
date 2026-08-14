@@ -327,7 +327,8 @@ struct CLIShutdownTests {
             hotkey.emit(.pressed)
             // **`begin()` に入った時点で終了要求を出す。** ここは phase だけが立っていて、
             // `state` はまだ `.idle`、門も何も観測していない。
-            try await waitUntil("begin() に入る") { transcriber.beginEntered == 1 }
+            // **1 回目は起動時の捨て往復**（`warmUpTranscriber()`）。押下で始まるのは 2 回目。
+            try await waitUntil("begin() に入る") { transcriber.beginEntered == 2 }
             #expect(await session.state == .idle, "この検査が窓を通っていない（前提が崩れた）")
 
             let release = Task {

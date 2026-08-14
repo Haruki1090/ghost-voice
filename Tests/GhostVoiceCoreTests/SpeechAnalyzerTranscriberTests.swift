@@ -298,6 +298,7 @@ struct Streaming {
         try await transcriber.finish()
         let finishReturned = ContinuousClock.now
         try await consumer.value          // 結果ストリームの終了まで待つ
+        let streamEnded = ContinuousClock.now
 
         let finals = await log.finals
         let volatiles = await log.volatileCount
@@ -309,6 +310,11 @@ struct Streaming {
               + "（うちキー解放前 \(finals.filter { $0 < released }.count) 件）")
         print("V-2 キー解放 → finish() 復帰: \(finishReturned - released)")
         print("V-2 キー解放 → .final 受信: \(finalAt - released)")
+        // **M2 の定義はこちらへ移った**（V-12 の修正）。「最初の確定」で先へ進むと
+        // 解放後に届く 2 件目が読まれず、発話の末尾が失われる（要件定義書 §2.8.4）。
+        // 待つべきは「これ以上テキストが来ない」と判る時点＝結果ストリームの終端である。
+        print("V-2 キー解放 → 結果ストリーム終端（現行の M2）: \(streamEnded - released)")
+        print("V-2 .final から終端までの上乗せ: \(streamEnded - finalAt)")
 
         // **この境界は要件値ではない。** 要件は `docs/01-requirements.md`（NFR-P3 200 ms）、
         // 実測は各タスクレポートの 2 条件計測が担う。ここが見るのは「明らかに壊れている」水準だけ。
@@ -319,6 +325,9 @@ struct Streaming {
         // 無いより悪い。桁の異なる回帰（700 ms〜数秒）は 500 ms でも確実に捕まる。
         #expect(finalAt - released < .milliseconds(500),
                 "確定レイテンシが桁で悪化している（要件 NFR-P3 は 200 ms。ここは壊れ検知の線）")
+        // **現行の M2 はこちらである。** 同じ根拠で同じ線を置く。
+        #expect(streamEnded - released < .milliseconds(500),
+                "終端までの所要が桁で悪化している（要件 NFR-P3 は 200 ms。ここは壊れ検知の線）")
     }
 
     /// M1 の一部: `begin()` の所要（キー押下 → バッファを供給できる状態）。
@@ -374,6 +383,79 @@ struct Streaming {
             try await transcriber.finish()
             for try await _ in stream {}
         }
+    }
+
+    /// **起動時の捨て往復**（`DictationSession.warmUpTranscriber()`）を実物で確かめる。
+    ///
+    /// 起動後の最初の `begin()` は実測 中央値 44.2 ms（低負荷）／ 64.5 ms（負荷下）・
+    /// 最大 540.4 ms 掛かり、**その費用は発話の頭の取りこぼしとして出る**
+    /// （`begin()` 復帰前のバッファは黙って捨てられる）。起動時に 1 往復させて
+    /// 捨てておけば、最初の発話が払うのはウォーム後の値（1.6〜2.2 ms）になる。
+    ///
+    /// ここで確かめるのは 2 つ。
+    ///
+    /// 1. **捨てた解析器が確実に畳まれること。** `SpeechModule` のインスタンスは
+    ///    1 つの `SpeechAnalyzer` にしか装着できない（§4.3.1）。畳まれていなければ
+    ///    次の発話が認識されない（あるいは異常終了する）。
+    /// 2. **往復の費用**（`begin()` と、入力を 1 バッファも与えない `finish()`）。
+    ///    起動直後に押された場合、その押下はこの残りを待つ。
+    ///
+    /// - Note: **1 回目が「コールド」かどうかは、このスイートの実行順に依る。**
+    ///   同一プロセスで先に別の検査が解析器を作っていれば、ここはウォームな値になる。
+    ///   コールドを見るときは `--filter` で単独実行すること。
+    @Test("M1a: 起動時の捨て往復と、その直後の begin()")
+    func throwawayRoundTripLeavesNoLiveAnalyzer() async throws {
+        let transcriber = try await prepared()
+        let format = try #require(await transcriber.requiredAudioFormat)
+        let buffers = try SpeechFixtures.buffers(
+            from: SpeechFixtures.audioURL, to: format, limitSeconds: 5)
+
+        // --- 捨て往復。**音声は 1 バッファも供給しない。**
+        let coldStart = ContinuousClock.now
+        let throwaway = try await transcriber.begin()
+        let coldBegin = ContinuousClock.now - coldStart
+        let finishStart = ContinuousClock.now
+        try await transcriber.finish()
+        let throwawayFinish = ContinuousClock.now - finishStart
+        // 実装と同じく、`finish()` を跨いでからストリームを手放す。
+        withExtendedLifetime(throwaway) {}
+
+        // --- 起動後の最初の発話に当たる往復
+        let warmStart = ContinuousClock.now
+        let stream = try await transcriber.begin()
+        let warmBegin = ContinuousClock.now - warmStart
+        for buffer in buffers { await transcriber.feed(SpeechFixtures.detachedCopy(of: buffer)) }
+        try await transcriber.finish()
+
+        var text = ""
+        for try await update in stream {
+            if case .final(let recognized) = update { text += recognized }
+        }
+
+        print("M1a 捨て往復 begin(): \(coldBegin)")
+        print("M1a 捨て往復 finish()（入力ゼロ）: \(throwawayFinish)")
+        print("M1a 捨て往復 合計: \(coldBegin + throwawayFinish)")
+        print("M1a 捨て往復の直後の begin(): \(warmBegin)")
+
+        // **これが 1 の検査である。** 捨てた解析器が生きたままだと、
+        // 2 つ目の解析器へ同じ種類のモジュールを装着することになる。
+        #expect(!text.isEmpty, "捨て往復のあとの発話が認識されない（解析器が畳まれていない）")
+
+        // **どちらも壊れ検知の線であって要件値ではない**（規律 10）。
+        // NFR-P1 の達成可否は V-9 の M1a 実測と、上の出力が示す。
+        //
+        // **どちらも 2 秒に置いてある。もっと締めた線は置けない。** 実測（2026-08-14 /
+        // M3 / macOS 26.5.2 / 各 8 回）では、負荷下でコールドの `begin()` が
+        // 中央値 158 ms / 最大 1110 ms、ウォームが 中央値 3.0 ms / **最大 106 ms** で、
+        // **2 つの分布が重なる。** さらに「1 回目がコールドか」は同一プロセス内の
+        // 実行順に依るので、比（ウォーム ≪ コールド）で判定することもできない。
+        // ウォーム経路の回帰は `measuresBeginLatency` の 50 ms 線が担当する。
+        #expect(
+            throwawayFinish < .seconds(2),
+            "入力ゼロの finish() が桁で悪化している（線は壊れ検知）: \(throwawayFinish)")
+        #expect(
+            warmBegin < .seconds(2),
+            "捨て往復の直後の begin() が桁で悪化している（線は壊れ検知）: \(warmBegin)")
     }
 }
 }
