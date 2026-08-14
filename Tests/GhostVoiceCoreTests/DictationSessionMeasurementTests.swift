@@ -26,6 +26,14 @@ final class ReplayAudioCapture: AudioCapturing, @unchecked Sendable {
     }
 
     var level: AsyncStream<Float> { levelStream }
+
+    /// **常に 0 を返す。この代役ではドロップを観測できない。**
+    ///
+    /// 形式変換の失敗は `EngineAudioCapture` の変換経路でしか起きず、ここは
+    /// 変換を通さない。したがって `Metrics.Sample.droppedBuffers` は必ず
+    /// `0 - 0 = 0` になる。**この計測から「ドロップが無かった」とは言えない**
+    /// （言えるのは「測っていない」だけ）。発話ごとの差分そのものの検査は
+    /// `countsDroppedBuffersPerUtterance` が `StubAudioCapture` で行う。
     var droppedBufferCount: Int { 0 }
 
     func prepare() throws {}
@@ -78,8 +86,18 @@ extension SpeechDependentTests {
     ///
     /// > **クリップボードは名前付きのものを使う。** `NSPasteboard.general` に触れると
     /// > 開発機で `swift test` を回した瞬間にユーザーのクリップボードが消える。
+    /// > **既定の `swift test` では走らない。** `GHOST_VOICE_MEASURE=1 swift test` で有効になる。
+    /// >
+    /// > 10 発話 × 3 秒の実認識と実 LLM を回すので 40 秒近く掛かり、**機体を飽和させる。**
+    /// > 実時間を閾値にしている既存のテストは、飽和した条件で `Task.sleep` のタイマー配送が
+    /// > 遅れると落ちる（申し送り【12】の断続的失敗と同じ形）。計測は必要なときに明示的に
+    /// > 回すもので、毎回の回帰検査に混ぜる性質のものではない。
+    /// > Task 7 が `GHOST_VOICE_MIC_TESTS=1` で確立した opt-in の前例に倣う。
     @Suite(
         "M5: キー解放から挿入完了まで",
+        .enabled("GHOST_VOICE_MEASURE=1 を付けると実行される") {
+            ProcessInfo.processInfo.environment["GHOST_VOICE_MEASURE"] == "1"
+        },
         .enabled("音声フィクスチャが要る") { SpeechFixtures.audioExists },
         .enabled(if: FoundationModelRefiner().isAvailable, "Apple Intelligence が要る")
     )
@@ -164,8 +182,7 @@ extension SpeechDependentTests {
             for (index, sample) in samples.enumerated() {
                 print(
                     "  #\(index + 1) M2=\(sample.finalizeMs) M3=\(sample.refineMs)"
-                    + " M4=\(sample.insertMs) 合計=\(sample.totalMs)"
-                    + " 捨てたバッファ=\(sample.droppedBuffers)")
+                    + " M4=\(sample.insertMs) 合計=\(sample.totalMs)")
             }
             for (name, values) in [
                 ("M2 確定", samples.map(\.finalize)),
@@ -184,6 +201,7 @@ extension SpeechDependentTests {
             print("M5 整形が 500 ms を超えた発話: \(over)/\(samples.count)")
             print("M5 NFR-P6（1000 ms）を満たした発話: \(samples.filter(\.meetsTarget).count)/\(samples.count)")
             print("M5 挿入経路: .clipboardOnly 固定（⌘V の往復と復元待ちは未計上。V-3 待ち）")
+            print("M5 捨てたバッファ: 未計測（代役の droppedBufferCount は定数 0）")
         }
 
         static func median(_ values: [Duration]) -> Duration {

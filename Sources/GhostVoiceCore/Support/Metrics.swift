@@ -19,6 +19,14 @@ public enum Metrics {
         /// 整形しなかった場合はほぼ 0。
         public let refine: Duration
         /// M4: 整形完了 → 挿入完了。目標 50 ms（NFR-P5）。
+        ///
+        /// - Important: **これは NFR-P5 と同じ量ではない。** ここが測るのは
+        ///   `TextInserting.insert(_:)` の実時間なので、Pasteboard 経路を通った場合は
+        ///   クリップボードの**復元待ち 120 ms が入る**。詳細設計書 §6.3 は
+        ///   「挿入はテキストが貼り付いた時点で完了しており、復元はその後始末」として
+        ///   その 120 ms を NFR-P5 に数えない。**この値を NFR-P5 と直接比べないこと**
+        ///   （経緯と予算配分は詳細設計書 §10 の「M4 について」）。
+        ///   一段目の AX 経路（往復 0.1〜5.5 ms）にはこの待ちが無い。
         public let insert: Duration
 
         /// この発話の間に**変換に失敗して捨てられた**バッファの数。
@@ -49,16 +57,6 @@ public enum Metrics {
             self.droppedBuffers = droppedBuffers
         }
 
-        public init(finalizeMs: Int, refineMs: Int, insertMs: Int, droppedBuffers: Int = 0) {
-            self.init(
-                finalize: .milliseconds(finalizeMs), refine: .milliseconds(refineMs),
-                insert: .milliseconds(insertMs), droppedBuffers: droppedBuffers
-            )
-        }
-    }
-
-    static func elapsed(since start: ContinuousClock.Instant) -> Duration {
-        ContinuousClock.now - start
     }
 
     static func milliseconds(_ duration: Duration) -> Int {
