@@ -12,7 +12,7 @@
 | # | 方針 | 理由 |
 |---|---|---|
 | 1 | コアロジックを Swift Package に分離し、アプリは UI と OS 統合のみを担う | NFR-M2（テスト容易性）、NFR-M3（OSS 公開） |
-| 2 | 外部依存を最小化する。導入するのは notch UI ライブラリのみ | 条件 C-2（軽量）、OSS 公開時の可読性 |
+| 2 | **外部依存パッケージを持たない。** notch HUD も自前の `NSPanel` で実装する（§8.3） | 条件 C-2（軽量）、OSS 公開時の可読性 |
 | 3 | 認識・整形・挿入の各段をプロトコルで抽象化する | NFR-M1（差し替え可能）、R-2 / R-4 への対応 |
 | 4 | 失敗時は必ず縮退動作を持たせ、発話を失わない（**例外は secure input 中のみ**。§7） | 音声は再現できないため。R-4 / R-5 |
 | 5 | 常時起動しておくべきものは起動時に温めておく | NFR-P1 / NFR-P4。コールドスタートは実測 1.906 秒（設計調査）／ 3.318 秒（Task 6）。**`FoundationModels` は捨て推論を通さないと温まらない**（§6） |
@@ -359,10 +359,28 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 ### 8.1 HUD の配置
 
 - 表示先は**常に内蔵ディスプレイ**（FR-3）。外部ディスプレイで作業中も内蔵側に表示する。
-- 内蔵ディスプレイは `NSScreen.screens` から `safeAreaInsets.top > 0`（notch の存在）で判定し、該当がなければ `NSScreen.screens.first` にフォールバックする。
-- ウィンドウレベルは全画面表示アプリより上に出す必要がある。`NSPanel` を `.nonactivatingPanel` で構成し、フォーカスを奪わない。
+- **内蔵ディスプレイの判定は `CGDisplayIsBuiltin` で行う。** 実測で内蔵 = 1 / 外部 = 0 を返した（2026-08-14 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2 / 内蔵 + DELL S2722QC の 2 画面）。詳細設計書 §7.1。
+- **その画面に notch があるかは別の問い**であり、`auxiliaryTopLeftArea` / `auxiliaryTopRightArea` が非 nil かで判定する（表示形状の分岐に使う）。
+- ウィンドウレベルは全画面表示アプリとメニューバーより上に出す必要がある。**`.statusBar + 1`（= 26）を採る**（z 順の実測は詳細設計書 §7.2）。
+- `NSPanel` を `.borderless` + `.nonactivatingPanel` で構成し、フォーカスを奪わない。
+- **HUD の window は `NSApp.run()` が始まった後にだけ生成・表示する**（実測。下記）。
+
+> **以前の記述（`safeAreaInsets.top > 0` で判定し、該当がなければ `NSScreen.screens.first` へフォールバックする）は誤りだったので取り消した。**
+> この機体ではたまたま正しい答えを出すが、**notch 非搭載の MacBook では内蔵でも `safeAreaInsets.top == 0` になる**ため内蔵を内蔵と認識できない。
+> また `NSScreen.screens.first` は主ディスプレイであって内蔵とは限らない（実測でも `NSScreen.main != NSScreen.screens.first` だった）。
 
 > **フォーカスを奪わないことは必須要件である。** 挿入先アプリのフォーカスが外れると、テキストの挿入先が失われる。
+>
+> **`NSApp.run()` の前に window を `orderFrontRegardless()` すると、AppKit が `finishLaunching` の時点でアプリを活性化する**（実測）。
+> `setActivationPolicy(.accessory)` を先に呼んでいても、`.nonactivatingPanel` でも、`canBecomeKey == false` でも防げない。
+> 活性化すると `AccessibilityInserter.frontmostProcessIdentifier()` が拾う最前面 pid が Ghost Voice 自身になり、**挿入先が壊れる。**
+> したがって「起動時に非表示の HUD を用意しておく」実装にしてはならない。詳細設計書 §7.2。
+
+### 8.1.1 内蔵ディスプレイが存在しない構成（クラムシェル）
+
+蓋を閉じて外部ディスプレイだけで使う場合、内蔵は `NSScreen.screens` から消えるため `CGDisplayIsBuiltin` の該当は無くなる（**この状態の実測は未実施。V-22**）。
+FR-3 は物理的に満たせないので、要件定義書 §4.3 の「notch 非搭載機ではフォールバック表示」と同じ扱いにする。
+候補は (a) 主ディスプレイのメニューバー右端付近に小さく出す、(b) HUD を出さずメニューバーアイコンの状態変化だけにする、の 2 つで、**どちらを採るかはフェーズ 2 の実装時に決める（未決定）。**
 
 ### 8.2 表示内容
 
@@ -378,10 +396,19 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 
 | 案 | 内容 | 判断 |
 |---|---|---|
-| A | [DynamicNotchKit](https://github.com/MrKai77/DynamicNotchKit)（MIT / macOS 13+ / 活発）を採用 | **採用**。notch の形状検出と展開アニメーションは自前実装するとコストが高い |
-| B | `NSPanel` を自前実装 | 不採用。ただし DynamicNotchKit が FR-3（表示先の固定）に対応できない場合は自前実装へ切り替える |
+| A | [DynamicNotchKit](https://github.com/MrKai77/DynamicNotchKit)（MIT / macOS 13+ / 活発）を採用 | **不採用**（2026-08-14 に裁定） |
+| B | `NSPanel` を自前実装 | **採用** |
 
-**確認事項**: DynamicNotchKit が「外部ディスプレイ使用中に内蔵ディスプレイへ表示する」制御に対応しているかは未確認。詳細設計時に検証し、非対応なら案 B へ切り替える（V-5 として §11 に追加）。
+**当初は案 A を採っていたが、案 B へ改めた。** 理由は次のとおり。
+
+1. **案 B の難所とされた 2 点は、どちらも実測で解決した**（2026-08-14 / M3 / macOS 26.5.2）。
+   内蔵ディスプレイの特定は `CGDisplayIsBuiltin`（§8.1）、フォーカスを奪わないことは
+   `.borderless` + `.nonactivatingPanel` + `orderFrontRegardless()`（詳細設計書 §7.2）で成立することを確かめた。
+2. **残る差は形状（notch の角丸との連続）と展開アニメーションだけ**であり、これは機能要件ではない。
+3. 案 B は **FR-3（表示先を内蔵へ固定する）を完全に制御できる。** 他人の実装の都合に縛られない。
+4. **外部依存ゼロを維持できる**（§1 の方針 2）。
+
+**V-5（DynamicNotchKit が FR-3 に対応するか）は「採用しないため問わない」として閉じた。**
 
 ---
 
@@ -424,12 +451,64 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 
 | 項目 | 内容 |
 |---|---|
-| App Sandbox | **無効**（AX API に必須） |
-| Hardened Runtime | 有効 |
-| 必要な Info.plist | `NSMicrophoneUsageDescription`（**`NSSpeechRecognitionUsageDescription` は不要**。`SpeechAnalyzer` は音声認識の TCC を要求しない。実測 V-14） |
+| バンドルの作り方 | **SwiftPM の実行ファイルターゲット + 後段の組み立てスクリプト**（`Scripts/make-app.sh` 相当が `Contents/MacOS/` へ実行ファイルを置き、`Info.plist` を書き、`codesign` する）。**`.xcodeproj` は作らない**（下記） |
+| App Sandbox | **無効**（AX API に必須）。entitlement を書かないことで無効にする |
+| Hardened Runtime | 有効（`codesign --options runtime`） |
+| 署名 | **Apple Development 証明書（または Developer ID）で署名する。ad-hoc（`-s -`）は採らない**（下記） |
+| 必要な Info.plist | `NSMicrophoneUsageDescription`（**`NSSpeechRecognitionUsageDescription` は不要**。`SpeechAnalyzer` は音声認識の TCC を要求しない。実測 V-14）。ほかに `CFBundleIdentifier` / `CFBundleName` / `CFBundleExecutable` / `CFBundlePackageType`(`APPL`) / `CFBundleShortVersionString` / `CFBundleVersion` / `LSMinimumSystemVersion`(`26.0`) / `LSUIElement` / `NSHighResolutionCapable` |
+| 必要な entitlements（署名時に渡す。`Info.plist` ではない） | `com.apple.security.app-sandbox` は書かない（＝無効）。`com.apple.security.device.audio-input` = `true`（Hardened Runtime 下のマイク使用に要る。**Apple の仕様であって本プロジェクトでは未実測。V-17**）。`com.apple.security.automation.apple-events` は不要 |
 | 必要な TCC 権限 | マイク、アクセシビリティ（`kTCCServiceAccessibility` と `kTCCServicePostEvent` の両方）、キーイベント監視（`kTCCServiceListenEvent` / 入力監視。ホットキーの `CGEventTap` に要る）。**音声認識は不要**（実測 V-14） |
-| `LSUIElement` | `true`（Dock に表示しない） |
-| 配布 | Developer ID 署名 + notarization。Mac App Store は不可（要件定義書 §5） |
+| `LSUIElement` | `true`（Dock に表示しない）。**実測でコードを 1 行も書かずに `activationPolicy == .accessory` になった**（2026-08-14 / M3 / macOS 26.5.2。手で組み立てた `.app` で確認）。`setActivationPolicy(.accessory)` の明示呼び出しは要らない |
+| 配布 | Developer ID 署名 + notarization。Mac App Store は不可（要件定義書 §5）。**自分でビルドして自分で使う間は公証は要らない**——自前ビルドの `.app` には `com.apple.quarantine` が付かず、`open` で警告なく起動した（実測 2026-08-14） |
+
+> **アクセシビリティ・入力監視・キー送出には、`Info.plist` に書けるキーが存在しない**（実測 2026-08-14）。
+> macOS の TCC 本体（`/System/Library/PrivateFrameworks/TCC.framework/Support/tccd`）が参照する
+> `NS…UsageDescription` キーを列挙したところ、`kTCCServiceAccessibility` / `kTCCServiceListenEvent` /
+> `kTCCServicePostEvent` に対応するキーは 1 つも無かった（`NSMicrophoneUsageDescription` は存在する）。
+> これら 3 つは「アプリが説明文を出す」形式ではなく、**利用者がシステム設定で明示的に追加する形式**である。
+> `NSAccessibilityUsageDescription` のような名前を書いても**無視されるだけ**なので書かない。
+>
+> **`NSAppleEventsUsageDescription` も書かない。** Ghost Voice は Apple Events でアプリを操作しない
+> （挿入は AX API と `CGEvent.post`。詳細設計書 §6）。書くと無関係なダイアログの余地を作るだけである。
+
+> **なぜ ad-hoc 署名を採らないか（実測 2026-08-14 / M3 / macOS 26.5.2 / Xcode 26.6）。**
+> ad-hoc 署名の designated requirement（DR）は既定で **`cdhash` 単体**であり、identifier もチーム ID も入らない。
+> `codesign` 自体は決定的だが（同じ入力なら同じ cdhash）、**実コードを 1 箇所変えて再ビルドすると cdhash は別物になる**
+> （`Info.plist` の `CFBundleVersion` を 1 つ上げるだけでも変わった）。TCC の許可は DR に紐づくので、
+> ad-hoc のままだと**ビルドのたびに 4 つの権限を付け直させる**設計になる。
+> Apple Development 証明書で署名すると DR は
+> `identifier "…" and anchor apple generic and certificate leaf[subject.CN] = "…"` の形になり、
+> **実コードを変えて再ビルドしても DR の文字列は 1 文字も変わらなかった**（cdhash は変わる）。
+> 実在アプリ（VS Code / Chrome / Calculator）の DR にも cdhash は入っていない。
+> **ただし「証明書署名なら再ビルド後も TCC の許可が実際に残る」ことは未実測である（V-16）。** 許可の付与が要るため。
+>
+> **`CFBundleIdentifier` は一度決めたら変えない。** DR に焼き込まれるので、変えると許可がすべて失われ、
+> システム設定の一覧に古い項目が残る。
+
+> **`.xcodeproj` を作らない理由。** `project.pbxproj` は差分が読めず競合の温床で、正本＝ドキュメントという本プロジェクトの規律と噛み合わない。
+> ビルド構成が Xcode の GUI へ散ると、上の表と実物の対応が取れなくなる。
+> また `swift package generate-xcodeproj` は既に存在しない（実測）ので、作るなら手で保守することになる。
+> SwiftUI の `@main struct App`（`MenuBarExtra` / `Settings` を含む）が `swift build` だけで通ること、
+> `View` を含むライブラリとテストターゲットを同居させても `swift test` が影響を受けないことは実測済みである（2026-08-14）。
+
+### 10.1 フェーズ 1 の許可は `.app` へ引き継がれない（実測 2026-08-14）
+
+同一の `.app` を「ターミナルから直接実行」と「`open` で起動（LaunchServices）」の 2 通りで走らせ、**照会だけ**を行った
+（要求系 API は呼ばず、ダイアログは 1 つも出していない）。
+
+| 照会項目 | ターミナルから直接実行 | `open` で起動 |
+|---|---|---|
+| `AVCaptureDevice.authorizationStatus(for: .audio)` | `.authorized` | **`.notDetermined`** |
+| `AXIsProcessTrusted()` | true | **false** |
+| `CGPreflightListenEventAccess()` | true | **false** |
+| `CGPreflightPostEventAccess()` | true | **false** |
+| `getppid()` | ターミナル | **1（launchd）** |
+
+→ **`.app` は Finder / Dock / `open` から起動された瞬間に自分自身が責任プロセスになり、ターミナルアプリの許可を一切引き継がない。**
+したがって**フェーズ 2 では 4 つの権限を Ghost Voice.app に対して付け直してもらう必要がある**（FR-10。詳細設計書 §9）。これは避けられない。
+
+**手順書には「ターミナルから `Ghost Voice.app/Contents/MacOS/…` を直接叩かないこと」を書く。**
+叩くとターミナルの許可を引き継いでしまい、「動いているのに Finder から起動すると動かない」という切り分け不能な状態になる。
 
 > `AXUIElement` 系 API は `kTCCServiceAccessibility`、`CGEvent.post` は `kTCCServicePostEvent`、`CGEvent.tapCreate`（ホットキー）は `kTCCServiceListenEvent` という**それぞれ別の TCC サービス**を使う。前 2 つは「システム設定 > プライバシーとセキュリティ > アクセシビリティ」に、`kTCCServiceListenEvent` は「入力監視」に表示されるが、内部的にはいずれも別枠である。二段構えの挿入（§5.2）は前 2 つを、ホットキー監視は 3 つ目を必要とする。
 >
@@ -443,9 +522,18 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 
 | ID | 内容 |
 |---|---|
-| V-5 | DynamicNotchKit が「外部ディスプレイ使用中に内蔵ディスプレイの notch へ表示する」制御に対応しているか |
-| V-6 | `.nonactivatingPanel` 構成の HUD がフォーカスを奪わないこと |
+| ~~V-5~~ | ~~DynamicNotchKit が「外部ディスプレイ使用中に内蔵ディスプレイの notch へ表示する」制御に対応しているか~~ **閉じた。DynamicNotchKit を採用しないため問わない**（§8.3） |
+| V-6 | `.nonactivatingPanel` 構成の HUD がフォーカスを奪わないこと。**一部実測済み**（§8.1 / 詳細設計書 §7.2）。残るのは実バンドル・本番構成での確認 |
 | V-7 | ウォームアップ常駐時のアイドルメモリが NFR-S3（150 MB）以内に収まること |
+| V-16 | Apple Development 証明書で署名した `.app` の TCC 許可が、再ビルド・再署名の後も残ること（§10） |
+| V-17 | Hardened Runtime 下で `com.apple.security.device.audio-input` が無いとマイクを開けないこと（§10） |
+| V-18 | `.app` を移動（`~/Downloads` → `/Applications`）すると許可が無効になるか（§10） |
+| V-19 | `NSApp.run()` の下で `CGEventTap` のイベントが届くこと（詳細設計書 §7.2） |
+| V-20 | notch の切り欠きそのものに描いた内容が見えるか（詳細設計書 §7.1） |
+| V-21 | `.canJoinAllSpaces` / `.fullScreenAuxiliary` が効くこと（全 Space・他アプリのフルスクリーン上での表示） |
+| V-22 | クラムシェル（内蔵が `NSScreen.screens` に無い）ときの表示先（§8.1.1） |
+
+詳細と実施時期は詳細設計書 §13 の一覧に集約する。
 
 ---
 
