@@ -458,21 +458,39 @@ final class BackgroundLoad: Sendable {
 /// **AX が遅い相手でも押下が待たされないこと**である。
 /// だから注入 0 ms では測らない（対処前でも通ってしまい、何も掴めない）。
 ///
-/// **線は 25 ms（壊れ検知であって要件値ではない）。** 要件は NFR-P1 の 50 ms で、
-/// それを見るのは実アプリでの計測（V-36 / V-28）である。
-/// 注入 10 ms での実測 最大 3.1 ms に対して 8 倍、対処前の 164 ms に対しては 1/6.5 で、
+/// ## 線の引き直し（2026-08-15。再レビュー C-1 と同じ形の欠陥だった）
+///
+/// **注入 10 ms・線 25 ms では、全件並列実行の裾で落ちた**——実観測 173.4 ms（1 回）。
+/// 25 ms は「対処後の実測 3 ms」に対しては十分でも、**対処前の信号（164 ms）と
+/// 並列実行の雑音（173 ms）が重なっていた**ので、線をどこへ動かしても
+/// 「雑音で落ちる」か「退行を見逃す」のどちらかになる。**信号の側を大きくして離す。**
+///
+/// **注入を 40 ms にした**（対処前の待ち ≒ 12 往復 × 40 ms ≒ 480 ms）。
+/// 対処後は往復コストに依存しないので、実測は 10 ms のときと変わらない:
+///
+/// | 条件 | 回数 | 押下 → 録音開始 |
+/// |---|---|---|
+/// | 低負荷・この検査だけ（注入 40 ms） | 3 | 1.40 / 1.44 / 1.92 ms |
+/// | 全件並列（注入 40 ms） | 3 | 2.11 / 2.24 / 2.28 ms |
+/// | 全件並列（注入 10 ms。引き直す前） | 8 | 0.04〜2.89 ms（**別に 173.4 ms が 1 回**） |
+///
+/// **線は 250 ms（壊れ検知であって要件値ではない）。** 実測の最大 2.3 ms の約 100 倍、
+/// 観測された最悪の雑音 173 ms より上、**対処前の信号 480 ms のおよそ半分**なので、
 /// **actor を握る実装へ戻した瞬間に赤くなる。**
+/// 要件は NFR-P1 の 50 ms で、それを見るのは実アプリでの計測（V-36 / V-28）である。
 @Suite("差し替えが PTT を待たせないこと（V-36 の退行検知）")
 struct RevisionBlockingRegressionTests {
 
     @Test("AX が遅い相手でも、差し替えの最中の押下から録音開始までが壊れ検知の線を割らない")
     func pressDuringRevisionStaysResponsive() async throws {
         try await withTempRoot { root in
-            // **1 往復 10 ms を注入する。** 0 ms だと差し替えが actor を握っていても
+            // **1 往復 40 ms を注入する。** 0 ms だと差し替えが actor を握っていても
             // 通ってしまい、この検査は何も掴まない（対処前の実測 2.5 ms）。
+            // 10 ms では対処前の信号（164 ms）が並列実行の雑音（実観測 173 ms）に
+            // 埋もれたので、**信号の側を大きくして離した**（上の表）。
             let accessibility = LatencyInjectingAccessibility(
                 BlockingWorld.accessibility(for: BlockingWorld.freshField()),
-                perCall: .milliseconds(10))
+                perCall: .milliseconds(40))
             let settings = SettingsStore(rootURL: root)
             try settings.update { $0.refinementApplyMode = .afterInsert }
             let hotkey = StubHotkeyMonitor()
@@ -525,8 +543,9 @@ struct RevisionBlockingRegressionTests {
             hotkey.emit(.released)
             try await waitUntil("後始末", timeout: .seconds(30)) { await session.state == .idle }
 
+            print("V-36 退行検知: 押下から録音開始まで \(elapsed)")
             #expect(
-                elapsed < .milliseconds(25),
+                elapsed < .milliseconds(250),
                 "差し替えが actor を握る時間が伸びている（線は壊れ検知。要件 NFR-P1 は 50 ms）: \(elapsed)")
         }
     }
