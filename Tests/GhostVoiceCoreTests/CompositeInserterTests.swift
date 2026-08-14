@@ -95,6 +95,50 @@ struct CompositeInserterTests {
         #expect(clipboard.left == ["失われては困る発話"])
     }
 
+    /// **`.clipboardOnly` は「クリップボードへ残した」という主張である**
+    /// （`TextInserting` の doc: 「`.inserted(.clipboardOnly)` を返すときは、
+    /// テキストが実際にクリップボードへ残っていること」）。
+    ///
+    /// 最後の砦が失敗したのに `.clipboardOnly` を返すと、利用者は
+    /// 「⌘V で貼れます」に従って取りに行き、**そこには何も無い。**
+    /// さらに履歴書き込みも失敗すると、**嘘を言ったうえで発話が完全に消える。**
+    @Test("最後の砦が失敗したら clipboardOnly と偽らない")
+    func doesNotClaimClipboardWhenTheLastResortFails() async {
+        let clipboard = StubClipboard(succeeds: false)
+        let composite = CompositeInserter(
+            primary: StubInserter(canInsert: false, succeeds: true),
+            fallback: StubInserter(canInsert: false, succeeds: true),
+            lastResort: clipboard,
+            isSecureInputEnabled: { false }
+        )
+
+        let outcome = await composite.insert("失われては困る発話")
+        #expect(
+            outcome != .inserted(.clipboardOnly),
+            "クリップボードへ置けていないのに『クリップボードへ残した』と報告している")
+        #expect(
+            !outcome.leftTextWithUser,
+            "テキストがどこにも無いのに『利用者の手元にある』と答えている")
+        // **それでも履歴には記録する。** 履歴がこの発話の最後の写しになる。
+        #expect(outcome.recordableMethod == .notInserted)
+    }
+
+    /// 対照。**置けたときは今までどおり `.clipboardOnly`** である。
+    @Test("最後の砦が成功したら clipboardOnly のまま")
+    func stillReportsClipboardOnlyWhenTheLastResortSucceeds() async {
+        let clipboard = StubClipboard(succeeds: true)
+        let composite = CompositeInserter(
+            primary: StubInserter(canInsert: false, succeeds: true),
+            fallback: StubInserter(canInsert: false, succeeds: true),
+            lastResort: clipboard,
+            isSecureInputEnabled: { false }
+        )
+
+        let outcome = await composite.insert("失われては困る発話")
+        #expect(outcome == .inserted(.clipboardOnly))
+        #expect(outcome.leftTextWithUser)
+    }
+
     /// 挿入に成功した場合まで最後の砦を叩くと、ユーザーのクリップボードを毎回
     /// 上書きすることになる。成功時は触ってはならない。
     @Test("挿入に成功したらクリップボードへは残さない")

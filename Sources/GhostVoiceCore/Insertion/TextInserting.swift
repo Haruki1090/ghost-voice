@@ -163,14 +163,22 @@ public struct StubInserter: PrimaryInserting {
 /// 合成器が書き込む記録が別物になる（`#expect(clipboard.left == [...])` が常に空を見る）。
 public final class StubClipboard: ClipboardLeaving {
     private let texts = Mutex<[String]>([])
+    private let succeeds: Bool
 
-    public init() {}
+    /// - Parameter succeeds: `leave` が成功したと答えるか。
+    ///   **false にできることが要る**——実装が戻り値を捨てていると、
+    ///   「クリップボードへ残した」が嘘になる経路を検査から駆動できない
+    ///   （最終レビュー A-2。常に true を返す代役しか無かったために見逃した）。
+    public init(succeeds: Bool = true) {
+        self.succeeds = succeeds
+    }
 
-    /// 残されたテキスト。
+    /// 残されたテキスト。**置けなかったものは含まない。**
     public var left: [String] { texts.withLock { $0 } }
 
     @discardableResult
     public func leave(_ text: String) -> Bool {
+        guard succeeds else { return false }
         texts.withLock { $0.append(text) }
         return true
     }

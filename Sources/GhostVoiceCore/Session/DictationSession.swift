@@ -80,6 +80,15 @@ public enum SessionFailure: Sendable, Equatable {
     ///   **false なら発話そのものが失われた。** 利用者にとって意味がまったく違うので、
     ///   同じ文言にしてはならない。
     case historyUnavailable(insertedElsewhere: Bool)
+
+    /// **どの経路でも挿入できず、クリップボードへも残せなかった**
+    /// （`InsertionOutcome.failedEverywhere`）。
+    ///
+    /// 以前はこの縮退が `.inserted(.clipboardOnly)` に化けており、
+    /// 利用者は「⌘V で貼れます」と告げられて空のクリップボードを見ることになった
+    /// （最終レビュー A-2）。**テキストは履歴にだけある**ので、
+    /// 案内する先は履歴画面（FR-9 の再挿入）である。
+    case insertionFailed
 }
 
 /// セッションの操作そのものが受け付けられなかった。
@@ -995,12 +1004,25 @@ public actor DictationSession {
         // **`.refusedSecureInput` は履歴に記録してはならない**（Task 8 の裁定）。
         // `recordableMethod` が nil を返すのがその一手間で、ここを素通りさせると
         // パスワードが `history.json` へ平文で入る。
-        if let method = outcome.recordableMethod,
-            !record(raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
-        {
-            // **テキストは利用者の手元にある。** 失ったのは履歴と Undo だけなので、
-            // 中断経路とは別の文言で伝える（`SessionFailure` の注記）。
-            fail(.historyUnavailable(insertedElsewhere: true))
+        if let method = outcome.recordableMethod {
+            let stored = record(
+                raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
+            // **上限 0 は失敗にしない。** 挿入できているので発話は利用者の手元にあり、
+            // 履歴を残さないのは利用者自身の指示である（`HistoryStore.normalized`）。
+            // 一方、**書けなかった**のは伝える。
+            if stored == .failed {
+                // 手元にテキストがあるかどうかで文言が変わる。
+                // **`.failedEverywhere` では手元にも無い**ので「発話そのものが失われた」。
+                fail(.historyUnavailable(insertedElsewhere: outcome.leftTextWithUser))
+                return
+            }
+        }
+
+        // **どこにも入らず、クリップボードへも残せなかった。** 履歴だけが写しである
+        // （`InsertionOutcome.failedEverywhere`）。以前はここが `.clipboardOnly` に
+        // 化けており、「⌘V で貼れます」と告げていた（最終レビュー A-2）。
+        guard outcome != .failedEverywhere else {
+            fail(.insertionFailed)
             return
         }
 
@@ -1109,9 +1131,28 @@ public actor DictationSession {
             rawText: raw, refinedText: nil,
             localeIdentifier: settings.localeIdentifier, insertionMethod: method
         )
-        guard record(entry) else {
+        // **書けなければ差し替えを始めない**（詳細設計書 §8.3）。
+        // 履歴に写しが無いまま欄を書き換えると、`.lost`（R-9）に落ちたときの
+        // 4 重の受けのうち 1 番目が抜ける。**上限 0 で「残らなかった」場合も同じ**——
+        // 直後の `history.update` が対象を見つけられないので、差し替えを始めてはならない。
+        let stored = record(entry)
+        guard stored == .stored else {
             refinement?.cancel()
-            fail(.historyUnavailable(insertedElsewhere: true))
+            if stored == .failed {
+                fail(.historyUnavailable(insertedElsewhere: inserted.outcome.leftTextWithUser))
+            } else {
+                // 上限 0。**発話は欄にある**ので失敗ではないが、整形は反映できない。
+                notify(.refinementNotApplied(nil))
+                finishIdle()
+            }
+            return
+        }
+
+        // (b) 分岐と同じ扱い。**クリップボードへも残せていない**ので、
+        // 案内する先は履歴画面（FR-9 の再挿入）だけである。
+        guard inserted.outcome != .failedEverywhere else {
+            refinement?.cancel()
+            fail(.insertionFailed)
             return
         }
 
@@ -1217,8 +1258,15 @@ public actor DictationSession {
         // **履歴を先に確保する**（詳細設計書 §8.3）。raw と refined の両方が履歴に
         // ある状態で初めて欄を触る。**書けなければ差し替えを始めない**——
         // 差し替えの途中で発話が判らなくなったとき（R-9）、履歴が 1 番目の受けである。
+        // **戻り値も見る。** `update` は対象が見つからなければ何も書かず `false` を返す
+        // （上限 0 で押し出された／履歴画面から消された／`setLimit` で切り詰められた）。
+        // 例外が出ないので、捨てているとそのまま差し替えへ進んでいた（最終レビュー C-2）。
         do {
-            try history.update(id: entryID, refinedText: refined)
+            guard try history.update(id: entryID, refinedText: refined) else {
+                // 履歴に写しが無い。**欄は 1 文字も触らない。** 生テキストが残る。
+                notify(.refinementNotApplied(nil))
+                return
+            }
         } catch {
             notify(.refinementNotApplied(nil))
             if canShowState { emit(.failed(.historyUnavailable(insertedElsewhere: true))) }
@@ -1354,9 +1402,14 @@ public actor DictationSession {
     /// 履歴側の述語（`HistoryEntry.isAutomaticUndoCandidate`）の一方の条件を満たしてしまい、
     /// **一度も挿入していない文字列が「直近の整形済み発話」として履歴 UI に載る。**
     /// **経路（`.notInserted`）でも弾かれるので二重に守られているが、ここを緩めないこと。**
+    ///
+    /// - Important: **上限 0 でも「成功」にしてはならない。** `append` は何も保存せず
+    ///   例外も投げないので、2 値で扱っていた頃は成功として待機へ落ちていた。
+    ///   中断された発話にとって履歴は**唯一の写し**なので、残らなかったのなら
+    ///   それは「発話そのものが失われた」である（最終レビュー A-1）。
     private func finishCancelled(raw: String, locale: String) {
         if !raw.isEmpty,
-            !record(raw: raw, refined: nil, locale: locale, method: .notInserted)
+            record(raw: raw, refined: nil, locale: locale, method: .notInserted) != .stored
         {
             // **この発話はどこにも残っていない。** 挿入していないので手元にも無い。
             fail(.historyUnavailable(insertedElsewhere: false))
@@ -1365,7 +1418,23 @@ public actor DictationSession {
         finishIdle()
     }
 
-    /// - Returns: 書けたか。**握り潰してはならない。**
+    /// 履歴への書き込みの顛末。**「例外が出なかった」と「実際に残った」は別である。**
+    ///
+    /// 上限 0（設定画面のステッパーで到達できる。`HistoryStore.normalized` が
+    /// 「明示的な指示として尊重する」と定めたサポート構成）では、`append` は
+    /// **何も保存せず、例外も投げない。** ここを 2 値で扱っていたために、
+    /// **ESC で中断した発話が欄にもクリップボードにも履歴にも残らないまま、
+    /// 失敗を 1 つも出さずに待機へ落ちていた**（最終レビュー A-1）。
+    private enum HistoryRecord: Equatable {
+        /// 履歴に残った。
+        case stored
+        /// 例外は出ていないが、上限 0 なので**残っていない。**
+        case notRetained
+        /// 書けなかった（容量・権限・破損）。
+        case failed
+    }
+
+    /// - Returns: 顛末。**握り潰してはならない。**
     ///
     /// `try?` で捨てていた頃は、書き込みが失敗しても `.failed` も出ず標準エラーにも
     /// 出ず、メモリにも残らなかった。**中断された発話ではそれが唯一の写しなので、
@@ -1377,7 +1446,7 @@ public actor DictationSession {
     /// 破損）は時間で解決しない。**失敗したことを利用者へ告げる**方が確実に効く。
     private func record(
         raw: String, refined: String?, locale: String, method: InsertionMethod
-    ) -> Bool {
+    ) -> HistoryRecord {
         record(
             HistoryEntry(
                 rawText: raw, refinedText: refined,
@@ -1385,13 +1454,12 @@ public actor DictationSession {
             ))
     }
 
-    /// - Returns: 書けたか。**握り潰してはならない**（上の注記）。
-    private func record(_ entry: HistoryEntry) -> Bool {
+    /// - Returns: 顛末。**握り潰してはならない**（上の注記）。
+    private func record(_ entry: HistoryEntry) -> HistoryRecord {
         do {
-            try history.append(entry)
-            return true
+            return try history.append(entry) ? .stored : .notRetained
         } catch {
-            return false
+            return .failed
         }
     }
 

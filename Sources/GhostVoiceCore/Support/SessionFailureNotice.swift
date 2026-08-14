@@ -129,6 +129,17 @@ public struct SessionFailureNotice: Sendable, Equatable {
             remedies = [.checkStorage(path: Self.storageDisplayPath)]
             isRefusal = false
             speechWasLost = !insertedElsewhere
+
+        case .insertionFailed:
+            // **クリップボードへも残せていない。** 以前はこの縮退が
+            // `.inserted(.clipboardOnly)` に化けており、「⌘V で貼れます」と告げていた
+            // （最終レビュー A-2）。**残っているのは履歴だけ**なので、そこへ案内する。
+            summary = "どこにも挿入できず、クリップボードへも残せませんでした。"
+            detail = "この発話は履歴にだけ残っています。履歴画面から挿入し直してください。"
+            remedies = []
+            isRefusal = false
+            // 履歴には残っているので「どこにも残らなかった」ではない。
+            speechWasLost = false
         }
     }
 

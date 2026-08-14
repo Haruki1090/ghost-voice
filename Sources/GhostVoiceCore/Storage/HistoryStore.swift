@@ -171,14 +171,26 @@ public final class HistoryStore: @unchecked Sendable {
     /// - Important: **MainActor から呼んではならない**（同期の I/O でメインスレッドが止まる）。
     ///   ここは `DictationSession` から呼ばれる口である。UI からの書き込み
     ///   （`remove` / `removeAll` / `setLimit`）は `async` にしてあり、Core 側で背景へ逃がす。
-    public func append(_ entry: HistoryEntry) throws {
+    /// - Returns: **この項目が実際に履歴へ残ったか。**
+    ///
+    ///   **「例外が出なかったか」ではない。** 上限 0（設定画面のステッパーで到達できる）の
+    ///   ときは挿入した項目をその場で捨てるので、書き込みは成功しても**履歴には
+    ///   1 件も残らない。** 呼び出し側がこれを「保存された」と読むと、
+    ///   **中断された発話が欄にもクリップボードにも履歴にも無いまま、
+    ///   失敗を 1 つも出さずに待機へ落ちる**（最終レビュー A-1）。
+    @discardableResult
+    public func append(_ entry: HistoryEntry) throws -> Bool {
         // 上限 0 のときは挿入した項目をその場で捨てるので、内容は変わらない。
         // それでも保存は行う（フェーズ 1 と同じ挙動。壊れたファイルの退避がここで走る）。
+        var retained = false
         try mutate(saveEvenIfUnchanged: true) { entries in
             entries.insert(entry, at: 0)
             if entries.count > storedLimit { entries.removeLast(entries.count - storedLimit) }
-            return storedLimit > 0
+            // **ロックの中で読む**（`storedLimit` は `setLimit` が書き換える）。
+            retained = storedLimit > 0
+            return retained
         }
+        return retained
     }
 
     /// **既に書いた項目へ、後から整形結果を入れる**（FR-5(a) の (a) 分岐）。

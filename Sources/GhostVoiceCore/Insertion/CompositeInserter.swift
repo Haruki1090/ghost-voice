@@ -127,7 +127,14 @@ public struct CompositeInserter: AnchoringTextInserting {
         // つまり Pasteboard 経路がクリップボードへ書く機会が無い。ここを塞がないと
         // 「クリップボードへ残した」と報告しながら発話がどこにも無い状態になる。
         // 音声は再現できないので、これはこの製品で最も重い失敗である（基本設計書 §7）。
-        lastResort.leave(text)
+        //
+        // **戻り値を必ず見る。** `.inserted(.clipboardOnly)` は「クリップボードへ残した」
+        // という主張であって（`TextInserting` の doc）、置けていないのにそう答えると
+        // 利用者は「⌘V で貼れます」に従って取りに行き、そこには何も無い。
+        // **履歴書き込みも失敗すれば、嘘を言ったうえで発話が完全に消える**（最終レビュー A-2）。
+        guard lastResort.leave(text) else {
+            return AnchoredInsertion(outcome: .failedEverywhere, anchor: nil)
+        }
         return AnchoredInsertion(outcome: .inserted(.clipboardOnly), anchor: nil)
     }
 

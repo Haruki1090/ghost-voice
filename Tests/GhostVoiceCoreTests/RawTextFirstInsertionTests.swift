@@ -164,7 +164,8 @@ final class RevisionRig: Sendable {
         focusedProcess: pid_t = RevisionRig.targetProcess,
         rangeSettable: Bool = true,
         selectionWriteFails: Bool = false,
-        revisionDeadline: Duration = .seconds(5)
+        revisionDeadline: Duration = .seconds(5),
+        historyLimit: Int = 50
     ) -> RevisionRig {
         let identity = UUID()
         let field = FakeTextField(
@@ -207,7 +208,7 @@ final class RevisionRig: Sendable {
 
         let hotkey = StubHotkeyMonitor()
         let audio = StubAudioCapture()
-        let history = HistoryStore(rootURL: root, limit: 50)
+        let history = HistoryStore(rootURL: root, limit: historyLimit)
         let session = DictationSession(
             settings: settingsStore,
             hotkey: hotkey,
