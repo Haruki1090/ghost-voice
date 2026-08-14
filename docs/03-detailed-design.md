@@ -96,13 +96,14 @@ ghost-voice/
 ├── Sources/GhostVoiceApp/             フェーズ 2 のアプリ（**Xcode プロジェクトは作らない**）
 │   ├── Main/main.swift                薄い @main。中身は Shell/ へ
 │   ├── Shell/                         器（**検査対象**）
-│   │   ├── GhostVoiceAppDelegate.swift 起動と終了の順序。**終了は素通ししない**（§8.10）
+│   │   ├── GhostVoiceAppMain.swift     Main/main.swift が委譲する実体（NSApplication.run() を呼ぶ）
+│   │   ├── GhostVoiceAppDelegate.swift 起動と終了の順序。**終了は素通ししない**（§13 の V-34）
 │   │   ├── AppSessionRuntime.swift    常駐セッションの持ち主。終了は Core の段取りを通す
 │   │   ├── AppPermissions.swift       許可の**要求**と設定ペインを開くこと
 │   │   │                              （**照会は Core の PermissionInquiry**）
 │   │   ├── AppPermissionGuidance.swift 権限の案内（許可の相手は Ghost Voice 自身）
 │   │   ├── AppLaunchOptions.swift / AppDiagnostics.swift / AppSurface.swift /
-│   │   ├── LaunchSequence.swift       run() が回り始めた後にだけ画面を作る（§8.9）
+│   │   ├── LaunchSequence.swift       run() が回り始めた後にだけ画面を作る（§7.2）
 │   │   └── HUD/                       notch HUD（§7）
 │   │       ├── HUDScreenSnapshot.swift **NSScreen を読む唯一の場所**（§7.1）
 │   │       ├── HUDPlacement.swift     どの画面のどこへ出すか（純粋な値の変換）
@@ -1222,7 +1223,7 @@ Pasteboard 経路と `clipboardOnly` はハンドルを作らない（範囲を�
 
 #### メッセージングの上限
 
-`AXUIElementSetMessagingTimeout` をシステムワイド要素へ 0.5 秒で設定する。既定は 6 秒で、前面のアプリが固まっていると**適用可否の判定だけで 6 秒ユーザーを待たせる**。挿入の予算は NFR-P5 の 50 ms しかない。正常な往復は実測 0.1〜5.5 ms なので 0.5 秒は十分に緩い。
+`AXUIElementSetMessagingTimeout` を**最前面アプリの要素**（`AXUIElementCreateApplication(pid)` で作ったもの）へ 0.5 秒で設定する。**システムワイド要素へは設定しない**——§2.8.5 (1) の実測で、システムワイド要素からの取得はこの機体の全アプリで即座に `cannotComplete` になると判り、**取得経路ごと使わないことにした**（当初はここも「システムワイド要素へ」と書いていた。取得経路だけを直して、この行を直し忘れていた。2026-08-15 訂正）。既定は 6 秒で、前面のアプリが固まっていると**適用可否の判定だけで 6 秒ユーザーを待たせる**。挿入の予算は NFR-P5 の 50 ms しかない。正常な往復は実測 0.1〜5.5 ms なので 0.5 秒は十分に緩い。
 
 #### フォーカス要素の型検査
 
@@ -1432,7 +1433,7 @@ guard let method = outcome.recordableMethod else { return }  // 拒否は記録�
 
 | # | 条件 | 何を防ぐか | 判定の手段 |
 |---|---|---|---|
-| C-7 | そのプロセスで、本セッション中に喪失の疑いを出していない | 危険な相手への再試行。**アプリ名の一覧を持たずに締め出せる** | プロセス内の集合（AX を叩かない） |
+| C-7 | そのプロセスで、本セッション中に**喪失の疑い（`.lost`）**を出していない。**無言失敗（`.silentlyIgnored`）では締め出さない** | 危険な相手への再試行。**アプリ名の一覧を持たずに締め出せる** | プロセス内の集合（AX を叩かない） |
 | — | 錨が失効していない（次の発話の挿入が始まっていない） | 前の発話の差し替えが次の発話へ当たること | `InsertionEpoch`（同上） |
 | C-2 | 錨がプロセス内メモリに生きている | 別プロセス・別セッションからの Undo | **`ReplacementAnchor` を `Codable` にしない** |
 | — | 空文字への差し替えでない | **「消すだけ」になること** | 文字列（同上） |
@@ -1789,8 +1790,17 @@ notch 非搭載の内蔵ディスプレイの実測（該当機が手元に無�
 | 完了のチェックマーク | 0.6 秒 | 上表のとおり |
 | 失敗 | 3 秒 | 上表のとおり |
 | **発話を失った疑いのある失敗** | **8 秒** | `SessionFailureNotice.speechWasLost` が真のときだけ。**毎回強く出すと本当に失った回が埋もれる** |
-| 通知（Undo の顛末など） | 1.5〜2.5 秒 | 利用者の打鍵に対する返事なので、返事が要る長さだけ |
+| 通知（Undo の顛末など） | **2 秒** | 利用者の打鍵に対する返事なので、返事が要る長さだけ。**重い通知は上の「失敗 3 秒」「発話を失った疑い 8 秒」へ振り替える**（`HUDPresenter` が重さで選ぶ） |
+| **クリップボードへ生テキストを退避したという通知** | **期限を置かない** | `.undoCopiedRawTextToClipboard` のみ。**読み落とすと、クリップボードに在る生テキストへ辿り着けなくなる**（§14.5） |
 | モデルの導入中 | **期限を置かない** | いつ終わるか判らない（数分）。数秒で消すと「押しても何も起きない」へ戻る |
+| モデルの導入が**完了** | 3 秒 | 導入中の表示を畳むための区切り |
+| モデルの導入が**失敗** | 5 秒 | 失敗（3 秒）より長い。利用者が対処を要する |
+
+> **旧版は通知を「1.5〜2.5 秒」という幅で書いていたが、実装にその分岐は無い。**
+> `HUDPresenter.Timing.notice` は **2 秒の単一値**で、長さを変えたいときは
+> **重さで別の枠（`failure` / `speechLost`）を選ぶ**形になっている。**幅の記述は
+> 実装される前の設計の残骸だったので、実装に合わせて畳んだ**（2026-08-15）。
+> **値の正本は `HUDPresenter.Timing` である。**
 
 **保持中でも `.recording` は勝つ。** 利用者が話し始めているのに前のエラーを出し続けるのは嘘である。
 
@@ -1854,6 +1864,9 @@ public struct Settings: Codable, Sendable {
     public var refinementEnabled: Bool          // 既定 true
     public var refinementTimeoutMs: Int         // 既定 750（§10）
     public var historyLimit: Int                // 既定 50
+    // フェーズ 2 で追加（基本設計書 §9.1）
+    public var refinementApplyMode: RefinementApplyMode // 既定 .afterInsert（FR-5(a)）
+    public var revisionDeadlineMs: Int          // 既定 3000（NFR-P6b の打ち切り。推定値）
 
     // ホットキーの妥当性を一括で検証する（§12-9）。復元経路（init(from:)）と
     // 保存経路（SettingsStore.update）の両方が呼ぶ。
@@ -2111,9 +2124,19 @@ public protocol PermissionChecking: Sendable {
 
 > **これは種類ごとに問う形の素描であり、実装はこの形を採っていない。**
 > 実装は一式をまとめて照会する `GhostVoiceCore.PermissionInquiry.current() -> PermissionStatus` である
-> （Support/PermissionInquiry.swift）。**実 API を名指しで呼ぶのはそこ 1 箇所だけ**にしてある——
+> （Support/PermissionInquiry.swift）。**「4 つのサービスと API の対応表」を持つのはそこ 1 枚だけ**にしてある——
 > 下の対応表を 2 つ持つと、「どれか 1 つを他の判定に流用してはならない」という規律が
 > **片側だけ守られている状態**を作れてしまい、値が一致する機体では気付けない。
+>
+> **【2026-08-15 訂正】ここには「実 API を名指しで呼ぶのはそこ 1 箇所だけ」と書いてあったが、
+> それは事実ではない。** 各機構が自分に必要な 1 つを、差し替え可能な既定引数として直接呼んでいる:
+> `PasteboardInserter`（`CGPreflightPostEventAccess`）/ `CGEventTapHotkeyMonitor`
+> （`CGPreflightListenEventAccess` と `AXIsProcessTrusted`）/ `EngineAudioCapture`
+> （`AVCaptureDevice.authorizationStatus`）の**計 4 箇所**である。
+> **1 箇所なのは「照会の報告（`--check` と起動時の案内）が使う一式」のほうで、
+> 実 API の呼び出し箇所ではない。** 規律（1 つを他の判定に流用しない）は 4 箇所とも守っているが、
+> **「1 箇所だけだから安全」と読んではならない。** 各機構の既定引数を
+> `PermissionProbes.system` から引く形へ寄せるかは**未決**（最終レビューの申し送り）。
 > 差し替え口（`PermissionProbes`）を通して、4 つを 1 つずつ落とす検査で固定している
 > （`PermissionInquiryTests`）。案内の文言だけが CLI（ターミナルアプリが許可の相手）と
 > `.app`（Ghost Voice 自身が相手）で分かれる。
@@ -3023,7 +3046,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 6 | `HotkeyMonitor` | 判定と `CGEventTap` は完了。**V-4 はキーイベント監視の権限が要るため §12-11 へ繰り延べ。手順は README にある** |
 | 7 | `DictationSession`（状態機械） | **状態機械と計測は完了（Task 10）。M5（現 M5a）を 2 条件で実測し、整形の既定タイムアウトを 750 ms へ引き上げた（§10）。** CLI での一気通貫は §12-11 で完了 |
 | 8 | **`.app` バンドル化・署名**と `NotchHUD` | `Scripts/make-app.sh` で `.app` が組み上がり、Apple Development 証明書で署名され、`open` から起動する（基本設計書 §10）。**バンドルが先で、HUD はその上に載せる。** **V-19（`NSApp.run()` の下で `CGEventTap` が届くか）を真っ先に潰す。** 続いて V-16 / V-17 / V-18、V-6 の残り（実バンドル・本番構成での確認）、V-20 / V-21 / V-22 を実施する。**V-5 は閉じた**（DynamicNotchKit を採用しないため。§7.3） |
-| 9 | 設定 UI・権限フロー・履歴 UI | FR-7〜FR-11 が満たされる。**設定画面・履歴画面・Undo の伝え方は View と ViewModel まで実装済み（§14）。残るのは提示の配線（ステータス項目のメニューと窓）だけで、これは HUD と同じ `AppSurface` を触るため統合時に行う。** **受け入れ条件「ホットキーの妥当性は `HotkeyBinding` 自身の不変条件として一括で検証する」はフェーズ 2 で満たした**——単体の不変条件は `HotkeyBinding` の初期化子（`Codable` の復元も通る）、PTT と Undo の関係は `Settings.validateHotkeys()` が持ち、**保存経路（`SettingsStore.update`）と復元経路（`Settings.init(from:)`）の両方から呼ぶ。** 手編集した `settings.json` も検査を通る（フェーズ 1 では `update` の経路にしか無かった。最終レビュー M-7） |
+| 9 | 設定 UI・権限フロー・履歴 UI | FR-7〜FR-11 が満たされる。**設定画面・履歴画面・Undo の伝え方は View と ViewModel まで実装済み（§14）。提示の配線（ステータス項目のメニューと窓）も 2026-08-15 に完了した**（`StatusMenuSurface.swift` / `AppWindow.swift`。§14.6.1。V-43 / V-44 はその配線に対する実測である）。 **受け入れ条件「ホットキーの妥当性は `HotkeyBinding` 自身の不変条件として一括で検証する」はフェーズ 2 で満たした**——単体の不変条件は `HotkeyBinding` の初期化子（`Codable` の復元も通る）、PTT と Undo の関係は `Settings.validateHotkeys()` が持ち、**保存経路（`SettingsStore.update`）と復元経路（`Settings.init(from:)`）の両方から呼ぶ。** 手編集した `settings.json` も検査を通る（フェーズ 1 では `update` の経路にしか無かった。最終レビュー M-7） |
 | 10 | 性能計測と調整 | **M5（現 M5a）は実測済み（現行の打ち切り 750 ms で 中央値 398 / 411 ms、p90 419 / 819 ms。§10）。ただし `.clipboardOnly` 経路に固定した計測であり、⌘V の往復と復元待ちを含む確定は V-3 待ち。V-7（メモリ）は未確認** |
 | 11 | **CLI と一気通貫**（`ghost-voice`） | **完了（Task 11）。** 起動・権限案内・表示・終了の待ち合わせが動く。**FR-10 は部分達成**——権限の案内は達成、**モデル導入の案内は「導入が始まったことを 1 行出す」までで、進捗（`request.progress`）は出さない**（§4.3。進捗表示は HUD と一緒に §12-8 で行う）。`--check` / `--request-permissions` / `--mic-check` を用意した。**権限の要らない V-12 / V-13 / V-14 はここで実施した。V-3 / V-4 は権限の付与が要るため利用者が実施する**（README の手順） |
 
@@ -3089,9 +3112,9 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 
 ## 14. 設定画面・履歴画面・Undo の伝え方（フェーズ 2 / FR-11 / FR-9 / FR-7 の UI）
 
-**View と ViewModel だけがここにある。** 「どの窓・どのメニューから開くか」は
-各 ViewModel の doc コメントに書いてあり、**配線は統合時に行う**（HUD トラックと
-`AppSurface` の実装が重なるため、同時には触らない）。
+**この節は View と ViewModel の設計を述べる。** 「どの窓・どのメニューから開くか」の
+**配線は 2026-08-15 に完了している**（§14.6.1。`StatusMenuSurface.swift` / `AppWindow.swift`）。
+**当初この節は「配線は統合時に行う」と書いていたが、それはトラック D 実行中の記述である。**
 
 置き場所は `Sources/GhostVoiceApp/Shell/Settings/` と `.../History/` である。
 `GhostVoiceApp` ターゲットの `path` が `Sources/GhostVoiceApp/Shell` なので、
@@ -3100,7 +3123,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 ### 14.1 「読めなかった」を利用者へ見せる（統括の裁定の条件）
 
 不正なホットキーを 1 つ含むだけで `settings.json` は**丸ごと**復元されず、
-**全設定が既定値へ戻る**（§8.1 / 要件定義書 §9.1）。この設計を採る条件は
+**全設定が既定値へ戻る**（§8.1 / **基本設計書** §9.1）。この設計を採る条件は
 「**設定画面がこの事実を利用者へ見える形にすること**」である。無言で既定へ戻ると、
 フェーズ 1 で潰した「成功と記録されるのに中身が違う」と同じ形になる。
 
@@ -3174,7 +3197,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 
 ### 14.4 履歴画面（FR-9）
 
-一覧・**再挿入**・コピー・削除・全消去。集計は §9.3 の規定どおり。
+一覧・**再挿入**・コピー・削除・全消去。集計は**基本設計書** §9.3 の規定どおり。
 
 - **`.notInserted` を経路の集計の分母に入れない。** 中断された発話は `.ax` / `.pasteboard` /
   `.clipboardOnly` のどれも通っていない。**除いた件数は別に持って画面へ出す**——
@@ -3241,7 +3264,12 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 出ていないので、**見えない締め切りで黙って断られるのがいちばん悪い。**
 秒数は `HistoryStore.undoWindow` から取り、**画面側に `10` と書かない**（片方だけ変えると嘘になる）。
 
-### 14.6 実測が要ると判っていた 3 件（**すべて測った / 2026-08-15**）
+### 14.6 実測が要ると判っていた 3 件（**2 件は測って決着、1 件は一部だけ / 2026-08-15**）
+
+> **見出しを訂正した（2026-08-15）。** 旧版は「すべて測った」と書いていたが、
+> **V-42 は「一部実測」である**——干渉しないことは構造で保証したが、
+> **実キーボードでの捕獲そのもの（`CGEvent.tapCreate` が通ること）は測っていない。**
+> 下の表の V-42 の行が自らそう書いており、§13 の V-42 も「実装済み・一部実測」である。
 
 | 内容 | 結果 | 採番 |
 |---|---|---|
