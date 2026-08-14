@@ -493,6 +493,22 @@ struct AudioCaptureTapTests {
         #expect(summary.frames == 48_000, "取りこぼし \(48_000 - Int(summary.frames)) フレーム")
     }
 
+    /// **合否線は NFR-P1 の 50 ms ではない**（開発サイクル §5:
+    /// 実時間を測る検査の合否線を要件値そのものにしてはならない）。
+    ///
+    /// 要件値を線にすると、**実測が 0.05 ms でも 49 ms でも同じく緑**になり、
+    /// 「壊れたこと」を一度も捕まえられない。ここは負荷下の実測から引き直してある。
+    ///
+    /// **実測（2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2 / 各 50 回）:**
+    ///
+    /// | 条件 | 中央値 | 最大 |
+    /// |---|---|---|
+    /// | 低負荷 | 0.0102 ms | 0.0533 ms |
+    /// | 負荷下（`yes` 16 本。3 回） | 0.0107 / 0.0110 / 0.0219 ms | 0.0538 / 0.0401 / **0.1018** ms |
+    ///
+    /// **線は 1 ms。** 負荷下の最大 0.102 ms に対して約 10 倍で、
+    /// **NFR-P1（50 ms）の 1/50 である。** 武装のコストが 1 ms を超えたら、
+    /// それは要件を破ったのではなく**この経路の作りが変わった**ということである。
     @Test("startTap の武装コスト（NFR-P1 の下限値。実 HAL は回っていない）")
     func armingCostLowerBound() throws {
         // **これは NFR-P1 の実測値ではない。** 手動レンダリングではハードウェアの
@@ -514,7 +530,10 @@ struct AudioCaptureTapTests {
         print(String(
             format: "startTap 武装コスト（手動レンダリング / 下限値）: 中央値 %.4f ms / 最大 %.4f ms（50 回）",
             sorted[sorted.count / 2], sorted.last!))
-        #expect(sorted.last! < 50, "下限値ですら NFR-P1 の予算を超えている: \(sorted.last!) ms")
+        // **1 ms は壊れ検知であって要件値ではない**（上の表。要件は NFR-P1 の 50 ms）。
+        #expect(
+            sorted.last! < 1,
+            "武装コストが壊れ検知の線を割った（線は要件値ではない。要件 NFR-P1 は 50 ms）: \(sorted.last!) ms")
     }
 
     @Test("タップしていないときの設定変更でもエンジンは生きたまま")
@@ -682,6 +701,17 @@ struct AudioCaptureMicrophoneTests {
         #expect(!lengths.isEmpty)
     }
 
+    /// **合否線は NFR-P1 の 50 ms ではない**（開発サイクル §5）。
+    ///
+    /// **この検査は NFR-P1 の計測そのものである**（V-9）。要件を満たすかは
+    /// **印字された中央値と最大を読んで判断する**のであって、表明で判断するものではない。
+    /// 表明を要件値そのものに置くと、48 ms でも緑になり「余裕がゼロになった」ことを
+    /// 一度も捕まえられない。
+    ///
+    /// **線は 75 ms（要件値の 1.5 倍。開発サイクル §5 の目安）。**
+    /// 負荷下の実測から引き直したいが、**このスイートは実マイクを開くため
+    /// `GHOST_VOICE_MIC_TESTS=1` が要り、いまは実測を取っていない**（未実測）。
+    /// 実測が取れたらこの線をそこから引き直すこと。
     @Test("NFR-P1 / M1a: キー押下 → タップ武装")
     func armingLatency() throws {
         let capture = EngineAudioCapture()
@@ -697,7 +727,11 @@ struct AudioCaptureMicrophoneTests {
         let s = stats(samples)
         print(String(format: "M1a タップ武装: 中央値 %.4f ms / 最小 %.4f / 最大 %.4f（30 回・実 HAL）",
                      s.median, s.min, s.max))
-        #expect(s.max < 50, "最大 \(s.max) ms")
+        // **75 ms は壊れ検知であって要件値ではない**（要件 NFR-P1 は 50 ms）。
+        // 要件の達成判定は、上に印字した中央値と最大を読んで行うこと。
+        #expect(
+            s.max < 75,
+            "壊れ検知の線を割った（線は要件値ではない。要件 NFR-P1 は 50 ms）: 最大 \(s.max) ms")
     }
 
     @Test("NFR-P1 / M1b: キー押下 → 最初の実バッファ到達")

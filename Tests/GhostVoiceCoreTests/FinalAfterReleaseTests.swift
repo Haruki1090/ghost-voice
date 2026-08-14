@@ -150,7 +150,7 @@ extension SpeechDependentTests {
                 let audio = ReplayAudioCapture(buffers: buffers, interval: .milliseconds(100))
                 let hotkey = StubHotkeyMonitor()
                 let inserter = RecordingInserter()
-                let session = DictationSession(
+                let session = DictationSession.forTests(
                     settings: SettingsStore(rootURL: root),
                     hotkey: hotkey,
                     audio: audio,

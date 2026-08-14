@@ -43,7 +43,12 @@ public enum SessionNotice: Sendable, Equatable {
     ///   **どの理由でも欄の内容は変えていない。**
     case refinementNotApplied(ReplacementDecline?)
     /// **差し替えの途中で欄の内容が判らなくなった**（R-9）。
-    /// 差し替えようとした文字列はクリップボードにある。**これだけは重い。**
+    ///
+    /// 差し替えようとした文字列は**クリップボードへ退避を試みてある**
+    /// （`TextReplacer.verify`。`NSPasteboard.setString` が失敗した場合は載らない）。
+    /// **履歴には必ず raw と refined の両方がある**——差し替えは
+    /// 「履歴へ書けてから始める」を門にしているためで、そこが 1 番目の受けである
+    /// （詳細設計書 §8.3）。**これだけは重い。**
     case textMayHaveBeenLost
     /// Undo で整形前の生テキストへ戻した（FR-7）。
     case undone
@@ -80,6 +85,15 @@ public enum SessionFailure: Sendable, Equatable {
     ///   **false なら発話そのものが失われた。** 利用者にとって意味がまったく違うので、
     ///   同じ文言にしてはならない。
     case historyUnavailable(insertedElsewhere: Bool)
+
+    /// **どの経路でも挿入できず、クリップボードへも残せなかった**
+    /// （`InsertionOutcome.failedEverywhere`）。
+    ///
+    /// 以前はこの縮退が `.inserted(.clipboardOnly)` に化けており、
+    /// 利用者は「⌘V で貼れます」と告げられて空のクリップボードを見ることになった
+    /// （最終レビュー A-2）。**テキストは履歴にだけある**ので、
+    /// 案内する先は履歴画面（FR-9 の再挿入）である。
+    case insertionFailed
 }
 
 /// セッションの操作そのものが受け付けられなかった。
@@ -158,6 +172,15 @@ public actor DictationSession {
     private let replacer: TextReplacer?
     /// 自動で戻せない発話の生テキストを取り出す先（FR-7 の細目 3 行目）。
     private let clipboard: (any ClipboardLeaving)?
+
+    /// **この組み立てで FR-5(a) の差し替えと FR-7 の Undo が使えるか。**
+    ///
+    /// 偽なら常に (b) の分岐（整形を待ってから挿入する。フェーズ 1 と同じ）で動く。
+    /// **これが公開されているのは、「製品の組み立てが正しいこと」を検査が固定できる
+    /// ようにするためである**——フェーズ 2 の最終レビューで、本番の 2 箇所が
+    /// 差し替え器を渡しておらず、しかも検査が 1 件も落ちなかった
+    /// （検査が自分で正しい組を作っていた）ことが判ったため。
+    public nonisolated let canReviseInPlace: Bool
     private let history: HistoryStore
     private let vocabulary: VocabularyStore
     private let isSecureInputEnabled: @Sendable () -> Bool
@@ -257,6 +280,11 @@ public actor DictationSession {
     /// 挿入時刻からではない——(a) では挿入と差し替えの間に最大 NFR-P6b ぶんの隔たりがある）。
     private var undoExpiry: ContinuousClock.Instant?
     private var undoExpiryTask: Task<Void, Never>?
+    /// 進行中の Undo。**`isBusy` には数えない**（`pendingRevision` と同じ理由）。
+    ///
+    /// `run()` のループから待たずに起こす。待つと、AX が詰まる相手で
+    /// **その間の PTT が丸ごと処理されない**（最終レビュー 視点3 の指摘 2）。
+    private var undoTask: Task<Void, Never>?
 
     /// 確定テキストが出そろったか。**「最初の確定が届いたか」ではない。**
     ///
@@ -276,12 +304,19 @@ public actor DictationSession {
     private var isFinalSettled = false
     private var finalWaiters: [CheckedContinuation<Void, Never>] = []
 
-    /// **差し替え（FR-5(a) / FR-7）まで含めた本番の組み立て。**
+    /// **差し替え（FR-5(a) / FR-7）まで含めた本番の組み立て。これが唯一の公開初期化子である。**
     ///
     /// `CompositeInserter.systemStack(...)` が返す組をそのまま渡すこと。
     /// **挿入器と差し替え器を別々に作って渡してはならない**——世代を共有しないと
     /// 差し替えが一度も効かず、クリップボードを共有しないと喪失時の退避先が
     /// 誰にも見えない場所になる（`InsertionStack` の注記。どちらも黙って壊れる）。
+    ///
+    /// - Important: **差し替え器を省ける口はここには無い**（フェーズ 2 の最終レビュー）。
+    ///   以前は `inserter:` だけを取る公開初期化子が併存しており、**本番の 2 箇所が
+    ///   そちらを呼んでいたため、製品では差し替えも Undo も一度も動いていなかった。**
+    ///   注意書きは同じ型の doc に既に書かれていたが、本番はその初期化子を
+    ///   呼んでさえいなかった——**doc コメントでは守れないことが証明された**ので、
+    ///   省ける口は `internal`（`forTests`）へ落として本番から到達できなくしてある。
     public init(
         settings: SettingsStore,
         hotkey: any HotkeyMonitor,
@@ -305,11 +340,20 @@ public actor DictationSession {
             maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline)
     }
 
+    /// **テスト専用の組み立て。`internal` なので本番ターゲットからは到達できない。**
+    ///
+    /// 差し替え器を省いた（＝常に (b) の分岐で動く）セッションを作れる唯一の口である。
+    /// **フェーズ 1 と同じ経路の検査を残すために置いてあり、製品の組み立てではない。**
+    ///
+    /// 公開初期化子として残していた頃、本番の 2 箇所がこちらを呼んでいたために
+    /// **FR-5(a) の差し替えと FR-7 の Undo が製品では一度も動かなかった。**
+    /// 名前と可視性の両方で「本番の組み立てではない」ことを示している。
+    ///
     /// - Parameter replacer: 差し替え器。**nil なら常に (b) の分岐**——整形を待ってから
     ///   挿入する、フェーズ 1 と同じ経路で動く（`refinementApplyMode` の設定によらない）。
     /// - Parameter clipboard: 自動で戻せない発話の生テキストを取り出す先（FR-7 の細目）。
     ///   **`replacer` と同じクリップボードを渡すこと。**
-    public init(
+    static func forTests(
         settings: SettingsStore,
         hotkey: any HotkeyMonitor,
         audio: any AudioCapturing,
@@ -324,6 +368,31 @@ public actor DictationSession {
         postEventAuthorization: PostEventAuthorization = .shared,
         maxRecordingDuration: Duration = DictationSession.defaultMaxRecordingDuration,
         finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline
+    ) -> DictationSession {
+        DictationSession(
+            settings: settings, hotkey: hotkey, audio: audio, transcriber: transcriber,
+            refiner: refiner, inserter: inserter, replacer: replacer, clipboard: clipboard,
+            history: history, vocabulary: vocabulary,
+            isSecureInputEnabled: isSecureInputEnabled,
+            postEventAuthorization: postEventAuthorization,
+            maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline)
+    }
+
+    private init(
+        settings: SettingsStore,
+        hotkey: any HotkeyMonitor,
+        audio: any AudioCapturing,
+        transcriber: any Transcribing,
+        refiner: any Refining,
+        inserter: any TextInserting,
+        replacer: TextReplacer?,
+        clipboard: (any ClipboardLeaving)?,
+        history: HistoryStore,
+        vocabulary: VocabularyStore,
+        isSecureInputEnabled: @escaping @Sendable () -> Bool,
+        postEventAuthorization: PostEventAuthorization,
+        maxRecordingDuration: Duration,
+        finalizeDeadline: Duration
     ) {
         self.settings = settings
         self.hotkey = hotkey
@@ -331,9 +400,13 @@ public actor DictationSession {
         self.transcriber = transcriber
         self.refiner = refiner
         self.inserter = inserter
-        self.anchoringInserter = inserter as? any AnchoringTextInserting
+        let anchoring = inserter as? any AnchoringTextInserting
+        self.anchoringInserter = anchoring
         self.replacer = replacer
         self.clipboard = clipboard
+        // **(a) の分岐に必要な 3 つが揃っているか。** 経路判定（`completeUtterance`）が
+        // 見ているのと同じ条件である。
+        self.canReviseInPlace = (anchoring != nil && replacer != nil && clipboard != nil)
         self.history = history
         self.vocabulary = vocabulary
         self.isSecureInputEnabled = isSecureInputEnabled
@@ -364,6 +437,18 @@ public actor DictationSession {
     public nonisolated func stateStream() -> AsyncStream<SessionState> {
         stateBroadcast.stream()
     }
+
+    /// **状態を購読している人数。**
+    ///
+    /// 分配器は**登録済みの購読者にしか配らない**（`SessionBroadcast.yield`）。
+    /// `stateStream()` を `for await` するタスクは、**最初に走ったときに初めて登録される**ので、
+    /// 「購読を始めた直後に状態を撃つ」並びは競走になる——負ければその状態は誰にも届かず、
+    /// 待っている側は永久に待つ。
+    ///
+    /// **検査が「購読が成立するまで待つ」ために公開している**（視点4 §9 の機序 A。
+    /// `SessionMirrorTests` の 3 件が 10 秒の期限まで待って落ちる断続的失敗を作っていた）。
+    /// **製品の穴にはならない**——分配器の購読者数は元から `SessionBroadcast` が公開している。
+    public nonisolated var stateSubscriberCount: Int { stateBroadcast.subscriberCount }
 
     /// **マイク音量（RMS）を購読する**（欠落 3。HUD の録音インジケータ）。
     ///
@@ -590,7 +675,8 @@ public actor DictationSession {
             // キー解放を受け取れなくなっただけなので、最大録音時間の満了と同じく
             // **確定として扱い、そこまでの発話を届ける。** 利用者は喋っていたのだから。
             case .interrupted: stopRecording(cancelled: false)
-            case .undoRequested: performUndo()
+            // **待たない。** 待つとイベントループが止まり、その間の PTT が処理されない。
+            case .undoRequested: beginUndo()
             }
         }
         await completionTask?.value
@@ -599,6 +685,8 @@ public actor DictationSession {
         // 待つと終了が最大 NFR-P6b（既定 3 秒）延びる（設計 opus §3.3）。
         pendingRevision?.cancel()
         pendingRevision = nil
+        undoTask?.cancel()
+        undoTask = nil
         levelTask?.cancel()
         levelTask = nil
         assetTask?.cancel()
@@ -941,12 +1029,25 @@ public actor DictationSession {
         // **`.refusedSecureInput` は履歴に記録してはならない**（Task 8 の裁定）。
         // `recordableMethod` が nil を返すのがその一手間で、ここを素通りさせると
         // パスワードが `history.json` へ平文で入る。
-        if let method = outcome.recordableMethod,
-            !record(raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
-        {
-            // **テキストは利用者の手元にある。** 失ったのは履歴と Undo だけなので、
-            // 中断経路とは別の文言で伝える（`SessionFailure` の注記）。
-            fail(.historyUnavailable(insertedElsewhere: true))
+        if let method = outcome.recordableMethod {
+            let stored = record(
+                raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
+            // **上限 0 は失敗にしない。** 挿入できているので発話は利用者の手元にあり、
+            // 履歴を残さないのは利用者自身の指示である（`HistoryStore.normalized`）。
+            // 一方、**書けなかった**のは伝える。
+            if stored == .failed {
+                // 手元にテキストがあるかどうかで文言が変わる。
+                // **`.failedEverywhere` では手元にも無い**ので「発話そのものが失われた」。
+                fail(.historyUnavailable(insertedElsewhere: outcome.leftTextWithUser))
+                return
+            }
+        }
+
+        // **どこにも入らず、クリップボードへも残せなかった。** 履歴だけが写しである
+        // （`InsertionOutcome.failedEverywhere`）。以前はここが `.clipboardOnly` に
+        // 化けており、「⌘V で貼れます」と告げていた（最終レビュー A-2）。
+        guard outcome != .failedEverywhere else {
+            fail(.insertionFailed)
             return
         }
 
@@ -1055,9 +1156,28 @@ public actor DictationSession {
             rawText: raw, refinedText: nil,
             localeIdentifier: settings.localeIdentifier, insertionMethod: method
         )
-        guard record(entry) else {
+        // **書けなければ差し替えを始めない**（詳細設計書 §8.3）。
+        // 履歴に写しが無いまま欄を書き換えると、`.lost`（R-9）に落ちたときの
+        // 4 重の受けのうち 1 番目が抜ける。**上限 0 で「残らなかった」場合も同じ**——
+        // 直後の `history.update` が対象を見つけられないので、差し替えを始めてはならない。
+        let stored = record(entry)
+        guard stored == .stored else {
             refinement?.cancel()
-            fail(.historyUnavailable(insertedElsewhere: true))
+            if stored == .failed {
+                fail(.historyUnavailable(insertedElsewhere: inserted.outcome.leftTextWithUser))
+            } else {
+                // 上限 0。**発話は欄にある**ので失敗ではないが、整形は反映できない。
+                notify(.refinementNotApplied(nil))
+                finishIdle()
+            }
+            return
+        }
+
+        // (b) 分岐と同じ扱い。**クリップボードへも残せていない**ので、
+        // 案内する先は履歴画面（FR-9 の再挿入）だけである。
+        guard inserted.outcome != .failedEverywhere else {
+            refinement?.cancel()
+            fail(.insertionFailed)
             return
         }
 
@@ -1107,20 +1227,31 @@ public actor DictationSession {
     /// 整形が返った（あるいは打ち切られた）。**ここが唯一、欄を後から書き換える場所である。**
     ///
     /// - Important: **`replacer.replace` は同期で、AX を 12 回呼ぶ**（実測 2026-08-15）。
-    ///   actor の上で同期に走らせているのは意図である——**その間に挿入が割り込めない**
-    ///   ことが、世代の照合と実際の書き込みのあいだに窓を作らないための保証になる。
-    ///   代償は、そのあいだに PTT が押されると `startRecording` が待たされること
-    ///   （NFR-P1 の 50 ms の予算を食う）。
+    ///   **actor の上では走らせない**（`runOffActor`）。
+    ///
+    ///   フェーズ 2 の途中まで actor 上で同期に走らせており、その意図は
+    ///   「世代の照合と実際の書き込みのあいだに挿入が割り込めないこと」だった。
+    ///   **代償が重すぎた**——AX の往復の上限は 1 回 0.5 秒（`SystemAccessibility`）なので、
+    ///   固まった相手では**最大 12×0.5 = 約 6 秒 actor が塞がる。**
+    ///   その間 `run()` は `for await event in hotkey.events` から再開できず、
+    ///   **PTT の押下も解放も、届いているのに処理されない**——
+    ///   利用者は喋っているのに録音が始まらず、**発話が丸ごと落ちる**
+    ///   （最終レビュー 視点3 の指摘 2）。しかも `beginPendingRevision` は
+    ///   意図的に `.idle` へ戻して次の PTT を受け付ける設計なので、
+    ///   これは例外ではなく**通常経路**である。
+    ///
+    ///   **割り込みは別の手段で塞いだ**——世代の錠（`InsertionEpoch.withExclusiveWrite`）で
+    ///   挿入と差し替えを直列化する。**同じ組で作られる**ことが既に規律なので、
+    ///   配線が増えない。
     ///
     ///   **実測（V-36 / 詳細設計書 §10.1 / 代役の欄・実ディスク書き込み）**:
-    ///   押下 → 録音開始は 中央値 1.3 ms / 最大 3.5 ms（低負荷）、
-    ///   中央値 2.3 ms / 最大 2.7 ms（負荷下）。**配線ぶんは予算を食わない。**
-    ///   待たされる量はほぼ `12 × AX 1 往復 + 2 ms` で、
-    ///   **1 往復が約 4 ms を超える相手では 50 ms を破る。**
+    ///   AX 1 往復あたり 10 ms を注入した相手で、押下 → 録音開始は
+    ///   **166.5 ms（低負荷）/ 168.7 ms（負荷下）→ 対処後 2 ms 台**。
+    ///   注入 0 ms では前後とも 3 ms 未満で変わらない。
     ///   実アプリでの 1 往復のコストは未実測（V-28 / V-36）。
     ///
-    /// - Important: **ここに同期の作業を足さないこと。** 足せば実アプリでの余裕が
-    ///   そのぶん減る。`RevisionBlockingRegressionTests` が 25 ms の線で見張っている
+    /// - Important: **ここに actor を握ったままの同期作業を足さないこと。**
+    ///   `RevisionBlockingRegressionTests` が壊れ検知の線で見張っている
     ///   （**線は壊れ検知であって要件値ではない**）。
     private func applyRevision(
         _ refined: String?,
@@ -1129,7 +1260,7 @@ public actor DictationSession {
         utterance: Int,
         releasedAt: ContinuousClock.Instant,
         refineStart: ContinuousClock.Instant
-    ) {
+    ) async {
         pendingRevision = nil
         // **この発話がまだ「直近」か。** 次の発話が始まっていたら、状態も計測値も
         // そちらのものなので触らない（差し替えそのものは撃ってよい——欄を触るのは
@@ -1137,7 +1268,9 @@ public actor DictationSession {
         let isCurrent = (utterance == self.utterance)
         let canShowState = isCurrent && phase == .idle
         defer {
-            if canShowState {
+            // **actor を手放している間に次の発話が始まっていることがある。**
+            // そのときの状態はそちらのものなので、ここからは触らない。
+            if canShowState, utterance == self.utterance, phase == .idle {
                 hotkey.setSessionBusy(false)
                 emit(.idle)
             }
@@ -1163,8 +1296,15 @@ public actor DictationSession {
         // **履歴を先に確保する**（詳細設計書 §8.3）。raw と refined の両方が履歴に
         // ある状態で初めて欄を触る。**書けなければ差し替えを始めない**——
         // 差し替えの途中で発話が判らなくなったとき（R-9）、履歴が 1 番目の受けである。
+        // **戻り値も見る。** `update` は対象が見つからなければ何も書かず `false` を返す
+        // （上限 0 で押し出された／履歴画面から消された／`setLimit` で切り詰められた）。
+        // 例外が出ないので、捨てているとそのまま差し替えへ進んでいた（最終レビュー C-2）。
         do {
-            try history.update(id: entryID, refinedText: refined)
+            guard try history.update(id: entryID, refinedText: refined) else {
+                // 履歴に写しが無い。**欄は 1 文字も触らない。** 生テキストが残る。
+                notify(.refinementNotApplied(nil))
+                return
+            }
         } catch {
             notify(.refinementNotApplied(nil))
             if canShowState { emit(.failed(.historyUnavailable(insertedElsewhere: true))) }
@@ -1172,9 +1312,10 @@ public actor DictationSession {
         }
 
         if canShowState { emit(.revising) }
-        let result = replacer.replace(anchor, with: refined)
+        // **actor を手放して走らせる**（上の注記）。世代の錠が挿入との重なりを塞ぐ。
+        let result = await Self.runOffActor { replacer.replace(anchor, with: refined) }
         let revision = ContinuousClock.now - releasedAt
-        if isCurrent {
+        if utterance == self.utterance {
             latestMetrics = latestMetrics?.rewriting(refine: refineElapsed, revision: revision)
         }
 
@@ -1192,6 +1333,24 @@ public actor DictationSession {
             // 履歴・クリップボード・告知・以後の締め出しの 4 重で受けてある。
             notify(.textMayHaveBeenLost)
         }
+    }
+
+    /// **actor を手放して、同期の AX 往復を走らせる。**
+    ///
+    /// `TextReplacer.replace` / `undo` は同期で AX を最大 12 回叩く。1 往復の上限は
+    /// 0.5 秒（`SystemAccessibility.messagingTimeout`）なので、固まった相手では
+    /// **約 6 秒**掛かる。それを actor の上で走らせると、その間
+    /// **PTT の押下も解放も処理されず、発話が丸ごと落ちる**（最終レビュー 視点3 の指摘 2）。
+    ///
+    /// - Important: **`Task.detached` である。** 呼び出し元がキャンセルされても
+    ///   途中で畳まない——AX の書き込みは途中で止められる操作ではなく、
+    ///   止まった先の欄がどうなっているか判らなくなる（`.lost` を自分で作ることになる）。
+    /// - Important: **重なりは世代の錠が塞ぐ**（`InsertionEpoch.withExclusiveWrite`）。
+    ///   actor を手放しても、同じ組の挿入と AX の書き込みが交錯することは無い。
+    private static func runOffActor<T: Sendable>(
+        _ body: @escaping @Sendable () -> T
+    ) async -> T {
+        await Task.detached(priority: .userInitiated) { body() }.value
     }
 
     /// 保留中の差し替えを取りやめる（ESC / FR-7 の 1 行目）。
@@ -1239,9 +1398,24 @@ public actor DictationSession {
     /// 成功した差し替えからしか作られないので、**`.clipboardOnly` の発話へ
     /// Undo を撃つ経路は型として存在しない。**
     ///
+    /// **Undo を始める。待たない。**
+    ///
+    /// `run()` のイベントループから呼ばれるので、**ここで待つとループが止まる。**
+    /// `undo` は `replace` と同じ原始操作なので、AX が詰まる相手では最大約 6 秒掛かる。
+    /// その間ループが止まると、**PTT の押下も解放も処理されない**
+    /// （最終レビュー 視点3 の指摘 2。`applyRevision` と同じ形が `performUndo` にもあった）。
+    ///
+    /// - Note: 続けて 2 回撃たれても二重には戻さない。`performUndo` は書き換えの前に
+    ///   `clearUndoTarget()` するので、2 回目は錨を見つけられず縮退（クリップボードへの
+    ///   取り出し）へ落ちる。**これは 10 秒窓を過ぎた場合とまったく同じ結末である。**
+    private func beginUndo() {
+        undoTask = Task { [weak self] in await self?.performUndo() }
+    }
+
     /// - Important: **`replace` と同じ原始操作を逆向きに使うだけである。**
     ///   したがって secure input 中は同じ判定で拒否される（`TextReplacer.replace`）。
-    private func performUndo() {
+    /// - Important: **`replacer.undo` は actor を手放して走らせる**（`runOffActor`）。
+    private func performUndo() async {
         // 差し替えがまだ保留中なら、**取りやめるだけ。何も書き換えない**（FR-7 の 1 行目）。
         if pendingRevision != nil, undoAnchor == nil {
             cancelPendingRevision()
@@ -1261,8 +1435,10 @@ public actor DictationSession {
 
         let canShowState = (phase == .idle)
         if canShowState { emit(.revising) }
-        let result = replacer.undo(anchor)
-        if canShowState { emit(.idle) }
+        // **actor を手放して走らせる**（`runOffActor` の注記）。
+        let result = await Self.runOffActor { replacer.undo(anchor) }
+        // 手放している間に次の発話が始まっていることがある。そのときの状態はそちらのもの。
+        if canShowState, phase == .idle { emit(.idle) }
 
         switch result {
         case .replaced:
@@ -1281,7 +1457,19 @@ public actor DictationSession {
     /// **差し替えできない経路で挿入した直近の発話に限り、生テキストをクリップボードへ置く。**
     /// クリップボードを奪ってよいのは、これが**利用者の明示操作**だからである。
     /// 該当が無ければ何もしない（「戻せません」を告げるだけ）。
+    ///
+    /// - Important: **secure input 中は行わない。**
+    ///   ここは、挿入・差し替え・Undo 本体・再挿入のうちで**唯一 secure input の判定を
+    ///   通らない「クリップボードへ置く」経路**だった。到達しないと考えられてはいた
+    ///   ——この関数を呼ぶのは Undo キーの打鍵だけで、secure input が有効な間は
+    ///   `CGEventTap` にキーイベントが配送されないためである——が、
+    ///   **それは偶然の性質に依存した守り方であり、UI から Undo を撃てるようにした
+    ///   瞬間に穴が開く**（最終レビュー 視点5 の P-4）。**推定に頼らず判定を置く。**
     private func offerRawTextToClipboard() {
+        guard !isSecureInputEnabled() else {
+            notify(.undoUnavailable)
+            return
+        }
         guard let clipboard, let latest = history.entries.first,
             latest.isManualUndoFallbackCandidate,
             (0...HistoryStore.undoWindow).contains(Date().timeIntervalSince(latest.timestamp))
@@ -1289,7 +1477,14 @@ public actor DictationSession {
             notify(.undoUnavailable)
             return
         }
-        clipboard.leave(latest.rawText)
+        // **戻り値を見る。**「クリップボードへ取り出しました」は主張であって、
+        // 置けていないのにそう告げると、利用者は ⌘V を押して何も貼れない
+        // （`CompositeInserter` の最後の砦と同じ形。最終レビュー A-2）。
+        // 置けなくても発話は履歴にある——だから「戻せません」で済ませてよい。
+        guard clipboard.leave(latest.rawText) else {
+            notify(.undoUnavailable)
+            return
+        }
         notify(.undoCopiedRawTextToClipboard)
     }
 
@@ -1300,9 +1495,14 @@ public actor DictationSession {
     /// 履歴側の述語（`HistoryEntry.isAutomaticUndoCandidate`）の一方の条件を満たしてしまい、
     /// **一度も挿入していない文字列が「直近の整形済み発話」として履歴 UI に載る。**
     /// **経路（`.notInserted`）でも弾かれるので二重に守られているが、ここを緩めないこと。**
+    ///
+    /// - Important: **上限 0 でも「成功」にしてはならない。** `append` は何も保存せず
+    ///   例外も投げないので、2 値で扱っていた頃は成功として待機へ落ちていた。
+    ///   中断された発話にとって履歴は**唯一の写し**なので、残らなかったのなら
+    ///   それは「発話そのものが失われた」である（最終レビュー A-1）。
     private func finishCancelled(raw: String, locale: String) {
         if !raw.isEmpty,
-            !record(raw: raw, refined: nil, locale: locale, method: .notInserted)
+            record(raw: raw, refined: nil, locale: locale, method: .notInserted) != .stored
         {
             // **この発話はどこにも残っていない。** 挿入していないので手元にも無い。
             fail(.historyUnavailable(insertedElsewhere: false))
@@ -1311,7 +1511,23 @@ public actor DictationSession {
         finishIdle()
     }
 
-    /// - Returns: 書けたか。**握り潰してはならない。**
+    /// 履歴への書き込みの顛末。**「例外が出なかった」と「実際に残った」は別である。**
+    ///
+    /// 上限 0（設定画面のステッパーで到達できる。`HistoryStore.normalized` が
+    /// 「明示的な指示として尊重する」と定めたサポート構成）では、`append` は
+    /// **何も保存せず、例外も投げない。** ここを 2 値で扱っていたために、
+    /// **ESC で中断した発話が欄にもクリップボードにも履歴にも残らないまま、
+    /// 失敗を 1 つも出さずに待機へ落ちていた**（最終レビュー A-1）。
+    private enum HistoryRecord: Equatable {
+        /// 履歴に残った。
+        case stored
+        /// 例外は出ていないが、上限 0 なので**残っていない。**
+        case notRetained
+        /// 書けなかった（容量・権限・破損）。
+        case failed
+    }
+
+    /// - Returns: 顛末。**握り潰してはならない。**
     ///
     /// `try?` で捨てていた頃は、書き込みが失敗しても `.failed` も出ず標準エラーにも
     /// 出ず、メモリにも残らなかった。**中断された発話ではそれが唯一の写しなので、
@@ -1323,7 +1539,7 @@ public actor DictationSession {
     /// 破損）は時間で解決しない。**失敗したことを利用者へ告げる**方が確実に効く。
     private func record(
         raw: String, refined: String?, locale: String, method: InsertionMethod
-    ) -> Bool {
+    ) -> HistoryRecord {
         record(
             HistoryEntry(
                 rawText: raw, refinedText: refined,
@@ -1331,13 +1547,12 @@ public actor DictationSession {
             ))
     }
 
-    /// - Returns: 書けたか。**握り潰してはならない**（上の注記）。
-    private func record(_ entry: HistoryEntry) -> Bool {
+    /// - Returns: 顛末。**握り潰してはならない**（上の注記）。
+    private func record(_ entry: HistoryEntry) -> HistoryRecord {
         do {
-            try history.append(entry)
-            return true
+            return try history.append(entry) ? .stored : .notRetained
         } catch {
-            return false
+            return .failed
         }
     }
 

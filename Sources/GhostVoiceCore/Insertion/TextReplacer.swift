@@ -205,6 +205,13 @@ public final class TextReplacer: Sendable {
         self.isSecureInputEnabled = isSecureInputEnabled
     }
 
+    /// いま有効な挿入の世代。
+    ///
+    /// **挿入器と同じ `InsertionEpoch` を握っていることを検査が固定するために公開する。**
+    /// 別物を握ると差し替えは常に `.staleEpoch` で断念され、症状は
+    /// 「整形が反映されない」だけになる（`InsertionStack` の注記）。
+    public var currentEpoch: UInt64 { epoch.current }
+
     /// C-7 で締め出した相手か。
     public func isBlocked(_ processIdentifier: pid_t) -> Bool {
         blocked.withLock { $0.contains(processIdentifier) }
@@ -238,7 +245,20 @@ public final class TextReplacer: Sendable {
     ///
     /// - Returns: **`.replaced` 以外は「欄を書き換えていない」。**
     ///   `.lost` だけが「判らない」で、そこは退避・告知・締め出しを済ませてある。
+    /// - Important: **同期である。AX の往復を最大 12 回行う**（1 往復の上限は 0.5 秒）。
+    ///   **actor の上で呼んではならない**——相手が固まると最大約 6 秒 actor が塞がり、
+    ///   その間 PTT の押下も解放も処理されない（＝喋っているのに録音が始まらない。
+    ///   最終レビュー 視点3 の指摘 2）。`DictationSession` は `runOffActor(_:)` を通す。
+    /// - Important: 世代の照合から書き込みまでを**世代の錠**の中で行う
+    ///   （`InsertionEpoch.withExclusiveWrite`）。actor を手放しても、同じ組の挿入とは
+    ///   重ならない。
     public func replace(_ anchor: ReplacementAnchor, with replacement: String)
+        -> ReplacementResult
+    {
+        epoch.withExclusiveWrite { replaceExclusively(anchor, with: replacement) }
+    }
+
+    private func replaceExclusively(_ anchor: ReplacementAnchor, with replacement: String)
         -> ReplacementResult
     {
         // --- ここから: AX の往復を伴わない判定（安い順） ---
@@ -320,10 +340,15 @@ public final class TextReplacer: Sendable {
     ) -> ReplacementResult {
         // 新しい長さも自分で数えない。相手が返したキャレット位置の差を使う
         // （範囲の単位が未実測のため。`AXTextRange` の注記）。
+        //
+        // **上限は `AXTextRange.written` が型の側で掛ける**（NFR-V3 の条件 1）。
+        // 上限が無いと、相手がキャレットを欄の末尾へ送った場合に
+        // 「自分が書き始めた位置 〜 欄の末尾」を読むことになり、
+        // **利用者が元から書いていたテキストを読み出す。**
         let newRange = accessibility.selectedRange(of: element).flatMap { after -> AXTextRange? in
-            guard after.length == 0, after.location >= anchor.range.location else { return nil }
-            return AXTextRange(
-                location: anchor.range.location, length: after.location - anchor.range.location)
+            guard after.length == 0 else { return nil }
+            return AXTextRange.written(
+                replacement, from: anchor.range.location, to: after.location)
         }
 
         if let newRange,

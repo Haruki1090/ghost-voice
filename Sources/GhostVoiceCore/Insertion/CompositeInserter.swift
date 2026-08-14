@@ -127,7 +127,14 @@ public struct CompositeInserter: AnchoringTextInserting {
         // つまり Pasteboard 経路がクリップボードへ書く機会が無い。ここを塞がないと
         // 「クリップボードへ残した」と報告しながら発話がどこにも無い状態になる。
         // 音声は再現できないので、これはこの製品で最も重い失敗である（基本設計書 §7）。
-        lastResort.leave(text)
+        //
+        // **戻り値を必ず見る。** `.inserted(.clipboardOnly)` は「クリップボードへ残した」
+        // という主張であって（`TextInserting` の doc）、置けていないのにそう答えると
+        // 利用者は「⌘V で貼れます」に従って取りに行き、そこには何も無い。
+        // **履歴書き込みも失敗すれば、嘘を言ったうえで発話が完全に消える**（最終レビュー A-2）。
+        guard lastResort.leave(text) else {
+            return AnchoredInsertion(outcome: .failedEverywhere, anchor: nil)
+        }
         return AnchoredInsertion(outcome: .inserted(.clipboardOnly), anchor: nil)
     }
 
@@ -146,12 +153,20 @@ public struct CompositeInserter: AnchoringTextInserting {
         sender: any PasteShortcutSending = SystemPasteShortcutSender(),
         restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
         epoch: InsertionEpoch = InsertionEpoch(),
+        ownProcessIdentifier: pid_t = getpid(),
+        frontmostProcessIdentifier: @escaping @Sendable () -> pid_t? = {
+            SystemAccessibility.frontmostProcessIdentifier()
+        },
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) -> CompositeInserter {
         let pasteboardInserter = PasteboardInserter(
-            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay)
+            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay,
+            ownProcessIdentifier: ownProcessIdentifier,
+            frontmostProcessIdentifier: frontmostProcessIdentifier)
         return CompositeInserter(
-            primary: AccessibilityInserter(accessibility: accessibility, epoch: epoch),
+            primary: AccessibilityInserter(
+                accessibility: accessibility, ownProcessIdentifier: ownProcessIdentifier,
+                epoch: epoch),
             fallback: pasteboardInserter,
             lastResort: pasteboardInserter,
             epoch: epoch,
@@ -205,13 +220,24 @@ extension CompositeInserter {
         sender: any PasteShortcutSending = SystemPasteShortcutSender(),
         restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
         announcer: any ReplacementAnnouncing = SilentAnnouncer(),
+        ownProcessIdentifier: pid_t = getpid(),
+        frontmostProcessIdentifier: @escaping @Sendable () -> pid_t? = {
+            SystemAccessibility.frontmostProcessIdentifier()
+        },
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) -> InsertionStack {
         let epoch = InsertionEpoch()
+        // **自プロセスの判定は両段へ渡す。** 一段目（AX）だけに掛けていた頃は、
+        // 設定画面を開いたまま発話すると二段目の ⌘V が自分の窓へ飛んだ
+        // （最終レビュー 視点1 の B-1 / 視点3 の指摘 1）。
         let pasteboardInserter = PasteboardInserter(
-            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay)
+            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay,
+            ownProcessIdentifier: ownProcessIdentifier,
+            frontmostProcessIdentifier: frontmostProcessIdentifier)
         let inserter = CompositeInserter(
-            primary: AccessibilityInserter(accessibility: accessibility, epoch: epoch),
+            primary: AccessibilityInserter(
+                accessibility: accessibility, ownProcessIdentifier: ownProcessIdentifier,
+                epoch: epoch),
             fallback: pasteboardInserter,
             lastResort: pasteboardInserter,
             epoch: epoch,
@@ -223,6 +249,7 @@ extension CompositeInserter {
             clipboard: pasteboardInserter,
             announcer: announcer,
             epoch: epoch,
+            ownProcessIdentifier: ownProcessIdentifier,
             isSecureInputEnabled: isSecureInputEnabled
         )
         return InsertionStack(

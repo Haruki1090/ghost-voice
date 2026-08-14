@@ -129,7 +129,7 @@ extension SpeechDependentTests {
                 try await withTempRoot { root in
                     let audio = ReplayAudioCapture(buffers: buffers, interval: .milliseconds(100))
                     let hotkey = StubHotkeyMonitor()
-                    let session = DictationSession(
+                    let session = DictationSession.forTests(
                         settings: SettingsStore(rootURL: root),
                         hotkey: hotkey,
                         audio: audio,

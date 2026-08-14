@@ -19,9 +19,20 @@ import Testing
 final class SwitchingAccessibility: ReplacementCapableAccessibility, @unchecked Sendable {
 
     private let inner: Mutex<FakeAccessibility>
+    /// **経路判定（`canCaptureAnchor`）の直後に 1 度だけ走る仕掛け。**
+    ///
+    /// 「(a) を選んだ後・挿入する前に世界が変わった」という並びは、時計でも読み回数でも
+    /// 狙えない（読みの回数は実装の都合で変わる）。`isSelectedTextRangeSettable` は
+    /// **`canCaptureAnchor` でしか呼ばれない**ので、そこを目印にする。
+    private let onCaptureProbe: Mutex<(@Sendable () -> Void)?> = Mutex(nil)
 
     init(_ initial: FakeAccessibility) {
         self.inner = Mutex(initial)
+    }
+
+    /// 経路判定の直後に 1 度だけ呼ぶ。
+    func armAfterCaptureProbe(_ action: @escaping @Sendable () -> Void) {
+        onCaptureProbe.withLock { $0 = action }
     }
 
     /// **挿入が終わった後に世界を差し替える。**
@@ -45,7 +56,12 @@ final class SwitchingAccessibility: ReplacementCapableAccessibility, @unchecked 
         inner.withLock { $0.setSelectedText(text, on: element) }
     }
     func isSelectedTextRangeSettable(_ element: any FocusedElement) -> Bool {
-        inner.withLock { $0.isSelectedTextRangeSettable(element) }
+        let answer = inner.withLock { $0.isSelectedTextRangeSettable(element) }
+        if let action = onCaptureProbe.withLock({ current -> (@Sendable () -> Void)? in
+            defer { current = nil }
+            return current
+        }) { action() }
+        return answer
     }
     func selectedRange(of element: any FocusedElement) -> AXTextRange? {
         inner.withLock { $0.selectedRange(of: element) }
@@ -155,6 +171,42 @@ final class RevisionRig: Sendable {
     /// いまの欄の中身。**検査からのみ見る。**
     var content: String { field.withLock { $0.content } }
 
+    /// 1 発話ぶんを流し、**差し替えの顛末が出るまで**待つ。
+    ///
+    /// **`.idle` を待つだけでは足りない。** (a) の分岐では挿入の直後に `.idle` へ戻り、
+    /// 差し替えはその後に走る（それが設計の要点である）。
+    ///
+    /// - Parameter waitingForNotice: 顛末（`SessionNotice`）を待つか。
+    ///   (b) の分岐では差し替えが無いので何も流れない。
+    func speakAndSettle(waitingForNotice: Bool = true) async throws {
+        let collector = notices.follow(session)
+        defer { collector.cancel() }
+        let run = Task { [session] in await session.run() }
+        defer { run.cancel() }
+
+        try await speakOnce(on: run)
+        if waitingForNotice {
+            try await waitUntil("差し替えの顛末が出る") { !self.notices.notices.isEmpty }
+        }
+    }
+
+    /// 1 発話ぶんを流し、待機へ戻るまで待つ。**`run()` は呼び出し側が持つ。**
+    ///
+    /// (a) の分岐では、挿入が終わって履歴に載った時点で `.idle` へ戻る
+    /// （差し替えはその後ろ）。**履歴が増えたことを目印にする**——
+    /// `.idle` は 1 発話につき 2 回来るので目印にならない。
+    func speakOnce(on run: Task<Void, Never>) async throws {
+        let baseline = history.entries.count
+        hotkey.emit(.pressed)
+        try await waitUntil("録音が始まる") {
+            if case .recording = await self.session.state { return true }
+            return false
+        }
+        audio.emit(frames: 1_600)
+        hotkey.emit(.released)
+        try await waitUntil("挿入が終わる") { self.history.entries.count > baseline }
+    }
+
     /// 挿入器と差し替え器を、**同じ世代・同じクリップボード**で組む。
     static func make(
         root: URL,
@@ -164,12 +216,18 @@ final class RevisionRig: Sendable {
         focusedProcess: pid_t = RevisionRig.targetProcess,
         rangeSettable: Bool = true,
         selectionWriteFails: Bool = false,
-        revisionDeadline: Duration = .seconds(5)
+        revisionDeadline: Duration = .seconds(5),
+        historyLimit: Int = 50,
+        caret: FakeTextField.CaretAfterWrite = .endOfWrittenText,
+        secureInputAtInsertion: Bool = false,
+        refiner: SpyRefiner? = nil,
+        clipboardSucceeds: Bool = true
     ) -> RevisionRig {
         let identity = UUID()
         let field = FakeTextField(
             content: prefix + suffix,
             selection: AXTextRange(location: prefix.count, length: 0),
+            caret: caret,
             selectionWriteFails: selectionWriteFails
         )
         let element = FakeAccessibility.Element(
@@ -181,10 +239,14 @@ final class RevisionRig: Sendable {
             FakeAccessibility(focused: element, field: field))
 
         let secure = SecureInputFlag()
+        if secureInputAtInsertion {
+            // **経路判定を通した後・挿入する前**に有効化する（利用者がパスワード欄へ移った）。
+            accessibility.armAfterCaptureProbe { secure.enable() }
+        }
         let isSecureInputEnabled: @Sendable () -> Bool = { secure.isEnabled }
 
         let epoch = InsertionEpoch()
-        let clipboard = StubClipboard()
+        let clipboard = StubClipboard(succeeds: clipboardSucceeds)
         let inserter = CompositeInserter(
             primary: AccessibilityInserter(
                 accessibility: accessibility, ownProcessIdentifier: ownProcess, epoch: epoch),
@@ -200,20 +262,28 @@ final class RevisionRig: Sendable {
         )
 
         let settingsStore = SettingsStore(rootURL: root)
-        try? settingsStore.update {
-            $0.refinementApplyMode = applyMode
-            $0.revisionDeadlineMs = Int(revisionDeadline.components.seconds * 1_000)
+        do {
+            // **`try?` にしてはならない**（視点4 §5.1）。書けなかった場合、rig は
+            // 既定値（`.afterInsert` / 3000 ms）のまま**静かに**動く——
+            // 短い `revisionDeadline` を指定した検査が黙って 3 秒で走ることになる。
+            // **setup の失敗を成功として通す形**なので、失敗として記録する。
+            try settingsStore.update {
+                $0.refinementApplyMode = applyMode
+                $0.revisionDeadlineMs = Int(revisionDeadline.components.seconds * 1_000)
+            }
+        } catch {
+            Issue.record("rig の設定を書けなかった（既定値のまま走ると別のものを検査する）: \(error)")
         }
 
         let hotkey = StubHotkeyMonitor()
         let audio = StubAudioCapture()
-        let history = HistoryStore(rootURL: root, limit: 50)
+        let history = HistoryStore(rootURL: root, limit: historyLimit)
         let session = DictationSession(
             settings: settingsStore,
             hotkey: hotkey,
             audio: audio,
             transcriber: StubTranscriber(finalText: raw),
-            refiner: SpyRefiner(result: refined, delay: refineDelay),
+            refiner: refiner ?? SpyRefiner(result: refined, delay: refineDelay),
             insertion: InsertionStack(
                 inserter: inserter, replacer: replacer, clipboard: clipboard),
             history: history,

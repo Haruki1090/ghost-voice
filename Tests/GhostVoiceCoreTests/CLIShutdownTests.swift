@@ -114,7 +114,7 @@ struct CLIShutdownTests {
         root: URL, hotkey: StubHotkeyMonitor, inserter: RecordingInserter,
         transcriber: StubTranscriber
     ) -> DictationSession {
-        DictationSession(
+        DictationSession.forTests(
             settings: SettingsStore(rootURL: root),
             hotkey: hotkey,
             audio: StubAudioCapture(),

@@ -190,6 +190,12 @@ public final class HistoryViewModel {
         /// - Parameter copied: クリップボードへ退避できたか。
         ///   **できなくても発話は履歴に残っている**（この一覧のコピーで取り出せる）。
         case reinsertAbandoned(copied: Bool)
+        /// **どの経路でも挿入できず、クリップボードへも残せなかった**
+        /// （`InsertionOutcome.failedEverywhere`）。
+        ///
+        /// `.reinserted(.clipboardOnly)` と混ぜてはならない。あちらは
+        /// 「⌘V で貼れます」という主張である。**テキストは履歴にだけ残っている。**
+        case reinsertFailedEverywhere
         case deleted(count: Int)
         case deleteFailed(String)
 
@@ -215,6 +221,9 @@ public final class HistoryViewModel {
             case .reinsertAbandoned(copied: false):
                 "前面のアプリへ戻らなかったので挿入しませんでした。**クリップボードへも置けませんでした。**"
                     + "テキストは履歴に残っています（この一覧のコピーで取り出せます）。"
+            case .reinsertFailedEverywhere:
+                "どこにも挿入できず、**クリップボードへも置けませんでした。**"
+                    + "テキストは履歴に残っています（この一覧のコピーで取り出せます）。"
             case .deleted(let count): "\(count) 件削除しました"
             case .deleteFailed(let reason): "削除できませんでした（\(reason)）"
             }
@@ -230,6 +239,8 @@ public final class HistoryViewModel {
             // クリップボードへ退避できたなら、`.clipboardOnly` と同じ縮退である
             // （出口はある）。**できなければ残る出口が履歴だけになるので、赤く出す。**
             case .reinsertAbandoned(let copied): !copied
+            // 残る出口が履歴だけになる。**赤く出す。**
+            case .reinsertFailedEverywhere: true
             }
         }
     }
@@ -283,6 +294,7 @@ public final class HistoryViewModel {
         switch result {
         case .inserted(let method): outcome = .reinserted(method)
         case .refusedSecureInput: outcome = .reinsertRefusedSecureInput
+        case .failedEverywhere: outcome = .reinsertFailedEverywhere
         }
         lastOutcome = outcome
         return outcome

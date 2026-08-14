@@ -59,7 +59,11 @@ public final class AppSessionRuntime {
                 AppDiagnostics.note("[準備中] 音声認識モデルを導入しています。完了するまで押しても反応しません…")
             }),
             refiner: FoundationModelRefiner(),
-            inserter: CompositeInserter.system(),
+            // **差し替え器まで含めた組を渡す**（`InsertionStack`）。
+            // ここを `inserter:` だけにすると `replacer` / `clipboard` が nil になり、
+            // **FR-5(a) の差し替えも FR-7 の Undo も製品では一度も動かない。**
+            // フェーズ 2 の最終レビューまで、実際にそうなっていた。
+            insertion: CompositeInserter.systemStack(),
             history: history,
             vocabulary: vocabulary)
 
