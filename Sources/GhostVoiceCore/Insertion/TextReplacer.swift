@@ -205,6 +205,13 @@ public final class TextReplacer: Sendable {
         self.isSecureInputEnabled = isSecureInputEnabled
     }
 
+    /// いま有効な挿入の世代。
+    ///
+    /// **挿入器と同じ `InsertionEpoch` を握っていることを検査が固定するために公開する。**
+    /// 別物を握ると差し替えは常に `.staleEpoch` で断念され、症状は
+    /// 「整形が反映されない」だけになる（`InsertionStack` の注記）。
+    public var currentEpoch: UInt64 { epoch.current }
+
     /// C-7 で締め出した相手か。
     public func isBlocked(_ processIdentifier: pid_t) -> Bool {
         blocked.withLock { $0.contains(processIdentifier) }

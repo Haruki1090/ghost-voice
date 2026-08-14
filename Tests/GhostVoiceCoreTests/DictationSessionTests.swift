@@ -53,7 +53,7 @@ struct DictationSessionTests {
         // 履歴だけ別のルートへ向けられるようにしてある（書けない状況を作るため）。
         let history = HistoryStore(rootURL: historyRoot ?? root, limit: 50)
         let settings = SettingsStore(rootURL: root)
-        let session = DictationSession(
+        let session = DictationSession.forTests(
             settings: settings,
             hotkey: hotkey,
             audio: audio,

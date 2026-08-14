@@ -158,6 +158,15 @@ public actor DictationSession {
     private let replacer: TextReplacer?
     /// 自動で戻せない発話の生テキストを取り出す先（FR-7 の細目 3 行目）。
     private let clipboard: (any ClipboardLeaving)?
+
+    /// **この組み立てで FR-5(a) の差し替えと FR-7 の Undo が使えるか。**
+    ///
+    /// 偽なら常に (b) の分岐（整形を待ってから挿入する。フェーズ 1 と同じ）で動く。
+    /// **これが公開されているのは、「製品の組み立てが正しいこと」を検査が固定できる
+    /// ようにするためである**——フェーズ 2 の最終レビューで、本番の 2 箇所が
+    /// 差し替え器を渡しておらず、しかも検査が 1 件も落ちなかった
+    /// （検査が自分で正しい組を作っていた）ことが判ったため。
+    public nonisolated let canReviseInPlace: Bool
     private let history: HistoryStore
     private let vocabulary: VocabularyStore
     private let isSecureInputEnabled: @Sendable () -> Bool
@@ -276,12 +285,19 @@ public actor DictationSession {
     private var isFinalSettled = false
     private var finalWaiters: [CheckedContinuation<Void, Never>] = []
 
-    /// **差し替え（FR-5(a) / FR-7）まで含めた本番の組み立て。**
+    /// **差し替え（FR-5(a) / FR-7）まで含めた本番の組み立て。これが唯一の公開初期化子である。**
     ///
     /// `CompositeInserter.systemStack(...)` が返す組をそのまま渡すこと。
     /// **挿入器と差し替え器を別々に作って渡してはならない**——世代を共有しないと
     /// 差し替えが一度も効かず、クリップボードを共有しないと喪失時の退避先が
     /// 誰にも見えない場所になる（`InsertionStack` の注記。どちらも黙って壊れる）。
+    ///
+    /// - Important: **差し替え器を省ける口はここには無い**（フェーズ 2 の最終レビュー）。
+    ///   以前は `inserter:` だけを取る公開初期化子が併存しており、**本番の 2 箇所が
+    ///   そちらを呼んでいたため、製品では差し替えも Undo も一度も動いていなかった。**
+    ///   注意書きは同じ型の doc に既に書かれていたが、本番はその初期化子を
+    ///   呼んでさえいなかった——**doc コメントでは守れないことが証明された**ので、
+    ///   省ける口は `internal`（`forTests`）へ落として本番から到達できなくしてある。
     public init(
         settings: SettingsStore,
         hotkey: any HotkeyMonitor,
@@ -305,11 +321,20 @@ public actor DictationSession {
             maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline)
     }
 
+    /// **テスト専用の組み立て。`internal` なので本番ターゲットからは到達できない。**
+    ///
+    /// 差し替え器を省いた（＝常に (b) の分岐で動く）セッションを作れる唯一の口である。
+    /// **フェーズ 1 と同じ経路の検査を残すために置いてあり、製品の組み立てではない。**
+    ///
+    /// 公開初期化子として残していた頃、本番の 2 箇所がこちらを呼んでいたために
+    /// **FR-5(a) の差し替えと FR-7 の Undo が製品では一度も動かなかった。**
+    /// 名前と可視性の両方で「本番の組み立てではない」ことを示している。
+    ///
     /// - Parameter replacer: 差し替え器。**nil なら常に (b) の分岐**——整形を待ってから
     ///   挿入する、フェーズ 1 と同じ経路で動く（`refinementApplyMode` の設定によらない）。
     /// - Parameter clipboard: 自動で戻せない発話の生テキストを取り出す先（FR-7 の細目）。
     ///   **`replacer` と同じクリップボードを渡すこと。**
-    public init(
+    static func forTests(
         settings: SettingsStore,
         hotkey: any HotkeyMonitor,
         audio: any AudioCapturing,
@@ -324,6 +349,31 @@ public actor DictationSession {
         postEventAuthorization: PostEventAuthorization = .shared,
         maxRecordingDuration: Duration = DictationSession.defaultMaxRecordingDuration,
         finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline
+    ) -> DictationSession {
+        DictationSession(
+            settings: settings, hotkey: hotkey, audio: audio, transcriber: transcriber,
+            refiner: refiner, inserter: inserter, replacer: replacer, clipboard: clipboard,
+            history: history, vocabulary: vocabulary,
+            isSecureInputEnabled: isSecureInputEnabled,
+            postEventAuthorization: postEventAuthorization,
+            maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline)
+    }
+
+    private init(
+        settings: SettingsStore,
+        hotkey: any HotkeyMonitor,
+        audio: any AudioCapturing,
+        transcriber: any Transcribing,
+        refiner: any Refining,
+        inserter: any TextInserting,
+        replacer: TextReplacer?,
+        clipboard: (any ClipboardLeaving)?,
+        history: HistoryStore,
+        vocabulary: VocabularyStore,
+        isSecureInputEnabled: @escaping @Sendable () -> Bool,
+        postEventAuthorization: PostEventAuthorization,
+        maxRecordingDuration: Duration,
+        finalizeDeadline: Duration
     ) {
         self.settings = settings
         self.hotkey = hotkey
@@ -331,9 +381,13 @@ public actor DictationSession {
         self.transcriber = transcriber
         self.refiner = refiner
         self.inserter = inserter
-        self.anchoringInserter = inserter as? any AnchoringTextInserting
+        let anchoring = inserter as? any AnchoringTextInserting
+        self.anchoringInserter = anchoring
         self.replacer = replacer
         self.clipboard = clipboard
+        // **(a) の分岐に必要な 3 つが揃っているか。** 経路判定（`completeUtterance`）が
+        // 見ているのと同じ条件である。
+        self.canReviseInPlace = (anchoring != nil && replacer != nil && clipboard != nil)
         self.history = history
         self.vocabulary = vocabulary
         self.isSecureInputEnabled = isSecureInputEnabled

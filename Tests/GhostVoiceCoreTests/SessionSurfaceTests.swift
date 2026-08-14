@@ -344,7 +344,7 @@ struct SurfaceRig {
         let counting = CountingTranscriber()
         let stub = audio == nil ? StubAudioCapture() : nil
         let usedAudio = audio ?? stub!
-        let session = DictationSession(
+        let session = DictationSession.forTests(
             settings: settings ?? SettingsStore(rootURL: root),
             hotkey: hotkey,
             audio: usedAudio,
