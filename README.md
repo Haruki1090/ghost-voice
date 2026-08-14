@@ -163,7 +163,8 @@ swift test
 ## V-3 / V-4 の実施手順（権限を付与した人が行う）
 
 フェーズ 1 で唯一残っている検証である。**どちらも実キー入力と実挿入が要るので、
-権限を付与した本人にしか実施できない。** 結果は詳細設計書
+権限を付与した本人にしか実施できない。**
+**フェーズ 2 で足した V-23 / V-24 / V-26 / V-27（差し替えの前提）も同じ制約なので、下の 5 に並べてある。** 結果は詳細設計書
 [§11.3](docs/03-detailed-design.md) と [§13](docs/03-detailed-design.md) の表へ記入する。
 
 ### 0. 準備（5 分）
@@ -315,3 +316,151 @@ GHOST_VOICE_V12_SECONDS=103 swift test --filter FinalAfterRelease
 > **この検査は V-12 の欠陥を 1 度も捕まえていない。** 回帰を止めているのは代役による
 > `DictationSessionTests.doesNotDropSecondFinalAfterRelease`（既定の `swift test` で走る）で、
 > こちらは「実音声でも取りこぼさない」ことを実物で確かめる側である。
+
+### 5. V-23 / V-24 / V-26 / V-27: 差し替えの前提（15 分。**使い捨ての入力欄でのみ行うこと**）
+
+**「挿入済みテキストを後から整形結果へ差し替える」（FR-5(a) / FR-7）が成立するかを測る。**
+実装（`TextReplacer`）は全経路を代役で検査済みだが、**実アプリに対する挙動はまだ 1 つも測っていない。**
+
+> **この手順は入力欄の内容を実際に書き換える。** 保存していない文書・チャットの入力中の文・
+> パスワード欄では**絶対に行わないこと。** 空のメモや、捨ててよいテキストエディタの窓を使う。
+
+```bash
+mkdir -p /tmp/gv-probe && cat > /tmp/gv-probe/probe.swift <<'SWIFT'
+// V-23 / V-24 / V-26 / V-27 の実測用。**使い捨ての入力欄でのみ実行すること。**
+import ApplicationServices
+import CoreGraphics
+import Foundation
+
+func frontmostPid() -> pid_t? {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]
+    else { return nil }
+    for window in windows {
+        if let layer = window[kCGWindowLayer as String] as? Int, layer == 0,
+           let pid = window[kCGWindowOwnerPID as String] as? pid_t { return pid }
+    }
+    return nil
+}
+
+func focused() -> (AXUIElement, pid_t)? {
+    guard let pid = frontmostPid() else { return nil }
+    let app = AXUIElementCreateApplication(pid)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &value)
+            == .success,
+          let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+    else { return nil }
+    return (unsafeDowncast(value, to: AXUIElement.self), pid)
+}
+
+func settable(_ element: AXUIElement, _ attribute: String) -> Bool {
+    var flag: DarwinBoolean = false
+    return AXUIElementIsAttributeSettable(element, attribute as CFString, &flag) == .success
+        && flag.boolValue
+}
+
+func selection(_ element: AXUIElement) -> CFRange? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(
+        element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
+          let value, CFGetTypeID(value) == AXValueGetTypeID()
+    else { return nil }
+    var range = CFRange()
+    guard AXValueGetValue(unsafeDowncast(value, to: AXValue.self), .cfRange, &range) else {
+        return nil
+    }
+    return range
+}
+
+func setSelection(_ element: AXUIElement, _ range: CFRange) -> Bool {
+    var range = range
+    guard let value = AXValueCreate(.cfRange, &range) else { return false }
+    return AXUIElementSetAttributeValue(
+        element, kAXSelectedTextRangeAttribute as CFString, value) == .success
+}
+
+func string(_ element: AXUIElement, _ range: CFRange) -> String? {
+    var range = range
+    guard let parameter = AXValueCreate(.cfRange, &range) else { return nil }
+    var value: CFTypeRef?
+    guard AXUIElementCopyParameterizedAttributeValue(
+        element, kAXStringForRangeParameterizedAttribute as CFString, parameter, &value)
+            == .success
+    else { return nil }
+    return value as? String
+}
+
+print("5 秒以内に、使い捨ての入力欄をクリックしてください…")
+Thread.sleep(forTimeInterval: 5)
+
+guard let (element, pid) = focused() else {
+    print("フォーカス要素が取れません（AX 権限か、対象アプリの問題）"); exit(1)
+}
+var role: CFTypeRef?
+_ = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+print("pid=\(pid) role=\(role as? String ?? "不明")")
+print("V-23 kAXSelectedText settable      : \(settable(element, kAXSelectedTextAttribute as String))")
+print("V-23 kAXSelectedTextRange settable : \(settable(element, kAXSelectedTextRangeAttribute as String))")
+
+let marker = "検証用テキストです😀"
+guard let before = selection(element) else { print("選択範囲が読めません"); exit(1) }
+guard AXUIElementSetAttributeValue(
+    element, kAXSelectedTextAttribute as CFString, marker as CFString) == .success else {
+    print("書き込みが AXError。ここで終了（何も入っていない）"); exit(1)
+}
+guard let after = selection(element) else { print("書き込み後の選択範囲が読めません"); exit(1) }
+let length = after.location - before.location
+print("V-23 キャレット: 挿入直後 length=\(after.length)（0 が期待値）, 導いた長さ=\(length)")
+print("     単位の目安: count=\(marker.count) utf16=\(marker.utf16.count) scalars=\(marker.unicodeScalars.count)")
+
+let range = CFRange(location: before.location, length: length)
+if let read = string(element, range) {
+    print("V-24 AXStringForRange           : 読めた。一致=\(read == marker)")
+} else {
+    print("V-24 AXStringForRange           : **読めない**（この相手は差し替え不可）"); exit(0)
+}
+
+// V-27: 時間を置いてから同じ要素かを見る
+Thread.sleep(forTimeInterval: 2)
+if let (again, _) = focused() {
+    print("V-27 CFEqual（2 秒後）           : \(CFEqual(element, again))")
+}
+
+// V-26 本番: 範囲を選び直して 1 回で上書きする
+let replacement = "差し替え後"
+guard setSelection(element, range) else { print("範囲の設定が AXError"); exit(1) }
+guard AXUIElementSetAttributeValue(
+    element, kAXSelectedTextAttribute as CFString, replacement as CFString) == .success else {
+    print("V-26 上書きが AXError（何も起きていない）"); exit(1)
+}
+let newLength = (selection(element)?.location ?? before.location) - before.location
+let newRange = CFRange(location: before.location, length: newLength)
+switch string(element, newRange) {
+case replacement:
+    print("V-26 事後検査                    : 一致（差し替え成功）")
+case .some(let other) where other == marker || string(element, range) == marker:
+    print("V-26 事後検査                    : **元の文字列のまま = R-4 の無言失敗**")
+default:
+    print("V-26 事後検査                    : **どちらでもない = 喪失。設計を変える材料**")
+}
+SWIFT
+swift /tmp/gv-probe/probe.swift
+```
+
+実行したら **5 秒以内に使い捨ての入力欄をクリックする**（そこへ書き込まれる）。
+
+| 出力 | 何が判るか | 外れたときにどうなるか |
+|---|---|---|
+| `V-23 kAXSelectedTextRange settable` | 範囲を選び直せる相手か | **false なら差し替えは起きない。** 挙動は現状のまま（整形を待つ分岐） |
+| `V-24 AXStringForRange` | 読み戻せる相手か | **読めなければ差し替えは中止される**（生テキストが残る） |
+| `V-23 導いた長さ` と `単位の目安` | AX の範囲の単位（`count` / `utf16` / `scalars` のどれと一致するか） | **実装は長さを自分で数えないので、単位が何でも成立する。** 記録だけする |
+| `V-26 事後検査` | **`.lost`（消えるだけ）が実在するか** | **「どちらでもない」が 1 度でも出たら、差し替えを既定オフにする**（詳細設計書 §6.5 の唯一の重い行） |
+| `V-27 CFEqual` | 時間を跨いで同じ要素と判定できるか | false なら差し替えが一度も効かない（**誤った欄へは書かない**） |
+
+**アプリごとに繰り返す**（メモ / メール / Chrome アドレスバー / Slack / Notion / Xcode / ターミナル）。
+**あわせて IME の変換中（未確定の文字がある状態）でも 1 度実行する**——ここは B（誤ったテキストが入る）を
+作りうる箇所として設計が挙げている。
+
+**結果の記入先**: 詳細設計書 §13 の V-23 / V-24 / V-26 / V-27。
+**実測が設計の想定と違ったら、コードではなく設計書を事実に合わせて直すこと**（`docs/00-development-cycle.md`）。

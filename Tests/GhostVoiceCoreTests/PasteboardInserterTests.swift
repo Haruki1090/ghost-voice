@@ -29,7 +29,7 @@ struct PasteboardInserterTests {
                 pasteboard: pasteboard, sender: sender, restoreDelay: .milliseconds(1)
             )
 
-            #expect(await inserter.tryInsert("挿入するテキスト"))
+            #expect(await inserter.tryInsert("挿入するテキスト").didInsert)
             #expect(sender.calls.sendCount == 1)
             #expect(sender.calls.observed == ["挿入するテキスト"])
         }
@@ -49,7 +49,7 @@ struct PasteboardInserterTests {
             )
 
             let start = ContinuousClock.now
-            #expect(await inserter.tryInsert("挿入するテキスト"))
+            #expect(await inserter.tryInsert("挿入するテキスト").didInsert)
             let elapsed = ContinuousClock.now - start
 
             #expect(sender.calls.observed == ["挿入するテキスト"], "送出時点で載っていない")
@@ -76,7 +76,7 @@ struct PasteboardInserterTests {
                 sender: StubPasteShortcutSender(canSend: true),
                 restoreDelay: .milliseconds(1)
             )
-            #expect(await inserter.tryInsert("挿入するテキスト"))
+            #expect(await inserter.tryInsert("挿入するテキスト").didInsert)
 
             #expect(pasteboard.data(forType: .png) == png, "画像が失われた")
             #expect(pasteboard.string(forType: .string) == "画像に添えた説明")
@@ -103,7 +103,7 @@ struct PasteboardInserterTests {
                 sender: StubPasteShortcutSender(canSend: true),
                 restoreDelay: .milliseconds(1)
             )
-            #expect(await inserter.tryInsert("挿入するテキスト"))
+            #expect(await inserter.tryInsert("挿入するテキスト").didInsert)
 
             let restored = (pasteboard.readObjects(forClasses: [NSAttributedString.self])
                 as? [NSAttributedString])?.first
@@ -131,7 +131,7 @@ struct PasteboardInserterTests {
                 sender: StubPasteShortcutSender(canSend: true),
                 restoreDelay: .milliseconds(1)
             )
-            #expect(await inserter.tryInsert("挿入するテキスト"))
+            #expect(await inserter.tryInsert("挿入するテキスト").didInsert)
 
             let restored = pasteboard.pasteboardItems?.map { $0.string(forType: .string) }
             #expect(restored == ["一番目", "二番目", "三番目"])
@@ -174,7 +174,7 @@ struct PasteboardInserterTests {
                 restoreDelay: .milliseconds(1)
             )
 
-            #expect(await inserter.tryInsert("失われては困る発話") == false)
+            #expect(await inserter.tryInsert("失われては困る発話").didInsert == false)
             #expect(
                 pasteboard.string(forType: .string) == "失われては困る発話",
                 "復元してテキストを消している"
@@ -193,7 +193,7 @@ struct PasteboardInserterTests {
                 restoreDelay: .milliseconds(1)
             )
 
-            #expect(await inserter.tryInsert("挿入したテキスト"))
+            #expect(await inserter.tryInsert("挿入したテキスト").didInsert)
             #expect(pasteboard.string(forType: .string) == "挿入したテキスト")
         }
     }
