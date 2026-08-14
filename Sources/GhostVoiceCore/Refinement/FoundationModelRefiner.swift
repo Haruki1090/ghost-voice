@@ -57,7 +57,9 @@ public final class FoundationModelRefiner: Refining {
         )
 
         guard let output else { return nil }
-        return RefinementGuard.accept(output, refinementOf: raw)
+        // **辞書も渡す。** 残存率の検査は「頼んだ置換を当てた後の入力」と比べる
+        // （渡さないと FR-6 の置換が逸脱と区別できない。`RefinementGuard` の表）。
+        return RefinementGuard.accept(output, refinementOf: raw, terms: terms)
     }
 
     /// 1 リクエスト = 1 セッション。次の発話は別のセッションを使う。

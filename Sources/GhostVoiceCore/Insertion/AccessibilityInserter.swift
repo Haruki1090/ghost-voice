@@ -157,17 +157,61 @@ public struct SystemAccessibility: AccessibilityProbing {
         return Float(Double(seconds) + Double(attoseconds) / 1e18)
     }
 
+    /// 最前面のアプリを名指しして、その中のフォーカス要素を引く。
+    ///
+    /// **システムワイド要素は使わない（V-3 の実測 / 2026-08-14）。**
+    /// `AXUIElementCreateSystemWide()` から `kAXFocusedUIElementAttribute` を引くと、
+    /// **この機体では全アプリで即座に `cannotComplete`（-25204）を返した。**
+    /// メッセージングのタイムアウトを 0.5 秒から 5 秒へ伸ばしても **0 ms で落ちる**ので、
+    /// 相手の応答待ちではなく、システムワイド要素そのものが使えない。
+    /// **一方、`AXUIElementCreateApplication(pid)` で名指しすれば同じ属性が取れる。**
+    ///
+    /// この誤りのせいで、AX 経路は実機で一度も使われていなかった。30 回以上の挿入が
+    /// すべて Pasteboard へ落ち、そのぶん復元待ちをクリティカルパスで払っていた
+    /// （メモは `AXTextArea` / 書き込み可、Chrome のアドレスバーは `AXTextField` または
+    /// `AXComboBox` / 書き込み可で、**どちらも AX 経路が使えるはずだった**）。
+    ///
+    /// **最前面の pid は `CGWindowListCopyWindowInfo` から取る。**
+    /// `NSWorkspace.frontmostApplication` は通知で更新されるため、
+    /// **ランループを回さない文脈（この挿入器は actor 上で動く）では古い値を返し続ける**
+    /// （実測: 12 回中 10 回、切り替えたはずの最前面を追随できなかった）。
+    /// ウィンドウ名は読まないので、画面収録の許可は要らない。
     public func focusedElement() -> (any FocusedElement)? {
-        let system = AXUIElementCreateSystemWide()
-        // システムワイド要素へ設定すると、このプロセスが作る要素全体の既定になる。
-        AXUIElementSetMessagingTimeout(system, messagingTimeout)
+        guard let pid = Self.frontmostProcessIdentifier() else { return nil }
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, messagingTimeout)
 
         var value: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(
-            system, kAXFocusedUIElementAttribute as CFString, &value
+            application, kAXFocusedUIElementAttribute as CFString, &value
         )
         guard status == .success else { return nil }
         return Self.element(from: value)
+    }
+
+    /// 画面上のいちばん手前のウィンドウの持ち主。
+    ///
+    /// `kCGWindowLayer == 0` は通常のアプリケーションウィンドウを指す。メニューバーや
+    /// カーソルなどは別のレイヤに載るので、それらを飛ばして最初に見つかったものを返す。
+    static func frontmostProcessIdentifier() -> pid_t? {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+            as? [[String: Any]]
+        else { return nil }
+        return frontmostProcessIdentifier(in: windows)
+    }
+
+    /// 絞り込みの規則だけを取り出したもの。**実際のウィンドウ一覧に依存せず検査できる。**
+    ///
+    /// 一覧は前面から順に並ぶので、条件に合う最初のものが最前面である。
+    static func frontmostProcessIdentifier(in windows: [[String: Any]]) -> pid_t? {
+        for window in windows {
+            guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0,
+                let pid = window[kCGWindowOwnerPID as String] as? pid_t
+            else { continue }
+            return pid
+        }
+        return nil
     }
 
     /// AX の属性値を要素として包む。**型を確かめてから包むこと。**
@@ -179,7 +223,7 @@ public struct SystemAccessibility: AccessibilityProbing {
     /// 何も返さないので、権限の無い機体では型検査の分岐を通せない。
     static func element(from value: CFTypeRef?) -> Element? {
         guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        return Element(ax: unsafeBitCast(value, to: AXUIElement.self))
+        return Element(ax: unsafeDowncast(value, to: AXUIElement.self))
     }
 
     public func role(of element: any FocusedElement) -> String? {

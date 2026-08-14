@@ -122,7 +122,8 @@ struct CLIShutdownTests {
         continuation.finish()
         await loop.value
 
-        #expect(writer.text == "\r[録音中] あ\n[確定中]\n")
+        // `\u{1B}[K` は行末までを消す制御（`SessionNarration` の幅合わせ）。
+        #expect(writer.text == "\r\u{1B}[K[録音中] あ\n[確定中]\n")
         // 列が終わったので、終了処理は待たされない。
         #expect(await gate.waitUntilIdle(within: .milliseconds(10)) == .idle)
     }

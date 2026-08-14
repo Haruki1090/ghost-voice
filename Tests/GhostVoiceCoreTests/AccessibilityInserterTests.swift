@@ -241,3 +241,54 @@ struct SystemAccessibilityTests {
         #expect(SystemAccessibility().processIdentifier(of: valid!) == getpid())
     }
 }
+
+// MARK: - 最前面アプリの特定（V-3 の実測で入れ替えた経路 / 2026-08-14）
+
+/// **システムワイド要素は使えない。** `AXUIElementCreateSystemWide()` から
+/// `kAXFocusedUIElementAttribute` を引くと、実機では全アプリで即座に
+/// `cannotComplete` を返した（タイムアウトを 10 倍にしても 0 ms で落ちる）。
+/// 最前面アプリを pid で名指しすれば取れる。その pid をどう取るかの規則を固定する。
+@Suite("最前面アプリの特定")
+struct FrontmostWindowTests {
+
+    private func window(layer: Int, pid: pid_t) -> [String: Any] {
+        [kCGWindowLayer as String: layer, kCGWindowOwnerPID as String: pid]
+    }
+
+    @Test("いちばん手前の通常ウィンドウの持ち主を返す")
+    func picksTheFrontmostNormalWindow() {
+        let windows = [window(layer: 0, pid: 111), window(layer: 0, pid: 222)]
+        #expect(SystemAccessibility.frontmostProcessIdentifier(in: windows) == 111)
+    }
+
+    /// **メニューバー・カーソル・通知などは別のレイヤに載る。**
+    /// 層を見ずに先頭を取ると、それらの持ち主（多くは `WindowServer` や自分自身）を
+    /// 最前面と誤認し、AX 経路が永久に使えなくなる。
+    @Test("通常のウィンドウ以外の層は飛ばす")
+    func skipsNonZeroLayers() {
+        let windows = [
+            window(layer: 25, pid: 999),
+            window(layer: 3, pid: 888),
+            window(layer: 0, pid: 111),
+        ]
+        #expect(SystemAccessibility.frontmostProcessIdentifier(in: windows) == 111)
+    }
+
+    @Test("該当が無ければ nil を返す")
+    func returnsNilWhenNoNormalWindow() {
+        #expect(SystemAccessibility.frontmostProcessIdentifier(in: []) == nil)
+        #expect(SystemAccessibility.frontmostProcessIdentifier(in: [window(layer: 25, pid: 9)]) == nil)
+    }
+
+    /// 欠けた項目で落ちない。CGWindowList の要素は項目が揃っているとは限らない。
+    @Test("項目が欠けたウィンドウは飛ばす")
+    func skipsMalformedEntries() {
+        let windows: [[String: Any]] = [
+            [:],
+            [kCGWindowLayer as String: 0],
+            [kCGWindowOwnerPID as String: pid_t(77)],
+            window(layer: 0, pid: 111),
+        ]
+        #expect(SystemAccessibility.frontmostProcessIdentifier(in: windows) == 111)
+    }
+}

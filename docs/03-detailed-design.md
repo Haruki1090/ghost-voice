@@ -1716,7 +1716,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 |---|---|---|---|
 | V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 実装 §12-2 | **未完（肉声）**。合成音声のみ実施し CER 3.02 % vs 3.21 %（§11.2）。既定は `.dictation` を維持。肉声の録音が要るため保留 |
 | V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 | **完了**。40〜177 ms / 中央値 約 70 ms（推定値 300 ms を置き換え。§10） |
-| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-11 | **未実施（利用者の権限付与待ち）**。二段構えの実装と単体検査は完了。実挿入には AX API アクセス（`kTCCServiceAccessibility`）とキー送出（`kTCCServicePostEvent`）の**両方**が要り、無いと全アプリで `.inserted(.clipboardOnly)` になる。**CLI と手順は用意済み**（[README](../README.md) の「V-3 / V-4 の実施手順」、記入先は §11.3 の表）。**Task 11 の実装者は権限を付与できないため実施していない。** |
+| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-11 | **一部実施（2026-08-14 / 実機。要件定義書 §2.8.5）。取得経路の誤りで AX が一度も使われていなかったことが判明し、修正後にメモと Chrome アドレスバーで `ax` になった**（Chrome: `insert` 12〜34 ms・`total` 662〜891 ms で **NFR-P6 を初達成**／メモ: `insert` 307 ms）。**R-4（AX が成功を返しながら何も入らない）は未観測。** 残りのアプリ（メール / Slack / Notion / Xcode）は未実施。二段構えの実装と単体検査は完了。実挿入には AX API アクセス（`kTCCServiceAccessibility`）とキー送出（`kTCCServicePostEvent`）の**両方**が要り、無いと全アプリで `.inserted(.clipboardOnly)` になる。**CLI と手順は用意済み**（[README](../README.md) の「V-3 / V-4 の実施手順」、記入先は §11.3 の表）。**Task 11 の実装者は権限を付与できないため実施していない。** |
 | V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-11 | **未実施（利用者の権限付与待ち）**。判定ロジックと `CGEventTap` の実装・単体検査は完了。実キー入力の観測には `CGEvent.tapCreate` が通ること（`kTCCServiceListenEvent` / 入力監視）が要り、無いと 1 件も配送されない。**CLI と手順は用意済み**（[README](../README.md) の「V-3 / V-4 の実施手順」、6 項目の表）。**あわせて実キーボードが左右のデバイスビット（`NX_DEVICERALTKEYMASK` 等）を立てることを確認する**（§2.3）。**Task 11 の実装者は権限を付与できないため実施していない。** |
 | V-5 | DynamicNotchKit の表示先固定制御 | 実装 §12-8 | 未実施 |
 | V-6 | `.nonactivatingPanel` がフォーカスを奪わないこと | 実装 §12-8 | 未実施 |

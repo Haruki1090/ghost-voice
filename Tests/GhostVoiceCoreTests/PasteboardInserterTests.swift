@@ -237,9 +237,13 @@ struct PasteboardInserterTests {
     }
 
     /// 既定値そのものを固定する。実測に基づいて選んだ値なので、黙って変わってはいけない。
-    @Test("既定の復元待ち時間は 120 ms")
+    ///
+    /// **120 ms から 300 ms へ引き上げた（V-3 / 2026-08-14 の実機）。**
+    /// 120 ms では Electron 製アプリが ⌘V を処理する前に復元が走り、
+    /// **前のクリップボードの内容が貼られた**（履歴には成功として記録される）。
+    @Test("既定の復元待ち時間は 300 ms")
     func defaultRestoreDelayIsPinned() {
-        #expect(PasteboardInserter.defaultRestoreDelay == .milliseconds(120))
+        #expect(PasteboardInserter.defaultRestoreDelay == .milliseconds(300))
     }
 }
 

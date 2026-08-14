@@ -187,8 +187,10 @@ struct RefinementGuardTests {
     /// 末尾の改行だけで上限を超えて正常な整形が捨てられる。
     @Test("妥当性は空白を落とした後の長さで測る")
     func judgesPlausibilityAfterTrimming() {
+        // **入力と共通の文字を使う。** 別の文字で埋めると残存率の検査に落ちて、
+        // 「空白を落としているか」を確かめられない（この検査の目的が変わってしまう）。
         let raw = String(repeating: "あ", count: 4)          // 上限は 4 + 16 = 20 字
-        let output = String(repeating: "い", count: 20)
+        let output = String(repeating: "あ", count: 20)
         #expect(RefinementGuard.accept(output + "\n\n\n", refinementOf: raw) == output)
     }
 
@@ -517,5 +519,90 @@ struct FoundationModelRefinerDeviceTests {
         // 要件値の 1.5 倍を壊れ検知の線に取る（V-2 の検査線と同じ規約）。
         #expect(median < .milliseconds(750),
                 "整形が桁で悪化している（要件 NFR-P4 は 500 ms。ここは壊れ検知の線）。中央値: \(median)")
+    }
+}
+
+// MARK: - 出力が入力の変換になっているか（実機で観測 / 2026-08-14）
+
+/// **長さとコードフェンスだけでは、入力と同じくらいの長さの逸脱を止められない。**
+/// 実機で、モデルが質問に答え、その答えが利用者の発話として挿入された。
+@Suite("整形の受け入れ: 入力がどれだけ残っているか")
+struct RetainedRatioTests {
+
+    /// **実機で実際に挿入されてしまった 2 例。** 退行を止めるために逐語で残す。
+    @Test("質問に答えた出力は受け入れない（実機の再現）")
+    func rejectsAnswersObservedOnDevice() {
+        let cases = [
+            ("東京の天気どんな感じですか？", "東京の天気は晴れています。"),
+            ("明日の天気って何でしょうか？", "明日の天気は晴れそうです。"),
+        ]
+        for (raw, answer) in cases {
+            // 既存の 2 つの検査は素通りする。**それがこの検査が要る理由である。**
+            #expect(
+                RefinementGuard.isPlausible(answer, refinementOf: raw),
+                "長さの検査は通ってしまう（だから長さだけでは足りない）")
+            #expect(!RefinementGuard.containsCodeFence(answer))
+            #expect(
+                RefinementGuard.accept(answer, refinementOf: raw) == nil,
+                "「\(raw)」に対する回答「\(answer)」を受け入れている")
+        }
+    }
+
+    /// フィラー削除は**入力が縮む**。出力側で割ると落ちるので、短い方で割っている。
+    @Test("フィラーを削っただけの出力は受け入れる")
+    func acceptsFillerRemoval() {
+        #expect(RefinementGuard.accept("こんにちは。", refinementOf: "えー、こんにちは") != nil)
+        #expect(RefinementGuard.accept("会議は明日です。", refinementOf: "あのー、会議は、えっと明日です") != nil)
+    }
+
+    /// **用語の正規化は残存率だけでは逸脱と区別できない**（実測 0.50 対 0.46）。
+    /// 頼んだ置換を先に当てて初めて通る。**辞書を渡さなければ落ちる**ことも併せて固定する
+    /// ——そこが崩れると FR-6 が黙って効かなくなる。
+    @Test("用語を正規表記へ置き換えた出力は、辞書を渡せば受け入れる")
+    func acceptsVocabularySubstitutionWhenTermsAreGiven() {
+        let terms = [VocabularyTerm(canonical: "Google Apps Script", misheard: ["ジーエイエス"])]
+        let output = "Google Apps Script を使いました。"
+        let raw = "ジーエイエスを使いました"
+
+        #expect(
+            RefinementGuard.accept(output, refinementOf: raw, terms: terms) != nil,
+            "FR-6 の置換を落としている")
+        #expect(
+            RefinementGuard.accept(output, refinementOf: raw) == nil,
+            "辞書無しでも通るなら、残存率の検査が効いていない")
+    }
+
+    /// 辞書を渡しても、頼んでいない置換は通らない。
+    @Test("辞書に無い置換は、辞書を渡しても受け入れない")
+    func rejectsUnrequestedSubstitutionEvenWithTerms() {
+        let terms = [VocabularyTerm(canonical: "Google Apps Script", misheard: ["ジーエイエス"])]
+        #expect(
+            RefinementGuard.accept(
+                "東京の天気は晴れています。", refinementOf: "東京の天気どんな感じですか？",
+                terms: terms) == nil)
+    }
+
+    @Test("句読点を補っただけの出力は受け入れる")
+    func acceptsPunctuationOnly() {
+        #expect(RefinementGuard.accept("はい。", refinementOf: "はい") != nil)
+        #expect(RefinementGuard.accept("こんにちは。", refinementOf: "こんにちは") != nil)
+    }
+
+    /// 指標そのものを固定する。閾値だけを見ていると、指標の誤りに気づけない。
+    @Test("残存率は逸脱と正当な整形を分ける")
+    func ratioSeparatesDeviationFromRefinement() {
+        let deviation = RefinementGuard.retainedRatio(
+            "東京の天気は晴れています。", refinementOf: "東京の天気どんな感じですか？")
+        let refinement = RefinementGuard.retainedRatio(
+            "こんにちは。", refinementOf: "えー、こんにちは")
+        #expect(deviation < RefinementGuard.minimumRetainedRatio)
+        #expect(refinement >= RefinementGuard.minimumRetainedRatio)
+        #expect(deviation < refinement, "逸脱の方が残存率が高い")
+    }
+
+    /// 完全に別の文は当然落とす。
+    @Test("入力と無関係な出力は受け入れない")
+    func rejectsUnrelatedOutput() {
+        #expect(RefinementGuard.accept("承知しました。", refinementOf: "おはようございます") == nil)
     }
 }

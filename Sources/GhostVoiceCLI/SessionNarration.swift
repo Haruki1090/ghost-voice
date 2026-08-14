@@ -21,11 +21,14 @@ public enum SessionNarration {
         _ states: AsyncStream<SessionState>,
         metrics: @Sendable () async -> Metrics.Sample?,
         writer: any ConsoleWriting,
-        gate: ShutdownGate
+        gate: ShutdownGate,
+        columns: Int = SessionNarration.terminalColumns()
     ) async {
         for await state in states {
             let sample = (state == .idle) ? await metrics() : nil
-            if let text = line(for: state, metrics: sample) { writer.write(text) }
+            if let text = line(for: state, metrics: sample, columns: columns) {
+                writer.write(text)
+            }
             await gate.observe(state)
         }
         // 列が終わった＝セッションは処理中の発話を見届けた。終了処理を待たせない。
@@ -36,7 +39,59 @@ public enum SessionNarration {
     ///   `DictationSession.latestMetrics` は次の発話が始まるまで前の値を保持するので、
     ///   録音中に読むと前の発話の値を今の発話のものとして出してしまう。
     /// - Returns: 書き出す文字列。**何も出さないときは nil。**
-    public static func line(for state: SessionState, metrics: Metrics.Sample?) -> String? {
+    /// `[録音中] ` の表示幅（半角 9 桁ぶん）。
+    static let recordingPrefixWidth = 9
+
+    /// 端末の桁数。取れなければ 80 とみなす。
+    ///
+    /// **標準エラーを見る**（表示先がそこなので）。パイプへ繋がれている場合は
+    /// `ioctl` が失敗するが、そのときも折り返しは起きないので 80 で困らない。
+    public static func terminalColumns(fileDescriptor: Int32 = STDERR_FILENO) -> Int {
+        var size = winsize()
+        guard ioctl(fileDescriptor, UInt(TIOCGWINSZ), &size) == 0, size.ws_col > 0 else {
+            return 80
+        }
+        return Int(size.ws_col)
+    }
+
+    /// 表示幅。**全角は 2 桁**として数える。
+    ///
+    /// 文字数で切ると日本語では倍の桁を使うので、折り返しを防げない
+    /// （このプロジェクトの表示はほぼ日本語である）。
+    static func displayWidth(of text: some StringProtocol) -> Int {
+        text.unicodeScalars.reduce(0) { $0 + (isWide($1) ? 2 : 1) }
+    }
+
+    private static func isWide(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x1100...0x115F, 0x2E80...0xA4CF, 0xAC00...0xD7A3,
+            0xF900...0xFAFF, 0xFE30...0xFE6F, 0xFF00...0xFF60,
+            0xFFE0...0xFFE6, 0x1F300...0x1F64F, 0x20000...0x3FFFD:
+            true
+        default:
+            false
+        }
+    }
+
+    /// 末尾から `limit` 桁ぶんを取る。切り詰めたときは先頭に `…` を付ける。
+    ///
+    /// **末尾を残すのは、喋っている最中に見たいのが「いま認識された分」だから**である。
+    static func tail(of text: String, within limit: Int) -> String {
+        guard displayWidth(of: text) > limit else { return text }
+        var kept: [Character] = []
+        var width = 0
+        for character in text.reversed() {
+            let next = width + displayWidth(of: String(character))
+            if next > limit - 1 { break }  // 先頭の `…` のぶん 1 桁空ける
+            kept.append(character)
+            width = next
+        }
+        return "…" + String(kept.reversed())
+    }
+
+    public static func line(
+        for state: SessionState, metrics: Metrics.Sample?, columns: Int = 80
+    ) -> String? {
         switch state {
         case .idle:
             // 中断・失敗で終わった発話には計測値が無い。**その場合は何も出さない。**
@@ -44,7 +99,13 @@ public enum SessionNarration {
             return metricsLine(metrics)
         case .recording(let text):
             // 行頭へ戻して上書きする。確定へ進むときに改行を入れる（下の `.finalizing`）。
-            return "\r[録音中] \(text)"
+            //
+            // **端末の幅に収める。** `\r` が戻せるのは**折り返した最後の 1 行の先頭だけ**で、
+            // それより上の行は残る。収めずに出すと、長い発話で更新のたびに折り返しの
+            // ブロックが積み上がり、**「最初から出てしまう」**（実機で観測 / 2026-08-14）。
+            // `\u{1B}[K` は行末までを消す。短くなったときに前の文字が残らないようにする。
+            let room = max(8, columns - Self.recordingPrefixWidth)
+            return "\r\u{1B}[K[録音中] \(Self.tail(of: text, within: room))"
         case .finalizing:
             return "\n[確定中]\n"
         case .refining:

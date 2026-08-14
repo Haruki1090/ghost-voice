@@ -7,10 +7,12 @@ import Testing
 @Suite("CLI: 状態の表示")
 struct CLINarrationTests {
 
+    /// `\u{1B}[K`（行末までを消す）が入るのは、切り詰めで短くなったときに
+    /// 前の文字が残らないようにするためである（下の「端末の幅に収める」の一群）。
     @Test("録音中は暫定テキストを行頭から上書きする")
     func recordingShowsVolatileText() {
         let line = SessionNarration.line(for: .recording(volatileText: "こんにち"), metrics: nil)
-        #expect(line == "\r[録音中] こんにち")
+        #expect(line == "\r\u{1B}[K[録音中] こんにち")
     }
 
     @Test("確定・整形・挿入はそれぞれ別の行を出す")
@@ -132,4 +134,54 @@ struct CLINarrationTests {
         #expect(message.contains("クリップボード"))
         #expect(!message.contains("もう一度"))
     }
+
+    // MARK: - 端末の幅に収める（実機で観測 / 2026-08-14）
+
+    /// **`\r` が戻せるのは折り返した最後の 1 行の先頭だけである。**
+    /// 収めずに出すと、長い発話で更新のたびに折り返しのブロックが積み上がり、
+    /// 実機では「最初から出てしまう」形で観測された。
+    @Test("録音中の行は端末の幅に収める")
+    func recordingLineFitsWithinColumns() throws {
+        let long = String(repeating: "あ", count: 200)
+        let line = try #require(
+            SessionNarration.line(for: .recording(volatileText: long), metrics: nil, columns: 40))
+        let body = line.replacingOccurrences(of: "\r\u{1B}[K", with: "")
+        #expect(SessionNarration.displayWidth(of: body) <= 40, "折り返す幅で出している")
+        #expect(body.hasPrefix("[録音中] …"), "切り詰めた印が無い")
+    }
+
+    /// **末尾を残す。** 喋っている最中に見たいのは「いま認識された分」である。
+    @Test("切り詰めるときは末尾を残す")
+    func recordingLineKeepsTheTail() throws {
+        let text = "あいうえおかきくけこさしすせそ"
+        let line = try #require(
+            SessionNarration.line(for: .recording(volatileText: text), metrics: nil, columns: 20))
+        #expect(line.hasSuffix("そ"), "末尾が落ちている")
+        #expect(!line.contains("あいうえお"), "先頭を残している")
+    }
+
+    /// 全角を 1 桁と数えると、日本語では倍の桁を使うので折り返しを防げない。
+    @Test("表示幅は全角を 2 桁として数える")
+    func displayWidthCountsWideCharactersAsTwo() {
+        #expect(SessionNarration.displayWidth(of: "あ") == 2)
+        #expect(SessionNarration.displayWidth(of: "a") == 1)
+        #expect(SessionNarration.displayWidth(of: "あa") == 3)
+    }
+
+    /// 収まる長さなら切り詰めない（`…` を付けない）。
+    @Test("収まる長さはそのまま出す")
+    func shortRecordingLineIsNotTruncated() throws {
+        let line = try #require(
+            SessionNarration.line(for: .recording(volatileText: "こんにち"), metrics: nil, columns: 80))
+        #expect(line == "\r\u{1B}[K[録音中] こんにち")
+    }
+
+    /// 短くなったときに前の文字が残らないよう、行末までを消す。
+    @Test("録音中の行は行末までを消してから書く")
+    func recordingLineClearsToEndOfLine() throws {
+        let line = try #require(
+            SessionNarration.line(for: .recording(volatileText: "あ"), metrics: nil, columns: 80))
+        #expect(line.hasPrefix("\r\u{1B}[K"), "消去の制御が無いと前の文字が残る")
+    }
+
 }

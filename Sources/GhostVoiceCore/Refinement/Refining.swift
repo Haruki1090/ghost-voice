@@ -84,13 +84,91 @@ enum RefinementGuard {
         output.contains("```")
     }
 
+    /// 出力が入力の**変換**になっているか。共通部分列の長さで測る。
+    ///
+    /// **長さとコードフェンスだけでは、入力と同じくらいの長さの逸脱を止められない**
+    /// （実機で観測 / 2026-08-14。要件定義書 §2.8.5）:
+    ///
+    /// ```
+    /// raw    : 東京の天気どんな感じですか？   （14 字）
+    /// refined: 東京の天気は晴れています。     （13 字。比 0.93 で `isPlausible` を通る）
+    /// ```
+    ///
+    /// **モデルが質問に答え、その答えが利用者の発話として挿入された。** 内容は作り話で
+    /// ある（モデルは天気を知らない）。テキストを失うより重い——言っていないことを
+    /// 言ったことにしている。
+    ///
+    /// 既存の 2 つの検査が見ているのは「大きさ」と「1 つの目印」だけで、
+    /// **出力が入力の変換であるかを一度も確かめていなかった。** ここがその検査である。
+    ///
+    /// 割る数を**短い方の長さ**にしてあるのが要点。フィラー削除（入力が縮む）と
+    /// 句読点の補完（出力が伸びる）の両方を通すためである。
+    ///
+    /// **用語の正規化（FR-6）は、この指標だけでは逸脱と区別できない。** 実測:
+    ///
+    /// | 操作 | 例 | 残存率 |
+    /// |---|---|---|
+    /// | 句読点 | `はい` → `はい。` | 1.00 |
+    /// | フィラー削除 | `あのー、会議は、えっと明日です` → `会議は明日です。` | 0.88 |
+    /// | **用語の正規化** | `ジーエイエスを使いました` → `Google Apps Script を使いました。` | **0.50** |
+    /// | **逸脱（回答）** | `東京の天気どんな感じですか？` → `東京の天気は晴れています。` | **0.46** |
+    /// | 無関係 | `おはようございます` → `承知しました。` | 0.14 |
+    ///
+    /// **0.50 と 0.46 は閾値で分けられない。** どちらも「入力の文字を大きく置き換える」
+    /// 操作だからである。違いは**片方は我々が頼んだ置換で、もう片方は頼んでいない**
+    /// という一点にある。だから `accept` は**先に頼んだ置換を適用してから**ここへ渡す
+    /// （`applyingVocabulary(_:terms:)`）。適用後は用語の正規化がほぼ恒等変換になり、
+    /// 逸脱だけが低いまま残る。
+    ///
+    /// - Note: **観測点はまだ少ない**（逸脱 2 例・正当 5 例）。境界は 0.6 に置いてあるが、
+    ///   正当な整形を落とす報告が出たら、**閾値ではなく指標そのものを見直すこと。**
+    ///   最初に書いた「用語の正規化は約 0.79 だから通る」という見積もりは**外れていた**
+    ///   （実測 0.50）。検査が先に潰した。
+    static func retainedRatio(_ output: String, refinementOf raw: String) -> Double {
+        let a = Array(raw), b = Array(output)
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        // 共通部分列の長さ。1 行ぶんだけ持って回す。
+        var previous = [Int](repeating: 0, count: b.count + 1)
+        var current = previous
+        for i in 1...a.count {
+            for j in 1...b.count {
+                current[j] = a[i - 1] == b[j - 1] ? previous[j - 1] + 1 : max(previous[j], current[j - 1])
+            }
+            swap(&previous, &current)
+        }
+        return Double(previous[b.count]) / Double(min(a.count, b.count))
+    }
+
+    /// 残存率の下限。詳細は `retainedRatio(_:refinementOf:)`。
+    static let minimumRetainedRatio = 0.6
+
+    /// 頼んだ置換（FR-6 の用語辞書）を入力へ先に当てる。
+    ///
+    /// **これをしないと、用語の正規化と逸脱が残存率で区別できない**（上記の表）。
+    /// 整形器はこの辞書をプロンプトへ入れて置換を依頼しているので、
+    /// **置換後の姿こそが「期待される入力」である。**
+    static func applyingVocabulary(_ raw: String, terms: [VocabularyTerm]) -> String {
+        var result = raw
+        for term in terms {
+            for variant in term.misheard where !variant.isEmpty {
+                result = result.replacingOccurrences(of: variant, with: term.canonical)
+            }
+        }
+        return result
+    }
+
     /// LLM の出力を整形結果として受け入れるか決める。受け入れないときは nil を返し、
     /// 呼び出し側が生テキストへ縮退する。
-    static func accept(_ output: String, refinementOf raw: String) -> String? {
+    static func accept(
+        _ output: String, refinementOf raw: String, terms: [VocabularyTerm] = []
+    ) -> String? {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 残存率は**頼んだ置換を当てた後の入力**と比べる（`applyingVocabulary` の理由）。
+        let expected = applyingVocabulary(raw, terms: terms)
         guard !trimmed.isEmpty,
               !containsCodeFence(trimmed),
-              isPlausible(trimmed, refinementOf: raw)
+              isPlausible(trimmed, refinementOf: raw),
+              retainedRatio(trimmed, refinementOf: expected) >= minimumRetainedRatio
         else { return nil }
         return trimmed
     }
