@@ -86,6 +86,8 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
 
         let services = AppServices(
             session: runtime?.session,
+            // **履歴画面の再挿入へ、セッションと同じ組を渡す**（再レビュー B-2）。
+            insertion: runtime?.insertion,
             settings: settings,
             history: history,
             vocabulary: vocabulary,

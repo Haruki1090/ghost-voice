@@ -17,6 +17,14 @@ import GhostVoiceCore
 public final class AppSessionRuntime {
 
     public let session: DictationSession
+
+    /// **このセッションが使っている挿入・差し替えの組。**
+    ///
+    /// 画面（FR-9 の再挿入）へ**同じものを渡すために持ち回る。**
+    /// 別に組むと `InsertionEpoch` が別インスタンスになり、
+    /// **AX の書き込みを直列化する錠が 2 つになる**（再レビュー B-2）。
+    /// 詳しくは `SystemHistoryTextOutput` の注記。
+    public let insertion: InsertionStack
     private let monitor: CGEventTapHotkeyMonitor
 
     /// 設定画面がキー監視器へ触る面（打鍵の捕獲と PTT キーの反映。FR-11）。
@@ -29,8 +37,12 @@ public final class AppSessionRuntime {
     private var watchdog: Task<Void, Never>?
     private var isShuttingDown = false
 
-    private init(session: DictationSession, monitor: CGEventTapHotkeyMonitor) {
+    private init(
+        session: DictationSession, insertion: InsertionStack,
+        monitor: CGEventTapHotkeyMonitor
+    ) {
         self.session = session
+        self.insertion = insertion
         self.monitor = monitor
     }
 
@@ -49,6 +61,10 @@ public final class AppSessionRuntime {
         let monitor = CGEventTapHotkeyMonitor(binding: settings.settings.hotkey)
         try monitor.start()
 
+        // **組は 1 つだけ作る。** セッションと履歴画面の再挿入が同じ錠・同じ世代を
+        // 使うためで、2 つ作ると AX の書き込みが直列化されない（再レビュー B-2）。
+        let insertion = CompositeInserter.systemStack()
+
         let session = DictationSession(
             settings: settings,
             hotkey: monitor,
@@ -63,11 +79,12 @@ public final class AppSessionRuntime {
             // ここを `inserter:` だけにすると `replacer` / `clipboard` が nil になり、
             // **FR-5(a) の差し替えも FR-7 の Undo も製品では一度も動かない。**
             // フェーズ 2 の最終レビューまで、実際にそうなっていた。
-            insertion: CompositeInserter.systemStack(),
+            insertion: insertion,
             history: history,
             vocabulary: vocabulary)
 
-        let runtime = AppSessionRuntime(session: session, monitor: monitor)
+        let runtime = AppSessionRuntime(
+            session: session, insertion: insertion, monitor: monitor)
         runtime.runTask = Task { await session.run() }
         // タップは後から OS に無効化されうる。**黙って効かなくなる唯一の経路**なので見張る。
         // この `Task` は `@MainActor` の文脈で作るので MainActor を継いでいる。

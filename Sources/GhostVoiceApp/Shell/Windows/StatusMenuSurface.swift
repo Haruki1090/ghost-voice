@@ -64,7 +64,9 @@ public final class StatusMenuSurface: NSObject, AppSurface {
             directory: services.storageRoot)
         historyModel = HistoryViewModel(
             store: services.history,
-            output: SystemHistoryTextOutput.system(),
+            // **セッションと同じ組を共有する**（別に組むと AX 書き込みの錠が 2 つに
+            // なる。再レビュー B-2。`SystemHistoryTextOutput` の注記）。
+            output: SystemHistoryTextOutput.system(sharing: services.insertion),
             fileNotice: StoreFileNotice.collect(
                 settings: services.settings, vocabulary: services.vocabulary,
                 history: services.history, directory: services.storageRoot

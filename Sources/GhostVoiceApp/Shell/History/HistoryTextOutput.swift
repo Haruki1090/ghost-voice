@@ -22,11 +22,22 @@ public protocol HistoryTextOutput: Sendable {
 
 /// 本物の挿入器とクリップボードを束ねた口。
 ///
-/// - Important: **`AppSessionRuntime` が発話の挿入に使っている `CompositeInserter` とは
-///   別のインスタンスになる。** 世代（`InsertionEpoch`）を共有しないので、
-///   **ここからの再挿入では差し替えの錨を作らない**（作っても発話側の錨を失効させる
-///   だけで、Undo の対象にはならない）。再挿入は「もう一度打ち直す」操作であって、
-///   発話の続きではない。
+/// - Important: **発話の挿入に使っている組（`InsertionStack`）をそのまま共有する。**
+///   別に組むと `InsertionEpoch` が別インスタンスになり、
+///
+///   1. **再挿入の AX 書き込みが、保留中の差し替えの AX 書き込みと直列化されない**
+///      （錠は世代のインスタンスに属する）。`TextReplacer` の手順 2〜4 の間に
+///      同じ欄の前方へ書かれると、**記録済みの範囲がずれたまま上書きが走り、
+///      利用者の別のテキストが整形結果で消える。**
+///   2. **再挿入が発話側の錨を失効させない**（世代が別なので `.staleEpoch` が立たない）。
+///
+///   直前まで前者の説明が逆に書かれており（「失効させるだけ」）、
+///   **その誤った前提が「別インスタンスでよい」という判断を支えていた**（再レビュー B-2 / D）。
+///
+///   共有すると、再挿入は保留中の差し替えを `.staleEpoch` で降ろす。
+///   **縮退先は「差し替えない」＝生テキストが欄に残る**で、安全側である。
+///   再挿入で差し替えの錨を作らないのは変わらない（`insert` は `TextInserting` の口を
+///   通るので錨を返さない）——再挿入は「もう一度打ち直す」操作であって発話の続きではない。
 public struct SystemHistoryTextOutput: HistoryTextOutput {
     private let inserter: any TextInserting
     private let clipboard: any ClipboardLeaving
@@ -36,13 +47,18 @@ public struct SystemHistoryTextOutput: HistoryTextOutput {
         self.clipboard = clipboard
     }
 
-    /// 本番の組み立て。
+    /// 本番の組み立て。**セッションが使っている組を渡すこと**（上の注記）。
     ///
-    /// - Important: **既定の引数のまま検査から呼んではならない。** 本物の
+    /// - Parameter stack: 発話の挿入・差し替えに使っている組。
+    ///   **nil を渡してよいのは「セッションが 1 つも無いとき」だけである**
+    ///   （`--shell-only` / キー監視を開始できなかったとき）。そのときは保留中の
+    ///   差し替えが存在しえないので、独立した世代を作っても壊れる不変条件が無い。
+    /// - Important: **検査から呼んではならない。** nil を渡すと本物の
     ///   `CGEvent.post` と AX 書き込みが走り、**そのとき前面にあるアプリへ文字が出る**
-    ///   （`COMMON.md` の安全制約）。検査は `HistoryTextOutput` の代役を使うこと。
-    public static func system() -> SystemHistoryTextOutput {
-        let stack = CompositeInserter.systemStack()
+    ///   （`COMMON.md` の安全制約）。検査は `HistoryTextOutput` の代役か、
+    ///   代役で組んだ `InsertionStack` を渡すこと。
+    public static func system(sharing stack: InsertionStack?) -> SystemHistoryTextOutput {
+        let stack = stack ?? CompositeInserter.systemStack()
         return SystemHistoryTextOutput(inserter: stack.inserter, clipboard: stack.clipboard)
     }
 

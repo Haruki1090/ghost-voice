@@ -41,6 +41,14 @@ struct InsertionWiringContractTests {
         "Sources/GhostVoiceCLI/GhostVoiceRuntime.swift",
     ]
 
+    /// - Note: **「`insertion:` の直後に `systemStack(` が来る」という形では見ない。**
+    ///   `.app` は組を 1 度だけ作って**履歴画面の再挿入にも同じものを渡す**ようになった
+    ///   （再レビュー B-2。別に組むと AX 書き込みの錠が 2 つになる）ため、
+    ///   組み立てが `let insertion = CompositeInserter.systemStack()` と
+    ///   `insertion: insertion` の 2 行に分かれる。**命題は「その組を渡していること」**
+    ///   であって行の並びではないので、2 つを別々に見る。
+    ///   組の**型**（差し替え器つき）はコンパイラが保証する（公開初期化子は
+    ///   `insertion: InsertionStack` しか受け取らない。下の検査）。
     @Test(
         "本番の組み立ては InsertionStack（差し替え器つき）を渡す",
         arguments: InsertionWiringContractTests.productionAssemblies
@@ -48,7 +56,10 @@ struct InsertionWiringContractTests {
     func productionPassesTheInsertionStack(path: String) throws {
         let code = try Self.sourceWithoutComments(path)
         #expect(
-            code.contains("insertion: CompositeInserter.systemStack("),
+            code.contains("CompositeInserter.systemStack("),
+            "\(path) が本番の組み立て（systemStack）を通っていない")
+        #expect(
+            code.contains("insertion:"),
             "\(path) が差し替え器つきの組（InsertionStack）を渡していない")
         #expect(
             !code.contains("inserter: CompositeInserter.system("),

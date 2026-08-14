@@ -56,6 +56,15 @@ public protocol AppSurface: AnyObject {
 /// 画面は `nil` を「まだ喋れない」状態として描くこと。
 public struct AppServices: Sendable {
     public let session: DictationSession?
+    /// **セッションが使っている挿入・差し替えの組**（FR-9 の再挿入へ渡す）。
+    ///
+    /// **セッションと同じものを渡すこと。** 別に組むと `InsertionEpoch` が
+    /// 別インスタンスになり、AX の書き込みを直列化する錠が 2 つになる
+    /// （再レビュー B-2。詳しくは `SystemHistoryTextOutput` の注記）。
+    ///
+    /// **nil はセッションが 1 つも無いときだけ**（`--shell-only` /
+    /// キー監視を開始できなかったとき）。そのときは保留中の差し替えが存在しえない。
+    public let insertion: InsertionStack?
     public let settings: SettingsStore
     public let history: HistoryStore
     public let vocabulary: VocabularyStore
@@ -77,6 +86,7 @@ public struct AppServices: Sendable {
 
     public init(
         session: DictationSession?,
+        insertion: InsertionStack? = nil,
         settings: SettingsStore,
         history: HistoryStore,
         vocabulary: VocabularyStore,
@@ -86,6 +96,7 @@ public struct AppServices: Sendable {
         storageRoot: URL = StorageRoot.default
     ) {
         self.session = session
+        self.insertion = insertion
         self.settings = settings
         self.history = history
         self.vocabulary = vocabulary
