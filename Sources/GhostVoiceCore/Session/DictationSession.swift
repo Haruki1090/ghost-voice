@@ -433,6 +433,18 @@ public actor DictationSession {
         stateBroadcast.stream()
     }
 
+    /// **状態を購読している人数。**
+    ///
+    /// 分配器は**登録済みの購読者にしか配らない**（`SessionBroadcast.yield`）。
+    /// `stateStream()` を `for await` するタスクは、**最初に走ったときに初めて登録される**ので、
+    /// 「購読を始めた直後に状態を撃つ」並びは競走になる——負ければその状態は誰にも届かず、
+    /// 待っている側は永久に待つ。
+    ///
+    /// **検査が「購読が成立するまで待つ」ために公開している**（視点4 §9 の機序 A。
+    /// `SessionMirrorTests` の 3 件が 10 秒の期限まで待って落ちる断続的失敗を作っていた）。
+    /// **製品の穴にはならない**——分配器の購読者数は元から `SessionBroadcast` が公開している。
+    public nonisolated var stateSubscriberCount: Int { stateBroadcast.subscriberCount }
+
     /// **マイク音量（RMS）を購読する**（欠落 3。HUD の録音インジケータ）。
     ///
     /// `AudioCapturing.level` は単一消費者なので、**セッションが 1 人で読んで配り直す。**

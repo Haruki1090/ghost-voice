@@ -376,6 +376,12 @@ struct SessionMirrorTests {
             let mirror = await SessionMirror()
             await mirror.follow(rig.session)
             defer { Task { @MainActor in mirror.stop() } }
+            // **購読が成立するまで待つ。** `follow` は Task を作って即座に戻り、
+            // 購読が登録されるのはその Task が最初に走ったときである。ここを待たずに
+            // `.pressed` を撃つと、`.recording` が購読者 0 人へ配られて消え、
+            // 以後この検査は 10 秒の期限まで待って落ちる（視点4 §9 の機序 A）。
+            // 同じファイルの `SessionBroadcast` の検査は元からこれを待っている。
+            try await waitUntil("購読が始まる") { rig.session.stateSubscriberCount == 1 }
 
             let run = Task { await rig.session.run() }
             defer { run.cancel() }
@@ -405,6 +411,12 @@ struct SessionMirrorTests {
             await mirror.follow(rig.session)
             await mirror.follow(rig.session)
             defer { Task { @MainActor in mirror.stop() } }
+            // **購読が成立するまで待つ。** `follow` は Task を作って即座に戻り、
+            // 購読が登録されるのはその Task が最初に走ったときである。ここを待たずに
+            // `.pressed` を撃つと、`.recording` が購読者 0 人へ配られて消え、
+            // 以後この検査は 10 秒の期限まで待って落ちる（視点4 §9 の機序 A）。
+            // 同じファイルの `SessionBroadcast` の検査は元からこれを待っている。
+            try await waitUntil("購読が始まる") { rig.session.stateSubscriberCount == 1 }
 
             let run = Task { await rig.session.run() }
             defer { run.cancel() }
@@ -426,6 +438,12 @@ struct SessionMirrorTests {
             let mirror = await SessionMirror()
             await mirror.follow(rig.session)
             defer { Task { @MainActor in mirror.stop() } }
+            // **購読が成立するまで待つ。** `follow` は Task を作って即座に戻り、
+            // 購読が登録されるのはその Task が最初に走ったときである。ここを待たずに
+            // `.pressed` を撃つと、`.recording` が購読者 0 人へ配られて消え、
+            // 以後この検査は 10 秒の期限まで待って落ちる（視点4 §9 の機序 A）。
+            // 同じファイルの `SessionBroadcast` の検査は元からこれを待っている。
+            try await waitUntil("購読が始まる") { rig.session.stateSubscriberCount == 1 }
 
             let run = Task { await rig.session.run() }
             defer { run.cancel() }

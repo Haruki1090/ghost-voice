@@ -291,6 +291,16 @@ final class RecordingInserter: TextInserting, @unchecked Sendable {
 final class SpyRefiner: Refining, @unchecked Sendable {
 
     private let calls = Mutex<[String]>([])
+    /// **渡された打ち切りの値。**
+    ///
+    /// 記録していなかった頃、`startRefinement` の
+    /// `refinementApplyMode == .afterInsert ? revisionDeadline : refinementTimeout` の
+    /// **三項を逆にする変異が全件緑のまま生き残った**（視点4 の変異 A2）。
+    /// 逆にすると (a) の分岐が 3000 ms ではなく 750 ms で打ち切られ、
+    /// **約 40 字を超える発話では整形がほぼ必ず落ちる**——
+    /// フェーズ 2 が (a) を作って解こうとした問題そのものが戻る。
+    /// **代役が記録していない引数は、何を渡しても検査が通る。**
+    private let timeoutCalls = Mutex<[Duration]>([])
     private let result: String?
     private let delay: Duration
 
@@ -300,6 +310,8 @@ final class SpyRefiner: Refining, @unchecked Sendable {
     }
 
     var refinedInputs: [String] { calls.withLock { $0 } }
+    /// 渡された打ち切り（上の注記）。
+    var refineTimeouts: [Duration] { timeoutCalls.withLock { $0 } }
     var prewarmCount: Int { prewarms.load(ordering: .relaxed) }
     private let prewarms = Atomic<Int>(0)
 
@@ -318,6 +330,7 @@ final class SpyRefiner: Refining, @unchecked Sendable {
         _ raw: String, locale: Locale, terms: [VocabularyTerm], timeout: Duration
     ) async -> String? {
         calls.withLock { $0.append(raw) }
+        timeoutCalls.withLock { $0.append(timeout) }
         guard let result else { return nil }
         return await withTimeout(timeout) { [delay] in
             try? await Task.sleep(for: delay)
