@@ -80,7 +80,7 @@ struct SettingsCorruptNoticeTests {
 
         // 1. 顛末に載っている。
         #expect(model.lastSave == .saved(
-            transcriberReloaded: false, undoHotkeyRebound: false, quarantined: [.settings]))
+            transcriberReloaded: false, hotkeysRebound: SettingsViewModel.ReboundHotkeys(), quarantined: [.settings]))
         #expect(model.lastSave?.message.contains(".corrupt へ退避") == true)
 
         // 2. 告知の状態が `.moved` へ変わり、案内文も変わる。
@@ -135,7 +135,7 @@ struct SettingsCorruptNoticeTests {
 
         // history.json は書かれていないので退避もされていない。**告げてはならない。**
         #expect(model.lastSave == .saved(
-            transcriberReloaded: false, undoHotkeyRebound: false, quarantined: []))
+            transcriberReloaded: false, hotkeysRebound: SettingsViewModel.ReboundHotkeys(), quarantined: []))
         #expect(model.fileNotices.first?.quarantine == .pending)
     }
 

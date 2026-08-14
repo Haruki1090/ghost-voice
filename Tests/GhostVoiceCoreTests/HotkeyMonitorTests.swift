@@ -1586,3 +1586,278 @@ struct HotkeyDecisionPerformanceTests {
         #expect(p99 < 1_000, "1 打鍵に 1 ms 以上掛かっている: p99 \(p99) us")
     }
 }
+
+// MARK: - 捕獲モード（FR-11「ホットキーを設定画面から変更できる」）
+
+/// **純粋な状態遷移だけを見る。** タップも権限も要らない。
+@Suite("打鍵の捕獲（判定）")
+struct HotkeyCaptureStateTests {
+
+    /// 既定の PTT は修飾キー単独なので、**ここが捕まらないと FR-11 が成立しない。**
+    @Test("修飾キーを 1 つだけ押して離すと、修飾キー単独として捕まる")
+    func modifierOnlyIsCapturedOnRelease() {
+        var state = HotkeyCaptureState()
+
+        // 押した時点では**まだ決めない**（⌃⌘Z のような組を入力できなくなるため）。
+        let down = state.consume(
+            type: .flagsChanged, keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption))
+        #expect(down.outcome == .pending)
+        #expect(down.suppress == false, "flagsChanged を抑止すると下流が修飾状態を見失う")
+
+        let up = state.consume(type: .flagsChanged, keyCode: 0x3D, flags: [])
+        #expect(up.outcome == .captured(CapturedHotkey(keyCode: 0x3D, modifiers: [.option])))
+        #expect(up.suppress == false)
+    }
+
+    /// **`HotkeyBinding` の不変条件をそのまま通ること。** 画面側で検査を書き直さないので、
+    /// 捕獲した値が通らないなら捕獲の側が間違っている。
+    @Test("捕まえた修飾キー単独は `HotkeyBinding` の不変条件を通る")
+    func capturedModifierOnlyMakesAValidBinding() throws {
+        var state = HotkeyCaptureState()
+        _ = state.consume(
+            type: .flagsChanged, keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption))
+        let result = state.consume(type: .flagsChanged, keyCode: 0x3D, flags: [])
+        guard case .captured(let captured) = result.outcome else {
+            Issue.record("捕まえていない")
+            return
+        }
+        let binding = try HotkeyBinding(
+            keyCode: captured.keyCode, modifiers: captured.modifiers)
+        #expect(binding == .rightOption)
+    }
+
+    @Test("修飾キー + 文字キーは、文字キーの押下で捕まる")
+    func modifierPlusKeyIsCapturedOnKeyDown() throws {
+        var state = HotkeyCaptureState()
+        // ⌃ を押す
+        #expect(
+            state.consume(type: .flagsChanged, keyCode: 0x3B, flags: [.maskControl]).outcome
+                == .pending)
+        // ⌘ を足す（**ここで「左 Control 単独」の候補が消える**）
+        #expect(
+            state.consume(
+                type: .flagsChanged, keyCode: 0x37, flags: [.maskControl, .maskCommand]
+            ).outcome == .pending)
+        // Z を押す
+        let z = state.consume(
+            type: .keyDown, keyCode: 0x06, flags: [.maskControl, .maskCommand])
+        #expect(
+            z.outcome == .captured(CapturedHotkey(keyCode: 0x06, modifiers: [.control, .command])))
+        #expect(z.suppress, "確定させた打鍵が下流へ漏れている（設定画面の入力欄へ文字が入る）")
+
+        guard case .captured(let captured) = z.outcome else { return }
+        #expect(
+            try HotkeyBinding(keyCode: captured.keyCode, modifiers: captured.modifiers)
+                == .controlCommandZ)
+    }
+
+    /// **`HotkeyBinding` が認めない組を捕獲の側で作らせない。**
+    /// 作らせると、画面が「保存できません」を出すためだけの捕獲になる。
+    @Test("修飾キーを 2 つ押して離しても捕まらない")
+    func twoModifiersAreNotCaptured() {
+        var state = HotkeyCaptureState()
+        _ = state.consume(type: .flagsChanged, keyCode: 0x3B, flags: [.maskControl])
+        _ = state.consume(
+            type: .flagsChanged, keyCode: 0x37, flags: [.maskControl, .maskCommand])
+        _ = state.consume(type: .flagsChanged, keyCode: 0x37, flags: [.maskControl])
+        let last = state.consume(type: .flagsChanged, keyCode: 0x3B, flags: [])
+        #expect(last.outcome == .pending, "認められない組を捕まえている")
+    }
+
+    /// 修飾キーを押しながら文字を打った後、修飾キーを離しても**もう捕まらない**
+    /// （文字キーの押下で既に決着している）。
+    @Test("文字キーを見た後の修飾キーの解放では捕まらない")
+    func modifierReleaseAfterKeyDownDoesNotCapture() {
+        var state = HotkeyCaptureState()
+        _ = state.consume(type: .flagsChanged, keyCode: 0x3D, flags: [.maskAlternate])
+        _ = state.consume(type: .keyDown, keyCode: 0x06, flags: [.maskAlternate])
+        // 決着済みなので、ここから先は次の連なりである。
+        let release = state.consume(type: .flagsChanged, keyCode: 0x3D, flags: [])
+        #expect(release.outcome == .pending)
+    }
+
+    @Test("ESC は取り消しであり、抑止する")
+    func escapeCancels() {
+        var state = HotkeyCaptureState()
+        let escape = state.consume(type: .keyDown, keyCode: 0x35, flags: [])
+        #expect(escape.outcome == .cancelled)
+        #expect(escape.suppress, "取り消しの ESC が下流へ漏れている")
+    }
+
+    /// Caps Lock / Fn は `HotkeyBinding.Modifiers` に対応が無い。
+    /// **混ぜると「Caps Lock が入っている間だけ違うバインドが捕まる」ことになる。**
+    @Test("Caps Lock と Fn は修飾キーとして数えない")
+    func alphaShiftAndFunctionAreDropped() {
+        var state = HotkeyCaptureState()
+        let result = state.consume(
+            type: .keyDown, keyCode: 0x06,
+            flags: [.maskCommand, .maskAlphaShift, .maskSecondaryFn])
+        #expect(result.outcome == .captured(CapturedHotkey(keyCode: 0x06, modifiers: [.command])))
+    }
+
+    /// 表に無い修飾キー（Caps Lock 自身など）は候補にしない。
+    @Test("修飾キーの表に無いキーの flagsChanged では捕まらない")
+    func unknownModifierKeyIsNotCaptured() {
+        var state = HotkeyCaptureState()
+        _ = state.consume(type: .flagsChanged, keyCode: 0x39, flags: [.maskAlphaShift])
+        let up = state.consume(type: .flagsChanged, keyCode: 0x39, flags: [])
+        #expect(up.outcome == .pending)
+    }
+
+    @Test("keyUp は何も決めない（マスクに入っていても素通し）")
+    func keyUpDecidesNothing() {
+        var state = HotkeyCaptureState()
+        let result = state.consume(type: .keyUp, keyCode: 0x06, flags: [])
+        #expect(result.outcome == .pending)
+        #expect(result.suppress == false)
+    }
+}
+
+/// **本物の `handle` を通す。** 受け入れ条件「捕獲モード中に PTT が発火しない」はここ。
+@Suite("捕獲モード中の CGEventTapHotkeyMonitor")
+struct CGEventTapHotkeyMonitorCaptureTests {
+
+    private func makeMonitor(binding: HotkeyBinding = .rightOption) -> CGEventTapHotkeyMonitor {
+        CGEventTapHotkeyMonitor(
+            binding: binding,
+            listenAccessProbe: { false },
+            accessibilityProbe: { false },
+            tapController: deniedController()
+        )
+    }
+
+    /// **これが受け入れ条件 2 である。**
+    /// PTT の既定キー（右 Option）を捕獲中に押しても、`.pressed` が 1 件も流れてはならない
+    /// ——キーを設定しようとして録音が始まると、設定画面は使えない。
+    @Test("捕獲モード中は PTT が発火しない")
+    func pushToTalkDoesNotFireWhileCapturing() async {
+        let monitor = makeMonitor()
+        let captured = Mutex<[HotkeyCaptureOutcome]>([])
+        monitor.beginHotkeyCapture { outcome in captured.withLock { $0.append(outcome) } }
+
+        let down = makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption))
+        let up = makeEvent(keyCode: 0x3D, flags: [])
+        _ = monitor.handle(type: .flagsChanged, event: down)
+        _ = monitor.handle(type: .flagsChanged, event: up)
+
+        // 捕獲は成立している（＝空振りの検査ではない）。
+        #expect(
+            captured.withLock { $0 }
+                == [.captured(CapturedHotkey(keyCode: 0x3D, modifiers: [.option]))])
+
+        // **PTT のイベントは 1 件も流れていない。**
+        monitor.stop()
+        let drained = await drain(monitor.events)
+        #expect(drained.finished)
+        #expect(drained.events.isEmpty, "捕獲中に PTT が発火した: \(drained.events)")
+    }
+
+    /// Undo キーも同じ。**捕獲中に ⌃⌘Z を押したら、それは新しいバインドの入力である。**
+    @Test("捕獲モード中は Undo が発火しない")
+    func undoDoesNotFireWhileCapturing() async {
+        let monitor = makeMonitor()
+        monitor.setUndoAvailable(true)
+        let captured = Mutex<[HotkeyCaptureOutcome]>([])
+        monitor.beginHotkeyCapture { outcome in captured.withLock { $0.append(outcome) } }
+
+        _ = monitor.handle(
+            type: .keyDown,
+            event: makeEvent(keyCode: 0x06, flags: [.maskControl, .maskCommand]))
+
+        #expect(
+            captured.withLock { $0 }
+                == [.captured(CapturedHotkey(keyCode: 0x06, modifiers: [.control, .command]))])
+        monitor.stop()
+        let drained = await drain(monitor.events)
+        #expect(drained.events.isEmpty, "捕獲中に Undo が発火した: \(drained.events)")
+    }
+
+    /// ESC の中断も同じ。**捕獲中の ESC は「取り消し」であって発話の中断ではない。**
+    @Test("捕獲モード中の ESC は cancelled を流さず、取り消しとして配る")
+    func escapeIsCaptureCancelNotSessionCancel() async {
+        let monitor = makeMonitor()
+        let captured = Mutex<[HotkeyCaptureOutcome]>([])
+        monitor.beginHotkeyCapture { outcome in captured.withLock { $0.append(outcome) } }
+
+        #expect(
+            monitor.handle(type: .keyDown, event: makeEvent(keyCode: 0x35, flags: [])) == nil,
+            "取り消しの ESC が下流へ漏れている")
+
+        #expect(captured.withLock { $0 } == [.cancelled])
+        monitor.stop()
+        let drained = await drain(monitor.events)
+        #expect(drained.events.isEmpty, "捕獲中の ESC が発話の中断として流れた")
+    }
+
+    /// **決着すると自動的に閉じる。** 閉じ忘れで打鍵を食い続ける状態を構造で作らない。
+    @Test("1 打鍵で捕獲モードが閉じ、その後は PTT がふたたび発火する")
+    func captureEndsAfterOneKeystroke() async {
+        let monitor = makeMonitor()
+        monitor.beginHotkeyCapture { _ in }
+        #expect(monitor.isCapturingHotkey)
+
+        _ = monitor.handle(
+            type: .flagsChanged,
+            event: makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption)))
+        _ = monitor.handle(type: .flagsChanged, event: makeEvent(keyCode: 0x3D, flags: []))
+        #expect(!monitor.isCapturingHotkey, "決着したのに捕獲モードが閉じていない")
+
+        // ふたたび PTT が効く。
+        _ = monitor.handle(
+            type: .flagsChanged,
+            event: makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption)))
+        let events = await collect(monitor.events, count: 1)
+        #expect(events == [.pressed])
+    }
+
+    @Test("endHotkeyCapture で閉じると、決着は配られない")
+    func endCaptureDeliversNothing() {
+        let monitor = makeMonitor()
+        let captured = Mutex<[HotkeyCaptureOutcome]>([])
+        monitor.beginHotkeyCapture { outcome in captured.withLock { $0.append(outcome) } }
+        monitor.endHotkeyCapture()
+        #expect(!monitor.isCapturingHotkey)
+
+        _ = monitor.handle(
+            type: .flagsChanged,
+            event: makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption)))
+        _ = monitor.handle(type: .flagsChanged, event: makeEvent(keyCode: 0x3D, flags: []))
+        #expect(captured.withLock { $0 }.isEmpty, "閉じた後に決着が配られた")
+    }
+
+    /// **`rebind(to:)` と同じ縮退。** 捕獲中は PTT キーの解放が届かないので、
+    /// 出さないと録音が終わらない状態で固まる。
+    @Test("録音中に捕獲を始めると interrupted が流れる")
+    func beginningCaptureWhileRecordingInterrupts() async {
+        let monitor = makeMonitor()
+        _ = monitor.handle(
+            type: .flagsChanged,
+            event: makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption)))
+
+        monitor.beginHotkeyCapture { _ in }
+
+        let events = await collect(monitor.events, count: 2)
+        #expect(events == [.pressed, .interrupted])
+    }
+
+    /// **`.cancelled` にしてはならない。** 利用者は喋っていたのであって、
+    /// 中断を要求していない（`HotkeyEvent.interrupted` の doc）。
+    @Test("stop() は捕獲モードも畳む")
+    func stopClosesCapture() {
+        let monitor = makeMonitor()
+        monitor.beginHotkeyCapture { _ in }
+        monitor.stop()
+        #expect(!monitor.isCapturingHotkey, "止めた監視器が捕獲中を名乗っている")
+    }
+
+    /// **2 本目の `CGEventTap` を立てない**という裁定の実体。
+    /// 捕獲に要る種別はバインドに関わらず必ずマスクへ入っているので、張り替えが要らない。
+    @Test("捕獲に要る種別は、どのバインドでも既にマスクへ入っている")
+    func captureNeedsNoNewMask() {
+        for binding in [HotkeyBinding.rightOption, .controlCommandZ] {
+            let mask = CGEventTapHotkeyMonitor.eventMask(for: binding)
+            #expect(mask & (1 << CGEventType.flagsChanged.rawValue) != 0)
+            #expect(mask & (1 << CGEventType.keyDown.rawValue) != 0)
+        }
+    }
+}

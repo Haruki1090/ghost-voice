@@ -53,6 +53,21 @@ public final class SettingsViewModel {
     /// **読めなかったファイルの告知**（統括の裁定の条件）。`StoreFileNotice` を参照。
     public private(set) var fileNotices: [StoreFileNotice]
 
+    /// **キー監視を開始できなかったこと。** `nil` なら開始できている。
+    ///
+    /// ## HUD との棲み分け（統括が回収を指示した論点）
+    ///
+    /// **HUD は 1 行、設定画面は全文と直し方**である。HUD 側は起動時に 10 秒だけ
+    /// `AppPermissionGuidance.summary(for:)`（1 行）を出す——`.app` を Finder から
+    /// 起動すると標準エラーはどこにも出ないので、**そこでしか気づけない。**
+    /// しかしそれは**気づくための入口**であって、直すための情報ではない
+    /// （notch の帯は実測 221 pt しかなく、システム設定のパスも載らない）。
+    ///
+    /// **HUD を落とさないのは、設定画面は利用者が開かないと出ないからである。**
+    /// 「押しても何も起きない」に気づいた利用者が設定画面へ辿り着く保証は無い。
+    /// **重ねてよいのは、片方が「気づく」でもう片方が「直す」のときだけ**である。
+    public let hotkeyFailure: HotkeyError?
+
     /// 直近の保存の顛末。**成功も出す**（黙って終わると保存されたか判らない）。
     public private(set) var lastSave: SaveOutcome?
 
@@ -92,6 +107,9 @@ public final class SettingsViewModel {
     private let vocabulary: VocabularyStore
     private let history: HistoryStore
     private let session: (any SettingsSessionControlling)?
+    /// キー監視器。**`nil` なら打鍵の捕獲も PTT キーの反映もできない**
+    /// （`--shell-only` 起動・監視を開始できなかった場合）。
+    private let hotkey: (any HotkeyControlling)?
     private let directory: URL
     private let backgroundWrite: BackgroundWrite
     private let fileManager: FileManager
@@ -116,6 +134,8 @@ public final class SettingsViewModel {
         vocabulary: VocabularyStore,
         history: HistoryStore,
         session: (any SettingsSessionControlling)?,
+        hotkey: (any HotkeyControlling)? = nil,
+        hotkeyFailure: HotkeyError? = nil,
         directory: URL = StorageRoot.default,
         backgroundWrite: BackgroundWrite = .offCallerActor,
         fileManager: FileManager = .default
@@ -124,6 +144,8 @@ public final class SettingsViewModel {
         self.vocabulary = vocabulary
         self.history = history
         self.session = session
+        self.hotkey = hotkey
+        self.hotkeyFailure = hotkeyFailure
         self.directory = directory
         self.backgroundWrite = backgroundWrite
         self.fileManager = fileManager
@@ -174,16 +196,160 @@ public final class SettingsViewModel {
         draft.undoHotkey = try makeBinding(keyCode: keyCode, modifiers: modifiers)
     }
 
+    // MARK: - 打鍵の捕獲（FR-11「ホットキーを設定画面から変更できる」）
+
+    /// どちらのキーを捕まえているか。
+    public enum HotkeyField: Sendable, Equatable {
+        case pushToTalk
+        case undo
+    }
+
+    /// いま捕獲中のキー。`nil` なら捕獲していない。
+    ///
+    /// **画面の「キーを押してください」と一致させること。** ずれると、
+    /// 利用者は捕獲中と気づかずに打鍵し（PTT は発火しないので）**何も起きないように見える。**
+    public private(set) var capturingField: HotkeyField?
+
+    /// 捕獲の顛末（取り消した・その組は使えない）。**表示したら畳む。**
+    public private(set) var captureMessage: String?
+
+    /// 打鍵を捕まえて `draft` へ入れる。**保存はしない。**
+    ///
+    /// ## 何がどこで決まるか
+    ///
+    /// | 決めること | 誰が |
+    /// |---|---|
+    /// | どの打鍵を 1 つの組とみなすか（修飾キーは離した瞬間・文字キーは押した瞬間） | `HotkeyCaptureState`（Core） |
+    /// | その組が `HotkeyBinding` として成り立つか | `HotkeyBinding.init`（Core） |
+    /// | 捕獲中に PTT を発火させないこと | `CGEventTapHotkeyMonitor.handle`（Core） |
+    /// | 「いま捕獲中」を画面に出すこと | ここ |
+    ///
+    /// **画面は規則を 1 つも持たない。** 2 箇所に分かれると必ずずれる。
+    public func beginCapture(_ field: HotkeyField) {
+        guard let hotkey else {
+            // **黙って何も起きない形にしない。** 捕獲できない理由を言う。
+            captureMessage =
+                "キー監視が動いていないので、打鍵を捕まえられません。"
+                + "権限を与えて Ghost Voice を起動し直すか、`settings.json` を直接編集してください。"
+            return
+        }
+        // 押しっぱなしの捕獲を残さない（2 度目を押したときに前の捕獲が生きていると、
+        // 決着が古い欄へ入る）。
+        hotkey.endCapture()
+        capturingField = field
+        captureMessage = nil
+        hotkey.beginCapture { [weak self] outcome in
+            // **タップのコールバックのスレッドから来る。** MainActor へ持ち上げる。
+            // 決着は 1 件しか来ないので、`Task` の実行順が問題になる余地は無い。
+            Task { @MainActor [weak self] in
+                self?.finishCapture(outcome, field: field)
+            }
+        }
+    }
+
+    /// 捕獲をやめる。**窓を閉じるときは必ず呼ぶこと**（閉じるまで PTT が効かない）。
+    public func cancelCapture() {
+        hotkey?.endCapture()
+        capturingField = nil
+    }
+
+    public func clearCaptureMessage() { captureMessage = nil }
+
+    private func finishCapture(_ outcome: HotkeyCaptureOutcome, field: HotkeyField) {
+        // 別の欄の捕獲が先に始まっていたら、古い決着は捨てる。
+        guard capturingField == field else { return }
+        capturingField = nil
+
+        switch outcome {
+        case .pending:
+            // 監視器は決着しか配らない。来たら内部の誤りである。**黙って成功に見せない。**
+            captureMessage = "打鍵を判定できませんでした（内部の誤り）。"
+
+        case .cancelled:
+            captureMessage = "取りやめました。キーは変えていません。"
+
+        case .captured(let captured):
+            do {
+                let binding = try makeBinding(
+                    keyCode: captured.keyCode, modifiers: captured.modifiers)
+                switch field {
+                case .pushToTalk: draft.hotkey = binding
+                case .undo: draft.undoHotkey = binding
+                }
+                captureMessage = nil
+            } catch let error as HotkeyBindingError {
+                // **どの規則に触れたかは Core が型で持っている。** 画面は言い直さない。
+                captureMessage = error.explanation
+            } catch {
+                captureMessage = "そのキーは使えません（\(error)）。"
+            }
+        }
+    }
+
+    // MARK: - ユーザー辞書の編集（FR-11 / FR-6）
+
+    /// 誤認識表記を 1 つの入力欄で見せるための文字列。
+    ///
+    /// **辞書は FR-6（誤認識の修正）の入力であり、`RefinementGuard` が
+    /// 「頼んだ置換」と「逸脱」を区別する根拠でもある**（正本 §5.5.1）。
+    /// ここを編集できないと、整形が誤認識を直せないまま逸脱として捨てられる側に回る。
+    public func misheardText(at index: Int) -> String {
+        guard vocabularyTerms.indices.contains(index) else { return "" }
+        return MisheardListText.text(vocabularyTerms[index].misheard)
+    }
+
+    /// 正しい表記を差し替える。**保存はしない。**
+    public func setCanonical(_ text: String, at index: Int) {
+        guard vocabularyTerms.indices.contains(index) else { return }
+        let term = vocabularyTerms[index]
+        vocabularyTerms[index] = VocabularyTerm(canonical: text, misheard: term.misheard)
+    }
+
+    /// 誤認識表記を差し替える。**保存はしない。**
+    ///
+    /// - Parameter text: 区切り文字で並べた表記（`MisheardListText`）。
+    ///   **空白だけの項目と重複はここで落とす**——`VocabularyStore.normalize` は
+    ///   `canonical` しか正規化しないので、誤認識表記の掃除はここが唯一の場所である。
+    public func setMisheard(_ text: String, at index: Int) {
+        guard vocabularyTerms.indices.contains(index) else { return }
+        let term = vocabularyTerms[index]
+        vocabularyTerms[index] = VocabularyTerm(
+            canonical: term.canonical, misheard: MisheardListText.list(text))
+    }
+
+    /// 空の項目を足す。
+    public func addTerm() {
+        vocabularyTerms.append(VocabularyTerm(canonical: ""))
+    }
+
+    public func removeTerm(at index: Int) {
+        guard vocabularyTerms.indices.contains(index) else { return }
+        vocabularyTerms.remove(at: index)
+    }
+
     // MARK: - 保存
+
+    /// **保存しただけでは効かないものを、実際に効かせたか。**
+    ///
+    /// PTT / Undo のどちらも、`SettingsStore` へ書いただけでは監視器は古いキーを見ている
+    /// （`HotkeyMonitor.currentBinding` / `currentUndoBinding` の注記）。
+    /// フェーズ 1 の持ち越し項目 10 が名指ししたのはこの穴である。
+    public struct ReboundHotkeys: Sendable, Equatable {
+        public var pushToTalk = false
+        public var undo = false
+        public var isEmpty: Bool { !pushToTalk && !undo }
+        public init() {}
+    }
 
     /// 保存の顛末。**「保存した」だけでなく「何が起きたか」を持つ。**
     public enum SaveOutcome: Sendable, Equatable {
         /// 書けた。
         /// - Parameter transcriberReloaded: ロケール／認識種別を切り替え直したか。
-        /// - Parameter undoHotkeyRebound: Undo キーを監視器へ反映したか。
+        /// - Parameter hotkeysRebound: PTT / Undo のキーを監視器へ反映したか。
         /// - Parameter quarantined: この保存で `.corrupt` へ退避したファイル。
         case saved(
-            transcriberReloaded: Bool, undoHotkeyRebound: Bool, quarantined: [StoreFileNotice.File])
+            transcriberReloaded: Bool, hotkeysRebound: ReboundHotkeys,
+            quarantined: [StoreFileNotice.File])
         /// **1 バイトも書いていない。** PTT キーと Undo キーの修飾キーが衝突している。
         case rejectedHotkeyConflict
         /// **1 バイトも書いていない。** 発話の処理中だったのでロケールを切り替えられない。
@@ -201,7 +367,8 @@ public final class SettingsViewModel {
             case .saved(let reloaded, let rebound, let quarantined):
                 var text = "設定を保存しました。"
                 if reloaded { text += "認識の言語／種別を切り替えました。" }
-                if rebound { text += "Undo キーを反映しました。" }
+                if rebound.pushToTalk { text += "PTT キーを反映しました。" }
+                if rebound.undo { text += "Undo キーを反映しました。" }
                 if !quarantined.isEmpty {
                     text +=
                         "読めなかった "
@@ -247,9 +414,15 @@ public final class SettingsViewModel {
     ///    失敗したらファイルは一切変えない。
     /// 4. **ファイルへ書く**（設定と辞書。`BackgroundWrite` 経由でメインスレッドを離れて）。
     /// 5. **履歴の上限を実行時へ反映**（`HistoryStore.setLimit`。下げたらその場で切り詰まる）。
-    /// 6. **Undo キーを監視器へ反映**（保存しただけでは効かない）。
+    /// 6. **PTT / Undo のキーを監視器へ反映**（保存しただけでは効かない）。
     ///
     /// 4 以降で失敗した場合は「一部だけ反映された」と告げる。**黙らない。**
+    ///
+    /// - Note: **6 を 4 より後に置くのは 3 と逆である。** 認識器は「切り替えに失敗したら
+    ///   ディスクを変えない」（画面と認識がずれるのを防ぐ）が、キーの反映は
+    ///   **失敗しても次回の起動で必ず効く**（監視器は起動時に `settings.hotkey` を読む）。
+    ///   先に置くと、書き込みに失敗したときだけ「今回だけ新しいキー・次回から古いキー」
+    ///   という**どの起動とも一致しない状態**が残る。
     public func save() async {
         guard !isSaving else { return }
         isSaving = true
@@ -334,12 +507,24 @@ public final class SettingsViewModel {
             partialFailure = String(describing: error)
         }
 
-        // 6. Undo キー。**保存しただけでは監視器は古いキーを見ている。**
-        var undoRebound = false
+        // 6. PTT / Undo のキー。**保存しただけでは監視器は古いキーを見ている。**
+        //    フェーズ 1 では PTT キーを変えてもプロセスを再起動するまで効かなかった
+        //    （持ち越し項目 10）。**ここが FR-11 の「変更できる」の実体である。**
+        var rebound = ReboundHotkeys()
+        if next.hotkey != stored.hotkey, let hotkey {
+            do {
+                // **タップを張り替える**（実測 約 40 ms）。録音中なら `.interrupted` が
+                // 流れ、そこまでの発話は確定して挿入される（`HotkeyMonitor.rebind`）。
+                try hotkey.rebindPushToTalk(to: next.hotkey)
+                rebound.pushToTalk = true
+            } catch {
+                partialFailure = partialFailure ?? String(describing: error)
+            }
+        }
         if next.undoHotkey != stored.undoHotkey, let session {
             do {
                 try await session.rebindUndoHotkey(to: next.undoHotkey)
-                undoRebound = true
+                rebound.undo = true
             } catch {
                 partialFailure = partialFailure ?? String(describing: error)
             }
@@ -356,16 +541,19 @@ public final class SettingsViewModel {
         } else {
             lastSave = .saved(
                 transcriberReloaded: transcriberReloaded,
-                undoHotkeyRebound: undoRebound,
+                hotkeysRebound: rebound,
                 quarantined: quarantined)
         }
     }
 
     /// 編集を捨ててディスクの内容へ戻す。
     public func discard() {
+        // **捕獲中なら畳む。** 残すと、戻したはずの欄へ後から決着が入る。
+        cancelCapture()
         draft = settings.settings
         vocabularyTerms = vocabulary.terms
         lastSave = nil
+        captureMessage = nil
     }
 
     /// 告知を出し終えたら畳む。

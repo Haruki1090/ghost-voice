@@ -17,6 +17,9 @@ ghost-voice/
 ├── Sources/GhostVoiceCore/
 │   ├── Hotkey/
 │   │   ├── HotkeyMonitor.swift        プロトコル・HotkeyEvent・HotkeyDecision（判定）
+│   │   ├── HotkeyCapture.swift        フェーズ 2。**打鍵の捕獲**（`CapturedHotkey` /
+│   │   │                               `HotkeyCaptureState`）。§2.6。
+│   │   │                              **2 本目のタップを立てないための型**
 │   │   └── CGEventTapHotkeyMonitor.swift
 │   ├── Audio/
 │   │   ├── AudioCapturing.swift       プロトコル
@@ -61,6 +64,10 @@ ghost-voice/
 │       ├── SessionFailureNotice.swift 縮退の理由 → 媒体に依らない表示材料（§8.5）
 │       │                              **Models/ は「JSON になる値」だけを置く場所なので、
 │       │                               永続化しない派生型はここに置く**
+│       ├── SessionNoticeAnnouncement.swift
+│       │                              フェーズ 2。**通知（差し替えと Undo の顛末）→
+│       │                               媒体に依らない表示材料**（§8.5）。
+│       │                              **出すか出さないかも Core が決める**
 │       ├── ShutdownSequence.swift     終了の待ち合わせと段取り（発話を落とさない順序）。
 │       │                              **CLI と .app がここを共有する。**
 │       │                               ShutdownWaitOutcome / ShutdownGate /
@@ -105,7 +112,22 @@ ghost-voice/
 │   │       ├── HUDPanel.swift         **NSPanel を作る唯一の場所**（RunLoopEntry が要る）
 │   │       ├── HUDContentView.swift   SwiftUI。**継続アニメーションを置かない**
 │   │       └── NotchHUDSurface.swift  分配器の購読と配線。`--hud-check` の素振り
-│   └── Shell/Settings/ · Shell/History/  **未着手**（設定画面・履歴画面）
+│   ├── Shell/Settings/             設定画面（FR-11。§14）
+│   │   ├── SettingsViewModel.swift    状態と操作。**打鍵の捕獲もここが握る**（§2.6）
+│   │   ├── SettingsView.swift         SwiftUI
+│   │   ├── StoreFileNotice.swift      「読めなかった」を利用者に見せる翻訳（§14.1）
+│   │   ├── HotkeyControl.swift        **監視器へ触る面**（捕獲と PTT キーの反映）
+│   │   ├── SettingsSessionControl.swift `DictationSession` へ触る 2 口
+│   │   ├── MisheardListText.swift     誤認識表記の並び ⇄ 1 つの入力欄
+│   │   ├── BackgroundWrite.swift      **同期 I/O を呼び出し元のアクターから外す唯一の地点**
+│   │   └── HotkeyLabel.swift          バインドの表示
+│   ├── Shell/History/                 履歴画面（FR-9。§14.4）
+│   │   ├── HistoryViewModel.swift / HistoryView.swift / HistoryTextOutput.swift
+│   └── Shell/Windows/                 **提示の配線**（§14.6.1）
+│       ├── AppWindow.swift            **NSWindow を作る唯一の場所**（RunLoopEntry が要る）。
+│       │                              **前面の返し方も持つ**（V-43 / V-44）
+│       └── StatusMenuSurface.swift    NSStatusItem のメニューと、窓の開け閉め。
+│                                      `--window-check` の素振り
 ├── Resources/                         フェーズ 2
 │   ├── Info.plist                     テンプレート（基本設計書 §10）
 │   └── GhostVoice.entitlements
@@ -340,6 +362,59 @@ let tap = CGEvent.tapCreate(
 | 負荷下（`yes` 16 本、load average 約 9.7） | 0.771 μs | 1.56 μs | 46.60 μs |
 
 CPU 負荷でほぼ動かない。**比較のため: ここで `CGPreflightListenEventAccess()` を 1 回呼ぶと 10,657 μs（p50）で、約 14,000 倍になる。**
+
+### 2.6 打鍵の捕獲（設定画面から PTT / Undo キーを変える。FR-11）
+
+**2 本目の `CGEventTap` は立てない**（統括の裁定）。上の実測がその理由である——判定は
+1 打鍵 p50 0.75 μs で**システム全体の打鍵に乗る**ので、2 本目を立てると単純に 2 倍になり、
+**設定画面を開いていない間もずっと払い続ける代償**になる。
+
+代わりに、既存の監視器を**捕獲モード**へ入れる（`HotkeyMonitor.beginHotkeyCapture`）。
+
+```
+handle(type:event:)
+  ├─ 捕獲モード？ ── はい → HotkeyCaptureState.consume(…) で決着 → 戻る
+  └─ いいえ            → HotkeyDecision.decide(…)（従来どおり）
+```
+
+**捕獲モードのイベントは `HotkeyDecision.decide` を 1 度も通らない。** したがって
+**捕獲中に PTT も Undo も ESC の中断も発火しない**——キーを設定しようとして録音が始まると
+設定画面は使えないので、これは要件である。hot path に増えたのは **nil 比較 1 つ**だけである。
+
+#### 何をもって「1 つの組」とみなすか
+
+PTT の既定は修飾キー単独なので `keyDown` では捕まらない。しかし**押した瞬間に確定すると
+⌃⌘Z のような組を入力できない**（⌃ を押した時点で「左 Control」で決まってしまう）。
+
+| 入力 | いつ決まるか |
+|---|---|
+| 修飾キーを 1 つだけ押して離す | **離した瞬間**に「修飾キー単独」として確定 |
+| 修飾キー + 文字キー | **文字キーの押下**で確定（そのとき立っている修飾キーを添える） |
+| 修飾キーを 2 つ以上押して離す | **確定しない**（`HotkeyBinding` が認めない組を捕獲の側で作らせない） |
+| ESC | **取り消し**（捕獲モードを閉じ、キーは変えない） |
+
+- **抑止するのは確定させた `keyDown` と取り消しの ESC だけ。** `flagsChanged` は決して抑止しない
+  （抑止すると下流アプリが修飾状態を見失う。§2.4 と同じ判断）。
+- **1 打鍵で閉じる。** 決着を配ると捕獲モードは自動的に閉じる——
+  **閉じ忘れで打鍵を食い続ける状態を構造で作らない。**
+- **録音中に捕獲を始めると `.interrupted` を出す。** 捕獲中は PTT キーの解放が届かないので、
+  出さないと録音が終わらない状態で固まる（`rebind(to:)` と同じ形の穴）。
+- **ESC は捕獲では割り当てられない。** 規則としては ESC を PTT にできる（`decide` はバインドを
+  ESC より先に見る）ので、`settings.json` の手編集では通る。捕獲の側で取り消しに使うのは、
+  **押した瞬間に取り消せる口が他に無い**ためで、「ESC を割り当てられない」より
+  「捕獲から抜けられない」ほうが害が大きい。
+
+#### 妥当性の検査は捕獲の側に無い
+
+捕まえた値（`CapturedHotkey`）は**まだ `HotkeyBinding` ではない。**
+キーコードの範囲も修飾キー単独の表も `HotkeyBinding.init(keyCode:modifiers:)` が唯一の持ち主で、
+**設定画面はそこへ通して、投げられた `HotkeyBindingError` をそのまま説明に使う**（§14.1 と同じ規律）。
+
+#### 反映は保存のときに起きる
+
+**`SettingsStore` へ書いただけでは監視器は古いキーを見ている**（`HotkeyMonitor.currentBinding`）。
+フェーズ 1 で「設定画面で PTT キーを変えてもプロセスを再起動するまで効かなかった」のがこれである
+（持ち越し項目 10）。保存の手順 6 で `rebind(to:)` / `rebindUndo(to:)` を呼ぶ（§14.2）。
 
 ---
 
@@ -1844,6 +1919,24 @@ Undo のホットキーは既定で **⌃⌘Z**（Control + Command + Z）とす
 | Core（`Support/SessionFailureNotice.swift`） | 1 行の要約 / 補足 / 次にできること（`SessionRemedy`）/ 意図した拒否か（`isRefusal`）/ 発話を失ったか（`speechWasLost`） |
 | 媒体（CLI の `SessionNarration` / HUD） | `SessionRemedy` の言い直しだけ |
 
+#### `SessionNotice` も同じ形にした（配線トラック / 2026-08-15）
+
+**同じ間違いが `SessionNotice`（差し替えと Undo の顛末）で起きていた。** 文言が
+HUD（`HUDPresenter.announcement`）と Undo の UI（`UndoNarration`）の**2 箇所にあり、
+CLI には 1 箇所も無かった**——`ghost-voice` から Undo を撃つと**顛末が何も出なかった。**
+フェーズ 1 で潰した「無言で失敗する」と同じ形である。
+
+| 持ち主 | 中身 |
+|---|---|
+| Core（`Support/SessionNoticeAnnouncement.swift`） | **出すか出さないか** / 1 行の要約 / 補足 / 重さ（`Weight`）/ 失敗として出すか / **自動で消してよいか**（`isPersistent`） |
+| 媒体（CLI / HUD） | 重さ → 色と保持時間の写し、強調の書き方（端末は `**`、HUD は色） |
+
+- **`.refinementApplied` と `.refinementNotApplied(nil)` は出さない。** これも判断なので
+  Core が持つ（媒体ごとに変えると片方だけ賑やかになる）。理由は §7.4 と V-37。
+- **`.undoCopiedRawTextToClipboard` だけ `isPersistent` である。** 時間で畳むと
+  クリップボードに在る生テキストへ辿り着けない（UC-3 の縮退が死ぬ）。
+  **次の発話が始まれば消える**——「時計で消すな」であって「居座れ」ではない。
+
 同じ「権限を許可する」でも、素の実行ファイルは「**起動しているターミナルアプリ**を許可」、
 `.app` は「Ghost Voice を許可」になる（§9 / `PermissionGuidance` の注記）。
 **この差は文字列ではなく媒体の側にある**ので、Core は「どのペインか」までしか言わない。
@@ -2718,9 +2811,9 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-39 | **HUD を出した状態での M1a / M2**（HUD の描画が PTT の反応を鈍らせていないか） | V-19 の後（マイクとキー監視の許可が要る） | **未実施。** ランループ検証で「**メインスレッドを塞ぐと配送が p50 0.045 ms → 12.8 ms へ悪化する**」ことは実測されている。HUD 側は間引き（50 ms）・変化が無ければ再描画しない・継続アニメーションを置かない、で**悪化させうる経路を塞いだだけ**であり、**実際に悪化していないことは測っていない。** 測り方は既存の M1a / M2 の計測を HUD ありで回して、HUD 無し（`--shell-only` 相当）と比べる |
 | V-40 | **ディスプレイの抜き差しで HUD が付いていくか** | HUD の実機確認時 | **未実施。** `NSApplication.didChangeScreenParametersNotification` を購読して再配置する実装は入れてあるが、**通知が実際に来ることを確かめていない**（抜き差しの操作が要る）。来なければ HUD が古い座標に出続けるだけで、**挿入は壊れない。** 外部ディスプレイを抜き差しし、内蔵の切り欠きに出続けることを見る |
 | V-41 | **notch 非搭載の内蔵ディスプレイでの表示先** | 該当機が手に入ったとき | **未実施。手元に機体が無い**（MacBook Air M1 / Intel 機 / 13" MBP）。**コード上は防御済み**——`CGDisplayIsBuiltin` で内蔵を選び、`auxiliaryTop*Area` が nil なのでメニューバー直下へ倒れる（代役での検査あり。`HUDPlacementTests`）。ただし**代役の値は推測であり、実機が同じ値を返すことは確かめていない** |
-| V-42 | **設定画面で打鍵を捕まえられるか。`HotkeyMonitor` の `CGEventTap` と干渉しないか** | 打鍵捕獲の実装時 | **未実施。** PTT の既定が修飾キー単独なので `keyDown` では捕まらず `flagsChanged` を見る必要があり、**同じイベントを 2 箇所で見る**ことになる。**裁定（統括）: 2 本目のタップは立てず、既存の監視器を「捕獲モード」へ入れる**——判定は 1 打鍵 p50 0.75 μs で全システムの打鍵に乗るため（§2.5）、2 本目は設定画面を開いていない間も払い続ける代償になる |
-| V-43 | **窓を閉じてから前面が戻るまでの待ち方** | 履歴からの再挿入の配線時 | **未実施。** `NSApplication.didResignActiveNotification` で足りるかは未実測。**足りないと再挿入が Ghost Voice 自身の窓へ入る。** 現状は「閉じる口を渡されないと再挿入のボタンを出さない」ことで被害を構造で止めている（§14.4） |
-| V-44 | **`NSApp.hide(nil)` で前面が確実に戻るか** | 設定／履歴の窓を配線した後 | **未実施。** 戻らないと**次の発話の挿入先が壊れる。** トラック B が測ったフォーカス非奪取の確認（`kCGWindowLayer == 0` の最前面 pid を追う手順）を、**設定・履歴の窓を出した状態でやり直すこと** |
+| V-42 | **設定画面で打鍵を捕まえられるか。`HotkeyMonitor` の `CGEventTap` と干渉しないか** | 打鍵捕獲の実装時 | **実装済み・一部実測（2026-08-15 / 配線トラック）。** 裁定どおり **2 本目のタップを立てず、既存の監視器を「捕獲モード」へ入れた**（§2.6）。**干渉しないことは構造で保証されている**——捕獲モードのイベントは `HotkeyDecision.decide` を 1 度も通らないので、**捕獲中に PTT / Undo / ESC の中断が発火しえない**（合成イベントで本物の `handle` を通す検査が固定）。**残る未実測は実キーボードでの捕獲そのもの**（`CGEvent.tapCreate` が通ることが要る。V-4 と同じ制約）: ①修飾キー単独（右 Option）を離した瞬間に捕まるか、②⌃⌘Z のような組が捕まるか、③捕獲中に他アプリへ打鍵が漏れないか。手順は [README](../README.md) の「設定画面（フェーズ 2 / FR-11）」 |
+| V-43 | **窓を閉じてから前面が戻るまでの待ち方** | 履歴からの再挿入の配線時 | **実測して答えが出た（2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2 / n=3）。`didResignActiveNotification` では足りない。** `NSApp.hide(nil)` の直後には `NSApp.isActive` が既に false であり（通知は 1 度も来ない＝待った気になるだけ）、**それでもなお `kCGWindowLayer == 0` の最前面は 24〜32 ms のあいだ Ghost Voice のままだった。** `NSWorkspace.shared.frontmostApplication` も同じく即座に切り替わるので使えない——**遅れているのは活性の帳簿ではなく window server の窓の並びである。** 対処: 活性の切り替えを待ったうえで **150 ms の整定**を置いた（`AppWindow.frontmostSettle`。**決めごとであって要件値ではない**。観測した最大の約 5 倍）。**残る未実測: 負荷下での入れ替わり時間の分布**（n=3 は低負荷）。外れても失うのは再挿入 1 回であり、発話は失われない（履歴からコピーで取り出せる） |
+| V-44 | **`NSApp.hide(nil)` で前面が確実に戻るか** | 設定／履歴の窓を配線した後 | **実測して達成（2026-08-15 / 同上）。戻る。** `--window-check` で設定 → 履歴の順に開閉し、`kCGWindowLayer == 0` の最前面 pid を 4 ms 間隔で追った。**窓を出していない区間では 2,451 回の観測で 1 度も奪っていない**（HUD は layer 26）。**窓を開いた区間では意図どおり Ghost Voice が最前面になり、閉じると元のアプリ（起動前と同じ pid）へ戻った。** `--hud-check`（HUD を実際に表示した状態）でも **1,488 回で奪取 0 回。** **ただし戻るまでの遅れがある**（V-43）。**残る未実測: 実バンドル（`Ghost Voice.app`）での確認**——素の実行ファイルで測った |
 
 ---
 
@@ -2831,6 +2924,15 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 
 実行は Core にある（`DictationSession.performUndo`）。決めたのは伝え方だけである。
 
+> **文言そのものも Core へ移した**（`SessionNoticeAnnouncement`。統括の裁定）。
+> 以前は HUD（`HUDPresenter.announcement`）と Undo の UI（`UndoNarration`）の**2 箇所にあり、
+> CLI には 1 箇所も無かった**——`ghost-voice` から Undo を撃つと顛末が何も出ない、という
+> **フェーズ 1 で潰した「無言で失敗する」と同じ形**である。
+> `SessionFailureNotice` を Core へ置いたのとまったく同じ理由である（§8.5）。
+> **媒体が決めるのは色・保持時間・強調の書き方だけ**にした。
+> `.undoCopiedRawTextToClipboard` だけは `isPersistent` を立ててあり、**時間で畳まない**
+> （読み落とすとクリップボードに在る生テキストへ辿り着けない）。次の発話が始まれば消える。
+
 **出口は HUD の 1 行にする。窓は開かない。通知センターも使わない。音も鳴らさない。**
 
 - Undo はホットキーで撃たれる。**そのとき利用者は別のアプリで作業していて、
@@ -2854,10 +2956,40 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 出ていないので、**見えない締め切りで黙って断られるのがいちばん悪い。**
 秒数は `HistoryStore.undoWindow` から取り、**画面側に `10` と書かない**（片方だけ変えると嘘になる）。
 
-### 14.6 ここで実測が要ると判ったこと（**採番は統括が §13 へ入れるとき付ける**）
+### 14.6 実測が要ると判っていた 3 件（**すべて測った / 2026-08-15**）
 
-| 内容 | なぜ要るか |
+| 内容 | 結果 | 採番 |
+|---|---|---|
+| **設定画面で打鍵を捕まえられるか。`CGEventTap` と干渉しないか** | **干渉しない形で実装した**（§2.6）。2 本目のタップを立てず、捕獲モードのイベントは `HotkeyDecision.decide` を 1 度も通らない——**捕獲中に PTT / Undo / ESC の中断が発火しえない。** 残るのは実キーボードでの捕獲そのもの（`CGEvent.tapCreate` が通ることが要る） | **V-42** |
+| **窓を閉じてから前面が戻るまでの待ち方** | **`didResignActiveNotification` では足りなかった。** `NSApp.hide(nil)` の直後には既に非活性で通知が来ず、**それでも最前面は 24〜32 ms のあいだ Ghost Voice のままだった。** 活性を待つ実装は「待った気になるだけ」だった。150 ms の整定で埋めてある | **V-43** |
+| **`NSApp.hide(nil)` で前面が確実に戻るか** | **戻る。** `--window-check` で 4 ms 間隔の観測。窓を出していない区間は 2,451 回で奪取 0 回、閉じた後は起動前と同じアプリへ戻った | **V-44** |
+
+#### 14.6.0 「キー監視を開始できなかった」を誰が言うか（HUD と設定画面の棲み分け）
+
+**両方が言う。ただし言うことが違う。**
+
+| 出口 | 何を言うか | なぜそこか |
+|---|---|---|
+| **HUD**（起動時に 10 秒） | `AppPermissionGuidance.summary(for:)` の**1 行** | **`.app` を Finder から起動すると標準エラーはどこにも出ない。** キー監視が始まっていないことは HUD でしか見えない。**気づかせるための出口である** |
+| **ステータスメニュー**（常設） | 「キー入力を監視できていません（設定を開く）」の 1 項目 | HUD の 10 秒を見逃した後でも、**押しても何も起きない**理由に辿り着ける |
+| **設定画面** | `AppPermissionGuidance.message(for:)` の**全文**（システム設定のパス・許可の相手・再起動が要ること） | **直すための情報である。** notch の帯は実測 221 pt しかなく、パスは載らない |
+
+**HUD を落とさない理由**は「設定画面は利用者が開かないと出ない」ことである。
+「押しても何も起きない」に気づいた利用者が設定画面へ辿り着く保証は無い。
+**重ねてよいのは、片方が「気づく」でもう片方が「直す」のときだけである**——
+同じ文言を 2 か所へ出すのは（§8.5 が禁じている）別の話であり、ここは**粒度が違う。**
+
+#### 14.6.1 窓の提示の配線（`StatusMenuSurface`）
+
+「どの窓・どのメニューから開くか」は各 ViewModel の doc コメントにあり、**その指示どおりに配線した。**
+
+| 指示 | 実装 |
 |---|---|
-| **設定画面で打鍵を捕まえられるか。`CGEventTap` と干渉しないか** | PTT の既定が修飾キー単独なので `keyDown` では捕まらず `flagsChanged` を見る必要があり、**`HotkeyMonitor` のタップと同じイベントを 2 箇所で見る**ことになる。確かめるまで打鍵の捕獲は入れていない（キーの変更は手編集か `setHotkey(keyCode:modifiers:)` の配線で行う） |
-| **窓を閉じてから前面が戻るまでの待ち方** | 再挿入の前提。`NSApplication.didResignActiveNotification` で足りるかは未実測。足りないと**再挿入が Ghost Voice 自身の窓へ入る** |
-| **`NSApp.hide(nil)` で前面が確実に戻るか** | 戻らないと、設定／履歴を開いた後の**次の発話の挿入先が壊れる**（トラック B が測ったフォーカス非奪取の確認を、窓を足した状態でやり直すことに含まれる） |
+| 開く口は `NSStatusItem` のメニュー | 設定… / 履歴… / 終了。**`LSUIElement = true` なのでここが唯一の入口である** |
+| `RunLoopEntry` を受け取ってから窓を作る | `AppWindow` が鍵を要求する。**さらに、窓は利用者がメニューを選んだ瞬間に作る**（`AppSurface` の doc が「起動時に非表示の window を用意しておく実装は禁止」と定めているため） |
+| 開くときは `NSApp.activate()`、閉じたら `NSApp.hide(nil)` | `AppWindow.present()` / `windowWillClose` / `dismissAndReturnFocus` |
+| 再挿入は窓を閉じて前面が戻ってから | `HistoryView` へ閉じる口を渡す。**渡さなければボタンが出ない**設計はそのまま |
+
+**`makeKeyAndOrderFront` を使ってよいのは `AppWindow` だけ**であり、HUD で使うことは
+ソース走査で禁じてある（`HUDWindowContractTests`）。**HUD とこの窓は要件が正反対である**——
+HUD は絶対に活性化させてはならず、この窓は活性化しないと設定を打ち込めない。

@@ -1,3 +1,4 @@
+import Foundation
 import GhostVoiceCore
 
 /// **`NSApplication.run()` が始まった後にしか作れない値。**
@@ -62,6 +63,17 @@ public struct AppServices: Sendable {
     public let permissions: PermissionStatus
     /// キー監視を開始できなかった理由。`nil` なら開始できている。
     public let hotkeyFailure: HotkeyError?
+    /// キー監視器への面（打鍵の捕獲と PTT キーの反映。FR-11）。
+    ///
+    /// **`nil` になりうる**（`--shell-only` / 監視を開始できなかったとき）。
+    /// nil のとき設定画面は打鍵を捕まえられないので、**その旨を利用者へ言うこと**
+    /// （黙って何も起きない形にしない）。
+    public let hotkey: (any HotkeyControlling)?
+    /// ストアを作るときに渡した保存先。
+    ///
+    /// **ストアと同じものを画面へ渡すため**に持ち回る。食い違うと、
+    /// `.corrupt` の在り処を嘘の場所で案内する（`StoreFileNotice` の注記）。
+    public let storageRoot: URL
 
     public init(
         session: DictationSession?,
@@ -69,7 +81,9 @@ public struct AppServices: Sendable {
         history: HistoryStore,
         vocabulary: VocabularyStore,
         permissions: PermissionStatus,
-        hotkeyFailure: HotkeyError?
+        hotkeyFailure: HotkeyError?,
+        hotkey: (any HotkeyControlling)? = nil,
+        storageRoot: URL = StorageRoot.default
     ) {
         self.session = session
         self.settings = settings
@@ -77,6 +91,8 @@ public struct AppServices: Sendable {
         self.vocabulary = vocabulary
         self.permissions = permissions
         self.hotkeyFailure = hotkeyFailure
+        self.hotkey = hotkey
+        self.storageRoot = storageRoot
     }
 }
 

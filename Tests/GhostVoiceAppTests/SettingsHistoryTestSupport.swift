@@ -174,3 +174,61 @@ enum TrackDSources {
 /// **`Thread.isMainThread` は `noasync` なので async 文脈から直に読めない。**
 /// 同期の関数に包む。包んでも意味は変わらない（実行中のスレッドを見るだけ）。
 func isRunningOnMainThread() -> Bool { Thread.isMainThread }
+
+// MARK: - キー監視器の代役
+
+/// `HotkeyControlling` の代役。**捕獲の決着を検査から流し込める。**
+///
+/// **本物（`CGEventTapHotkeyMonitor`）を検査から使ってはならない。**
+/// `CGEvent.tapCreate` は入力監視の権限ダイアログを誘発する（`COMMON.md` の安全制約）。
+final class HotkeyControlSpy: HotkeyControlling {
+    private let handler = Mutex<(@Sendable (HotkeyCaptureOutcome) -> Void)?>(nil)
+    private let beginCalls = Mutex<Int>(0)
+    private let endCalls = Mutex<Int>(0)
+    private let rebinds = Mutex<[HotkeyBinding]>([])
+    private let rebindError: (any Error)?
+
+    init(
+        currentPushToTalkBinding: HotkeyBinding = .rightOption,
+        rebindError: (any Error)? = nil
+    ) {
+        self.currentPushToTalkBinding = currentPushToTalkBinding
+        self.rebindError = rebindError
+    }
+
+    let currentPushToTalkBinding: HotkeyBinding
+
+    var beginCount: Int { beginCalls.withLock { $0 } }
+    var endCount: Int { endCalls.withLock { $0 } }
+    var isCapturing: Bool { handler.withLock { $0 != nil } }
+    var reboundPushToTalk: [HotkeyBinding] { rebinds.withLock { $0 } }
+
+    func beginCapture(_ onEvent: @escaping @Sendable (HotkeyCaptureOutcome) -> Void) {
+        beginCalls.withLock { $0 += 1 }
+        handler.withLock { $0 = onEvent }
+    }
+
+    func endCapture() {
+        let had = handler.withLock { current -> Bool in
+            let existed = current != nil
+            current = nil
+            return existed
+        }
+        if had { endCalls.withLock { $0 += 1 } }
+    }
+
+    func rebindPushToTalk(to binding: HotkeyBinding) throws {
+        if let rebindError { throw rebindError }
+        rebinds.withLock { $0.append(binding) }
+    }
+
+    /// 決着を配る。**本物と同じく 1 打鍵で閉じる。**
+    func deliver(_ outcome: HotkeyCaptureOutcome) {
+        let current = handler.withLock { existing -> (@Sendable (HotkeyCaptureOutcome) -> Void)? in
+            let value = existing
+            existing = nil
+            return value
+        }
+        current?(outcome)
+    }
+}

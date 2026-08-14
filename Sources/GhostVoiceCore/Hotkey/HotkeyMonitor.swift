@@ -103,6 +103,35 @@ public protocol HotkeyMonitor: AnyObject, Sendable {
     ///   打鍵ごとの判定コストは実測 p50 0.75 μs で、**これはシステム全体の打鍵に乗る**
     ///   （詳細設計書 §2.5）。ここで問い合わせや計算を行ってはならない。
     func setUndoAvailable(_ available: Bool)
+
+    /// **打鍵の捕獲を始める**（FR-11「ホットキーを設定画面から変更できる」）。
+    ///
+    /// **2 本目の `CGEventTap` を立てない**ための口である（統括の裁定）。判定は
+    /// 1 打鍵あたり p50 0.75 μs で全システムの打鍵に乗るので、2 本目を立てると
+    /// **設定画面を開いていない間もずっと 2 倍を払う**ことになる。
+    ///
+    /// - Important: **捕獲モードの間、PTT も Undo も ESC の中断も発火しない。**
+    ///   キーを設定しようとして録音が始まると設定画面は使えないので、これは要件である。
+    ///   判定は `HotkeyDecision.decide` を一度も通らない（`HotkeyCaptureState` が先に見る）。
+    /// - Important: **録音中に呼ぶと `.interrupted` が流れる。** 捕獲モードでは PTT キーの
+    ///   解放が届かないので、放っておくと録音が終わらない（`rebind(to:)` と同じ形の穴）。
+    ///   `.cancelled` ではないので、そこまでの発話は確定して挿入される。
+    /// - Important: **1 打鍵で終わる。** 決着（`.captured` / `.cancelled`）を配ると
+    ///   捕獲モードは自動的に閉じる。**閉じ忘れで打鍵を食い続ける状態を構造で作らない。**
+    /// - Important: **`onEvent` はタップのコールバックのスレッドから呼ばれる。**
+    ///   MainActor ではない。画面は自分で持ち上げること。
+    /// - Note: 二重に呼ぶと**後から呼んだほうが勝つ**（前の handler は捨てられ、
+    ///   何も配られない）。捕獲は利用者の 1 操作に紐づくので、待ち行列を作る意味が無い。
+    func beginHotkeyCapture(_ onEvent: @escaping @Sendable (HotkeyCaptureOutcome) -> Void)
+
+    /// 捕獲モードを閉じる。**二度呼んでも安全。** 決着は配られない。
+    ///
+    /// 設定画面が窓を閉じた・キー入力の受付を止めたときに必ず呼ぶこと
+    /// （呼ばなくても 1 打鍵で閉じるが、**閉じるまでは PTT が効かない**）。
+    func endHotkeyCapture()
+
+    /// いま捕獲モードか。**画面が「キーを押してください」を出しているかと一致させる。**
+    var isCapturingHotkey: Bool { get }
 }
 
 /// タップを開けなかった瞬間の権限照会の答え。
@@ -243,7 +272,9 @@ public enum HotkeyDecision {
         if binding.isModifierOnly {
             // 修飾キーは keyDown / keyUp を出さない。flagsChanged だけが手掛かり。
             guard type == .flagsChanged else { return (nil, false) }
-            isDown = isModifierDown(keyCode: binding.keyCode, flags: flags, binding: binding)
+            isDown = isModifierDown(
+                keyCode: binding.keyCode, flags: flags,
+                fallback: binding.modifiers.cgEventFlags)
 
             // **修飾キーの flagsChanged は決して抑止しない。**
             // 抑止すると下流アプリが修飾状態を見失い、⌥+矢印などが壊れる。
@@ -296,8 +327,13 @@ public enum HotkeyDecision {
     ///   実装の失敗は、取りこぼしより重い方へ倒れる）。
     ///   実キーボードがこのビットを立てることは V-4 で確認する
     ///   （**権限を付与した利用者が実施する**。README の手順の #3）。
-    private static func isModifierDown(
-        keyCode: Int64, flags: CGEventFlags, binding: HotkeyBinding
+    ///
+    /// - Parameter fallback: デバイスビットを読めなかったときに使う汎用マスク。
+    ///   **PTT の判定はバインドの修飾キー、捕獲はそのキー自身の修飾キーを渡す**
+    ///   （`HotkeyCaptureState`）。**左右の判定そのものは 1 箇所しか無い**——
+    ///   2 箇所に分かれると、片方だけが解放を取りこぼして録音が終わらなくなる。
+    static func isModifierDown(
+        keyCode: Int64, flags: CGEventFlags, fallback: CGEventFlags
     ) -> Bool {
         // **この退避経路は現在到達しない。** `isModifierOnly` が認める 8 個の
         // キーコードは全て `ModifierSide` の表に載っている（テスト
@@ -305,7 +341,7 @@ public enum HotkeyDecision {
         // 表への追加を忘れたときに**落ちずに従来の判定へ落ちる**ための保険として残す。
         // ミューテーションテストではここを潰す変異が生き残る（等価変異）。
         guard let bits = ModifierSide.bits(forKeyCode: keyCode) else {
-            return flags.contains(binding.modifiers.cgEventFlags)
+            return flags.contains(fallback)
         }
         let anySidePresent = (flags.rawValue & bits.bothSides) != 0
         if anySidePresent || !flags.contains(bits.generic) {
@@ -380,6 +416,24 @@ extension HotkeyBinding.Modifiers {
         if contains(.shift) { flags.insert(.maskShift) }
         return flags
     }
+
+    /// `CGEventFlags` から修飾キーを読む（捕獲に使う。`HotkeyCaptureState`）。
+    ///
+    /// **左右は区別しない。** `HotkeyBinding.Modifiers` に左右の区別が無いためで、
+    /// 左右を見るのは**修飾キー単独のバインドの押下判定だけ**である
+    /// （`HotkeyDecision.isModifierDown`。汎用マスクでは解放を取りこぼす）。
+    ///
+    /// **`.maskAlphaShift`（Caps Lock）や `.maskSecondaryFn` は落とす。**
+    /// `HotkeyBinding.Modifiers` に対応する値が無く、混ぜると
+    /// 「Caps Lock が入っている間だけ違うバインドが捕まる」ことになる。
+    public init(cgEventFlags flags: CGEventFlags) {
+        var result = HotkeyBinding.Modifiers()
+        if flags.contains(.maskCommand) { result.insert(.command) }
+        if flags.contains(.maskAlternate) { result.insert(.option) }
+        if flags.contains(.maskControl) { result.insert(.control) }
+        if flags.contains(.maskShift) { result.insert(.shift) }
+        self = result
+    }
 }
 
 /// テスト用。任意のタイミングでイベントを流せる。
@@ -394,6 +448,13 @@ public final class StubHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     private var undoBinding: HotkeyBinding
     private var undoRebindCalls: [HotkeyBinding] = []
     private var undoAvailableCalls: [Bool] = []
+    private var captureHandler: (@Sendable (HotkeyCaptureOutcome) -> Void)?
+    private var captureState = HotkeyCaptureState()
+    private var captureBegins = 0
+    private var captureEnds = 0
+    /// **`feedPushToTalkAttempt` のためだけの録音状態。** 本物の監視器と違い、
+    /// この代役は `emit(_:)` で任意のイベントを流せるので普段は状態を持たない。
+    private var isRecordingForCapture = false
 
     public init(
         binding: HotkeyBinding = .rightOption,
@@ -451,5 +512,84 @@ public final class StubHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
 
     public func setUndoAvailable(_ available: Bool) {
         lock.withLock { undoAvailableCalls.append(available) }
+    }
+
+    // MARK: - 捕獲モード
+
+    /// 捕獲モードへ入った回数と抜けた回数。**画面が閉じ忘れていないかを見る。**
+    public var captureBeginCount: Int { lock.withLock { captureBegins } }
+    public var captureEndCount: Int { lock.withLock { captureEnds } }
+
+    public var isCapturingHotkey: Bool { lock.withLock { captureHandler != nil } }
+
+    public func beginHotkeyCapture(_ onEvent: @escaping @Sendable (HotkeyCaptureOutcome) -> Void) {
+        let wasRecording: Bool = lock.withLock {
+            captureHandler = onEvent
+            captureState = HotkeyCaptureState()
+            captureBegins += 1
+            let recording = isRecordingForCapture
+            isRecordingForCapture = false
+            return recording
+        }
+        // **本物と同じ縮退を持つ**（捕獲中は PTT キーの解放が届かない）。
+        if wasRecording { continuation.yield(.interrupted) }
+    }
+
+    public func endHotkeyCapture() {
+        lock.withLock {
+            guard captureHandler != nil else { return }
+            captureHandler = nil
+            captureState = HotkeyCaptureState()
+            captureEnds += 1
+        }
+    }
+
+    /// 検査から打鍵を流し込む。**本物と同じ `HotkeyCaptureState` を通す。**
+    ///
+    /// - Returns: 抑止したか（本物のタップなら下流へ渡さない）。
+    @discardableResult
+    public func feedCapture(type: CGEventType, keyCode: Int64, flags: CGEventFlags) -> Bool {
+        let (outcome, suppress, handler): (
+            HotkeyCaptureOutcome, Bool, (@Sendable (HotkeyCaptureOutcome) -> Void)?
+        ) = lock.withLock {
+            guard captureHandler != nil else { return (.pending, false, nil) }
+            let result = captureState.consume(type: type, keyCode: keyCode, flags: flags)
+            switch result.outcome {
+            case .pending:
+                return (result.outcome, result.suppress, nil)
+            case .captured, .cancelled:
+                let handler = captureHandler
+                captureHandler = nil
+                captureState = HotkeyCaptureState()
+                captureEnds += 1
+                return (result.outcome, result.suppress, handler)
+            }
+        }
+        if case .pending = outcome {} else { handler?(outcome) }
+        return suppress
+    }
+
+    /// 捕獲モード中に PTT を発火させようとする（**発火してはならない**）。
+    ///
+    /// 本物の `handle` と同じ順序（捕獲モードを先に見る）を素通しで再現する。
+    public func feedPushToTalkAttempt(type: CGEventType, keyCode: Int64, flags: CGEventFlags) {
+        if isCapturingHotkey {
+            feedCapture(type: type, keyCode: keyCode, flags: flags)
+            return
+        }
+        let decision = HotkeyDecision.decide(
+            type: type, keyCode: keyCode, flags: flags,
+            binding: currentBinding, isRecording: lock.withLock { isRecordingForCapture },
+            undoBinding: currentUndoBinding)
+        if let event = decision.event {
+            lock.withLock {
+                switch event {
+                case .pressed: isRecordingForCapture = true
+                case .released, .cancelled, .interrupted: isRecordingForCapture = false
+                case .undoRequested: break
+                }
+            }
+            continuation.yield(event)
+        }
     }
 }

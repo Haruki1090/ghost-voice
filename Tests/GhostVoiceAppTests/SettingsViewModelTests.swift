@@ -99,7 +99,7 @@ struct SettingsViewModelTests {
                 SettingsSessionSpy.Prepared(localeIdentifier: "en-US", kind: .dictation)
             ])
         #expect(model.lastSave == .saved(
-            transcriberReloaded: true, undoHotkeyRebound: false, quarantined: []))
+            transcriberReloaded: true, hotkeysRebound: SettingsViewModel.ReboundHotkeys(), quarantined: []))
     }
 
     @Test("ロケールを変えていなければ `prepareTranscriber` を呼ばない（ロケール枠は有限）")
@@ -191,7 +191,7 @@ struct SettingsViewModelTests {
         await model.save()
 
         #expect(model.lastSave == .saved(
-            transcriberReloaded: false, undoHotkeyRebound: false, quarantined: []))
+            transcriberReloaded: false, hotkeysRebound: SettingsViewModel.ReboundHotkeys(), quarantined: []))
         #expect(SettingsStore(rootURL: temp.url).settings.localeIdentifier == "en-US")
     }
 

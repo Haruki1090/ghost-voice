@@ -260,6 +260,12 @@ public enum GhostVoiceRuntime {
                 session.stateUpdates, metrics: { await session.latestMetrics },
                 writer: err, gate: gate)
         }
+        // **Undo の顛末をここで出す。** これが無いと `ghost-voice` から Undo を撃っても
+        // 何も起きていないように見える（フェーズ 1 で潰した「無言で失敗する」と同じ形）。
+        // `notices()` は分配器なので `stateUpdates` の単一消費者制約に当たらない。
+        let noticeNarration = Task {
+            await SessionNarration.consumeNotices(session.notices(), writer: err)
+        }
         let run = Task { await session.run() }
 
         let isShuttingDown = Atomic<Bool>(false)
@@ -313,6 +319,10 @@ public enum GhostVoiceRuntime {
                     isBusy: { await session.isBusy },
                     announce: { err.announce($0) })
                 await narration.value
+                // **待ってから落とす。** キャンセルすると最後の顛末が出ないまま消える。
+                // `run()` は畳むときに通知の分配器も終端する（`DictationSession.run`）ので、
+                // ここは必ず戻る。
+                await noticeNarration.value
                 exit(0)
             }
         }

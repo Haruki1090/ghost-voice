@@ -267,9 +267,15 @@ struct HUDPresenterTests {
     /// `.textMayHaveBeenLost` が埋もれる。**理由がある側（差し替えの断念）は出す。**
     @Test("整形が返らなかっただけの通知は出さない")
     func quietAboutRefinementThatNeverReturned() {
-        #expect(HUDPresenter.announcement(for: .refinementNotApplied(nil)) == nil)
-        #expect(HUDPresenter.announcement(for: .refinementApplied) == nil)
-        #expect(HUDPresenter.announcement(for: .refinementNotApplied(.focusChanged)) != nil)
+        // **判断は Core が持つ**（`SessionNoticeAnnouncement`。統括の裁定「Core へ寄せる」）。
+        // ここが確かめるのは、HUD がその判断をそのまま使っていることである。
+        #expect(SessionNoticeAnnouncement(.refinementNotApplied(nil)) == nil)
+        #expect(SessionNoticeAnnouncement(.refinementApplied) == nil)
+        #expect(SessionNoticeAnnouncement(.refinementNotApplied(.focusChanged)) != nil)
+
+        var presenter = makePresenter()
+        presenter.apply(.notice(.refinementNotApplied(nil)), at: .now)
+        #expect(presenter.display == .hidden, "HUD が Core の判断を無視して出している")
     }
 
     /// R-9。**この設計で唯一「発話が欄から消えうる」経路**なので、回収を促す必要がある。
@@ -314,9 +320,35 @@ struct HUDPresenterTests {
         var presenter = makePresenter()
         let start = ContinuousClock.now
         presenter.apply(.notice(.undone), at: start)
-        #expect(presenter.display == .message(HUDMessage(text: "整形前へ戻しました。", severity: .info)))
-        presenter.apply(.tick, at: start + .milliseconds(1500))
+        // **文言は Core から来る。** HUD 側に写しを置かない。
+        #expect(
+            presenter.display
+                == .message(
+                    HUDMessage(
+                        text: SessionNoticeAnnouncement(.undone)!.summary, severity: .info)))
+        presenter.apply(.tick, at: start + presenter.timing.notice)
         #expect(presenter.display == .hidden)
+    }
+
+    /// **これだけは時間で畳んではならない**（`SessionNoticeAnnouncement.isPersistent`）。
+    /// 読み落とすと、クリップボードに在る生テキストへ辿り着けない（UC-3 の縮退が死ぬ）。
+    @Test("クリップボードへの退避は時間でも `.idle` でも消えない")
+    func clipboardFallbackIsNotDismissedAutomatically() {
+        var presenter = makePresenter()
+        let start = ContinuousClock.now
+        presenter.apply(.notice(.undoCopiedRawTextToClipboard), at: start)
+        // **差し替えの直後には必ず `.idle` が続く。** ここで消えると誰も読めない。
+        presenter.apply(.state(.idle), at: start + .milliseconds(1))
+        presenter.apply(.tick, at: start + .seconds(600))
+        guard case .message(let message) = presenter.display else {
+            Issue.record("消えている: \(presenter.display)")
+            return
+        }
+        #expect(message.text.contains("⌘V"))
+
+        // **次の発話が始まれば消える**（「時計で消すな」であって「居座れ」ではない）。
+        presenter.apply(.state(.recording(volatileText: "つぎ")), at: start + .seconds(601))
+        #expect(presenter.display.recordingText == "つぎ")
     }
 
     /// **すべての通知に扱いが決まっている**ことを固定する。
@@ -328,9 +360,18 @@ struct HUDPresenterTests {
             .textMayHaveBeenLost, .undone, .undoUnavailable, .undoDeclined(.focusChanged),
             .undoCopiedRawTextToClipboard,
         ]
-        // 黙って捨てるのは「整形の結末」の 2 つだけ。
-        let silent = all.filter { HUDPresenter.announcement(for: $0) == nil }
+        // 黙って捨てるのは「整形の結末」の 2 つだけ。**判断は Core が持つ。**
+        let silent = all.filter { SessionNoticeAnnouncement($0) == nil }
         #expect(silent == [.refinementApplied, .refinementNotApplied(nil)])
+
+        // **重さの写し方に穴が無い**（新しい重さが増えたらここが赤くなる）。
+        for weight in [
+            SessionNoticeAnnouncement.Weight.info, .warning, .lost, .actionRequired,
+        ] {
+            #expect(HUDPresenter.hold(for: weight, timing: HUDPresenter.Timing()) > .zero)
+        }
+        #expect(HUDPresenter.severity(for: .actionRequired) == .info, "拒否でも失敗でもない")
+        #expect(HUDPresenter.severity(for: .lost) == .lost)
     }
 
     // MARK: - モデルの導入
