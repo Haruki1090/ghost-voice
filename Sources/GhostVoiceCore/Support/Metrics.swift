@@ -119,7 +119,10 @@ public enum Metrics {
         /// **(a) の分岐では M3（整形）が挿入より後に確定する。** 挿入の直後に作った
         /// 標本は `refine: .zero` を持っており、整形が返ってから本当の値が入る。
         /// **M2 / M4 は動かさない**——挿入までの区間は既に確定している。
-        func rewriting(refine: Duration, revision: Duration) -> Sample {
+        /// - Parameter revision: 差し替えが**実際に走った**場合だけ入れる。
+        ///   整形が返らずに終わったときは nil のままにする——そこは NFR-P6b の
+        ///   対象外であり、nil を「未達」と数えてはならない（`meetsRevisionTarget`）。
+        func rewriting(refine: Duration, revision: Duration?) -> Sample {
             Sample(
                 finalize: finalize, refine: refine, insert: insert,
                 droppedBuffers: droppedBuffers,

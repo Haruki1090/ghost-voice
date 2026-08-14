@@ -449,9 +449,10 @@ public actor DictationSession {
             emit(.idle)
         }
 
-        // **発話ごとに呼び直さない。** `prepare` は `reserve` の後に失敗すると
-        // ロケール枠（上限 5）を解放しない（Task 5 申し送り）。再試行を毎発話で
-        // 重ねると `localeReservationLimitReached` に達して回復不能になる。
+        // **発話ごとに呼び直さない。** ロケール枠（上限 5）は有限で、
+        // 相異なるロケールを 5 種類試すと `localeReservationLimitReached` に達する。
+        // 枠の解放そのものは `SpeechAnalyzerTranscriber.prepare` が行うようになったが
+        // （持ち越し項目 5）、**再試行の回数を人の操作の回数に縛る**という規律は残す。
         // ロケールを変えるときは `prepareTranscriber(locale:kind:)` を明示的に呼ぶ。
         let current = settings.settings
         do {
@@ -1131,6 +1132,13 @@ public actor DictationSession {
             }
         }
 
+        // **整形の所要は、返らなかった場合も記録する。** ここを成功時だけにすると、
+        // 「打ち切りに掛かった」のか「逸脱の検査に落ちた」のかが計測から消え、
+        // **(b) の打ち切りを引き直すときに見るべき分布が取れない**（M3 は (b) では
+        // 常に記録されるので、片方だけ欠けた分布を比べることになる）。
+        let refineElapsed = ContinuousClock.now - refineStart
+        if isCurrent { latestMetrics = latestMetrics?.rewriting(refine: refineElapsed, revision: nil) }
+
         guard !isRevisionCancelled else {
             notify(.refinementNotApplied(nil))
             return
@@ -1156,8 +1164,7 @@ public actor DictationSession {
         let result = replacer.replace(anchor, with: refined)
         let revision = ContinuousClock.now - releasedAt
         if isCurrent {
-            latestMetrics = latestMetrics?.rewriting(
-                refine: ContinuousClock.now - refineStart, revision: revision)
+            latestMetrics = latestMetrics?.rewriting(refine: refineElapsed, revision: revision)
         }
 
         switch result {
@@ -1279,8 +1286,9 @@ public actor DictationSession {
     ///
     /// 基本設計書 §4: 中断でも録音済み内容は破棄せず履歴へ残す。挿入はしていないので
     /// `.notInserted` で記録する。**整形結果は残さない。** `refinedText` を入れると
-    /// `undoCandidate` の条件（`refinedText != nil`）を満たしてしまい、
-    /// **一度も挿入していない文字列を「戻せる」ことになる。**
+    /// 履歴側の述語（`HistoryEntry.isAutomaticUndoCandidate`）の一方の条件を満たしてしまい、
+    /// **一度も挿入していない文字列が「直近の整形済み発話」として履歴 UI に載る。**
+    /// **経路（`.notInserted`）でも弾かれるので二重に守られているが、ここを緩めないこと。**
     private func finishCancelled(raw: String, locale: String) {
         if !raw.isEmpty,
             !record(raw: raw, refined: nil, locale: locale, method: .notInserted)

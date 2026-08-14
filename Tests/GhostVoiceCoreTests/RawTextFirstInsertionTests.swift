@@ -767,3 +767,38 @@ struct RawTextFirstInsertionTests {
         }
     }
 }
+
+@Suite("FR-5(a): 反映できなかったときの計測")
+struct RawTextFirstMetricsTests {
+
+    /// **整形が返らなかった場合も M3 は記録する。**
+    ///
+    /// 成功時だけ記録すると、「打ち切りに掛かった」のか「逸脱の検査に落ちた」のかが
+    /// 計測から消え、**(b) の打ち切りを引き直すときに見るべき分布が片側だけ欠ける**
+    /// （(b) では M3 が常に記録されるため、比べられなくなる）。
+    @Test("整形が返らなくても M3 は残る")
+    func recordsRefinementDurationEvenWhenItReturnsNothing() async throws {
+        try await withTempRoot { root in
+            let rig = RevisionRig.make(root: root, refined: nil, refineDelay: .milliseconds(120))
+            let collector = rig.notices.follow(rig.session)
+            defer { collector.cancel() }
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") {
+                if case .recording = await rig.session.state { return true }
+                return false
+            }
+            rig.audio.emit(frames: 1_600)
+            rig.hotkey.emit(.released)
+            try await waitUntil("顛末が出る") { !rig.notices.notices.isEmpty }
+
+            let metrics = try #require(await rig.session.latestMetrics)
+            #expect(metrics.refine > .zero, "整形の所要が記録されていない")
+            // **差し替えは走っていないので M6 は無い。** nil を未達と数えてはならない。
+            #expect(metrics.revision == nil)
+            #expect(metrics.meetsRevisionTarget == nil)
+        }
+    }
+}
