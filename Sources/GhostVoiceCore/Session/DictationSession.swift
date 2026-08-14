@@ -93,7 +93,19 @@ public enum SessionFailure: Sendable, Equatable {
     /// 利用者は「⌘V で貼れます」と告げられて空のクリップボードを見ることになった
     /// （最終レビュー A-2）。**テキストは履歴にだけある**ので、
     /// 案内する先は履歴画面（FR-9 の再挿入）である。
-    case insertionFailed
+    ///
+    /// - Parameter retainedInHistory: **その履歴が実際に残ったか。**
+    ///   履歴上限 0（設定画面のステッパーで到達できる。`HistoryStore.normalized`）では
+    ///   `append` が何も保存せず例外も投げないので、**唯一の写しであるはずの履歴が
+    ///   1 件も無い。** ここを持たずに「履歴にだけ残っています」と言い切っていたため、
+    ///   **発話が完全に消えているのに `speechWasLost = false` を告げていた**
+    ///   （再レビュー B-1）。`historyUnavailable(insertedElsewhere:)` が
+    ///   同じ区別をしているのとまったく同じ理由である。
+    ///
+    ///   **false になるのは上限 0 で「残らなかった」場合だけである。**
+    ///   書き込みそのものが失敗した場合は `historyUnavailable` の側で告げる
+    ///   （`SessionFailureNotice` の文言がこの前提に乗っている）。
+    case insertionFailed(retainedInHistory: Bool)
 }
 
 /// セッションの操作そのものが受け付けられなかった。
@@ -1066,6 +1078,9 @@ public actor DictationSession {
         // **`.refusedSecureInput` は履歴に記録してはならない**（Task 8 の裁定）。
         // `recordableMethod` が nil を返すのがその一手間で、ここを素通りさせると
         // パスワードが `history.json` へ平文で入る。
+        // **履歴が実際に残ったか。** `.failedEverywhere` のときは唯一の写しなので、
+        // 下の告知の文言がこの値で変わる（再レビュー B-1）。
+        var retainedInHistory = false
         if let method = outcome.recordableMethod {
             let stored = record(
                 raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
@@ -1078,13 +1093,17 @@ public actor DictationSession {
                 fail(.historyUnavailable(insertedElsewhere: outcome.leftTextWithUser))
                 return
             }
+            retainedInHistory = stored == .stored
         }
 
         // **どこにも入らず、クリップボードへも残せなかった。** 履歴だけが写しである
         // （`InsertionOutcome.failedEverywhere`）。以前はここが `.clipboardOnly` に
         // 化けており、「⌘V で貼れます」と告げていた（最終レビュー A-2）。
+        //
+        // **その履歴も残らなかったのなら、発話はどこにも無い。** 上限 0 は
+        // 「挿入できている限りは失敗ではない」が、挿入できていないここでは話が逆になる。
         guard outcome != .failedEverywhere else {
-            fail(.insertionFailed)
+            fail(.insertionFailed(retainedInHistory: retainedInHistory))
             return
         }
 
@@ -1202,6 +1221,14 @@ public actor DictationSession {
             refinement?.cancel()
             if stored == .failed {
                 fail(.historyUnavailable(insertedElsewhere: inserted.outcome.leftTextWithUser))
+            } else if inserted.outcome == .failedEverywhere {
+                // **上限 0 と「どこにも挿入できなかった」が重なった。**
+                // 欄にもクリップボードにも履歴にも無い——発話は完全に失われている。
+                // ここを下の `notify` へ落としていたために、**失敗を 1 つも出さずに
+                // `.idle` で終わっていた**（再レビュー A-1）。しかも
+                // `.refinementNotApplied(nil)` は `SessionNoticeAnnouncement.init?` が
+                // nil を返すので、**HUD にも CLI にも何ひとつ出なかった。**
+                fail(.insertionFailed(retainedInHistory: false))
             } else {
                 // 上限 0。**発話は欄にある**ので失敗ではないが、整形は反映できない。
                 notify(.refinementNotApplied(nil))
@@ -1212,9 +1239,10 @@ public actor DictationSession {
 
         // (b) 分岐と同じ扱い。**クリップボードへも残せていない**ので、
         // 案内する先は履歴画面（FR-9 の再挿入）だけである。
+        // ここへ届いているのは `stored == .stored` の場合だけなので、履歴は確かに残っている。
         guard inserted.outcome != .failedEverywhere else {
             refinement?.cancel()
-            fail(.insertionFailed)
+            fail(.insertionFailed(retainedInHistory: true))
             return
         }
 

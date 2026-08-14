@@ -5,7 +5,13 @@ import Testing
 @Suite("SessionFailureNotice")
 struct SessionFailureNoticeTests {
 
-    /// 6 ケースすべて。取りこぼすと、その失敗だけ HUD が無言になる。
+    /// **`SessionFailure` の全ケース**（付随値のある 2 つは両方の値）。
+    /// 取りこぼすと、その失敗だけ HUD が無言になる。
+    ///
+    /// - Important: **ここは手で並べた表なので、列挙にケースを足しても勝手には増えない。**
+    ///   実際 `.insertionFailed` はこの表から漏れており、`Tests/` のどこにも
+    ///   現れないまま「6 ケースすべて」と書かれていた（再レビュー A-1 / B-1）。
+    ///   `coversEveryCase()` の `switch` が**コンパイラに網羅を守らせる。**
     private static let allFailures: [SessionFailure] = [
         .audioUnavailable,
         .transcriptionUnavailable,
@@ -13,7 +19,39 @@ struct SessionFailureNoticeTests {
         .refusedSecureInput,
         .historyUnavailable(insertedElsewhere: true),
         .historyUnavailable(insertedElsewhere: false),
+        .insertionFailed(retainedInHistory: true),
+        .insertionFailed(retainedInHistory: false),
     ]
+
+    /// **列挙にケースを足したら、ここがコンパイルエラーになる。**
+    ///
+    /// 表を手で保守する限り、足したケースが検査から漏れるのは時間の問題である
+    /// （`.insertionFailed` が実際にそうなった）。`switch` を網羅で書き、
+    /// **表がその `switch` の全ラベルを覆っていること**を検査する。
+    private static func label(of failure: SessionFailure) -> String {
+        switch failure {
+        case .audioUnavailable: "audioUnavailable"
+        case .transcriptionUnavailable: "transcriptionUnavailable"
+        case .noSpeechRecognized: "noSpeechRecognized"
+        case .refusedSecureInput: "refusedSecureInput"
+        case .historyUnavailable: "historyUnavailable"
+        case .insertionFailed: "insertionFailed"
+        }
+    }
+
+    /// 表に載っていないケースがあれば落ちる。
+    @Test("表が SessionFailure の全ケースを覆っている")
+    func coversEveryCase() {
+        let covered = Set(Self.allFailures.map { Self.label(of: $0) })
+        #expect(
+            covered == [
+                "audioUnavailable", "transcriptionUnavailable", "noSpeechRecognized",
+                "refusedSecureInput", "historyUnavailable", "insertionFailed",
+            ],
+            "SessionFailure にケースを足して allFailures を更新していない")
+        // 付随値のあるケースは**両方の値**を並べる（片方だけだと嘘の文言を見逃す）。
+        #expect(Self.allFailures.count == 8)
+    }
 
     @Test("すべての失敗に空でない要約がある")
     func everyFailureHasASummary() {
@@ -102,21 +140,45 @@ struct SessionFailureNoticeTests {
         #expect(kept.remedies.contains { if case .checkStorage = $0 { true } else { false } })
     }
 
-    /// 発話を失ったのは中断された履歴書き込みの失敗だけ。ほかを失敗と同列に扱うと、
-    /// HUD が毎回「発話が失われました」と出す。
-    @Test("発話を失ったと言うのは、挿入もしていない履歴の失敗だけ")
-    func onlyUninsertedHistoryFailureLosesSpeech() {
-        for failure in Self.allFailures where failure != .historyUnavailable(insertedElsewhere: false) {
-            #expect(!SessionFailureNotice(failure).speechWasLost, "\(failure) で発話が失われたことにしている")
+    /// 発話を失ったと言ってよいのは**写しが 1 つも無い 2 つ**だけ。
+    /// ほかを同列に扱うと、HUD が毎回「発話が失われました」と出して本当の回が埋もれる。
+    ///
+    /// **逆側（言わなすぎ）も同じだけ重い。** `.insertionFailed` は
+    /// 履歴が残ったかを問わず `speechWasLost = false` を返しており、
+    /// **どこにも無い発話を「失われていない」と告げていた**（再レビュー B-1）。
+    @Test("発話を失ったと言うのは、写しが 1 つも無い 2 つだけ")
+    func onlyFailuresWithoutAnyCopyLoseSpeech() {
+        let losing: Set<String> = [
+            "\(SessionFailure.historyUnavailable(insertedElsewhere: false))",
+            "\(SessionFailure.insertionFailed(retainedInHistory: false))",
+        ]
+        for failure in Self.allFailures {
+            let shouldLose = losing.contains("\(failure)")
+            #expect(
+                SessionFailureNotice(failure).speechWasLost == shouldLose,
+                "\(failure) の「発話を失ったか」が事実と食い違っている")
         }
     }
 
-    /// 6 つが同じ文面になっていないこと（どの失敗か判らなくなる）。
+    /// **写しがどこにも無い縮退は、履歴画面へ案内してはならない。** 案内先が空である。
+    @Test("写しの無い縮退は履歴画面へ案内しない")
+    func doesNotPointAtAnEmptyHistory() {
+        let lost = SessionFailureNotice(.insertionFailed(retainedInHistory: false))
+        #expect(!(lost.summary + lost.detail).contains("履歴にだけ残っています"))
+        #expect((lost.summary + lost.detail).contains("失われました"))
+
+        let kept = SessionFailureNotice(.insertionFailed(retainedInHistory: true))
+        #expect(kept.detail.contains("履歴"), "唯一の写しの在り処を案内していない")
+        #expect(!(kept.summary + kept.detail).contains("失われました"))
+        #expect(lost.summary != kept.summary)
+    }
+
+    /// 8 つが同じ文面になっていないこと（どの失敗か判らなくなる）。
     @Test("失敗ごとに別の文面になる")
     func noticesAreDistinct() {
         let texts = Self.allFailures.map { SessionFailureNotice($0).summary + $0.debugText }
-        #expect(Set(Self.allFailures.map { SessionFailureNotice($0).summary }).count == 6)
-        #expect(Set(texts).count == 6)
+        #expect(Set(Self.allFailures.map { SessionFailureNotice($0).summary }).count == 8)
+        #expect(Set(texts).count == 8)
     }
 
     @Test("保存先の案内はストレージの場所を持つ")

@@ -215,6 +215,11 @@ final class RevisionRig: Sendable {
         applyMode: RefinementApplyMode = .afterInsert,
         focusedProcess: pid_t = RevisionRig.targetProcess,
         rangeSettable: Bool = true,
+        // **AX が書き込みを拒む相手を作る。** `canInsert()` / `canCaptureAnchor()` は
+        // 真のまま `setSelectedText` だけが false を返す——(a) の分岐を選んだ後で
+        // **一段目が失敗する**という並びは、これ以外に作れない
+        // （`InsertionFailedEverywhereTests`）。
+        acceptsWrite: Bool = true,
         selectionWriteFails: Bool = false,
         revisionDeadline: Duration = .seconds(5),
         historyLimit: Int = 50,
@@ -240,7 +245,7 @@ final class RevisionRig: Sendable {
         )
         let element = FakeAccessibility.Element(
             role: kAXTextAreaRole as String, isSelectedTextSettable: true,
-            processIdentifier: focusedProcess, acceptsWrite: true,
+            processIdentifier: focusedProcess, acceptsWrite: acceptsWrite,
             isSelectedTextRangeSettable: rangeSettable, identity: identity
         )
         let accessibility = SwitchingAccessibility(

@@ -130,16 +130,31 @@ public struct SessionFailureNotice: Sendable, Equatable {
             isRefusal = false
             speechWasLost = !insertedElsewhere
 
-        case .insertionFailed:
+        case .insertionFailed(let retainedInHistory):
             // **クリップボードへも残せていない。** 以前はこの縮退が
             // `.inserted(.clipboardOnly)` に化けており、「⌘V で貼れます」と告げていた
             // （最終レビュー A-2）。**残っているのは履歴だけ**なので、そこへ案内する。
-            summary = "どこにも挿入できず、クリップボードへも残せませんでした。"
-            detail = "この発話は履歴にだけ残っています。履歴画面から挿入し直してください。"
-            remedies = []
+            //
+            // **ただし「履歴だけ」も、履歴が実際に残ったときにしか成り立たない。**
+            // 上限 0 では 1 件も残らないので、案内先には何も無い（再レビュー B-1）。
+            // `historyUnavailable(insertedElsewhere:)` と同じ形で言い分ける。
+            if retainedInHistory {
+                summary = "どこにも挿入できず、クリップボードへも残せませんでした。"
+                detail = "この発話は履歴にだけ残っています。履歴画面から挿入し直してください。"
+                remedies = []
+                // 履歴には残っているので「どこにも残らなかった」ではない。
+                speechWasLost = false
+            } else {
+                summary = "どこにも挿入できませんでした。この発話は失われました。"
+                detail =
+                    "クリップボードへも残せず、履歴にも残っていません"
+                    + "（履歴の保存件数が 0 件に設定されています）。もう一度話してください。"
+                // **直せるのは保存件数の設定である。** ストレージの確認を出すと
+                // 書き込み失敗（`historyUnavailable`）と取り違えさせる。
+                remedies = []
+                speechWasLost = true
+            }
             isRefusal = false
-            // 履歴には残っているので「どこにも残らなかった」ではない。
-            speechWasLost = false
         }
     }
 
