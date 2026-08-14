@@ -181,16 +181,31 @@ struct DictationSessionTests {
         }
     }
 
-    /// **整形は `.final` の到着で始まる。`finish()` の復帰を待たない。**
+    /// **整形は結果ストリームの終端で始まる。`finish()` の復帰を待たない。**
     ///
-    /// 実測では `.final` が `finish()` の復帰より 5〜48 ms 早く届く（V-2）。
-    /// ここでは代役でその差を 1 秒に広げ、待っていないことを検査できる形にしている。
-    @Test("確定は finish() の復帰ではなく .final の到着で先へ進む")
-    func proceedsOnFinalNotOnFinishReturn() async throws {
+    /// ## この検査が守っているもの（V-12 の修正で定義が変わった）
+    ///
+    /// 元の形は「**`.final` の到着**で先へ進む」ことを固定していた。根拠は
+    /// 「`.final` は `finish()` の復帰より 5〜48 ms 早く届く（V-2 実測）ので、
+    /// 復帰を待つと毎発話でそのぶんを捨てる」という一点である。
+    ///
+    /// **その定義は発話を失う**（V-12。`doesNotDropSecondFinalAfterRelease`）。
+    /// 最初の確定で進むと、後から届いた確定が読まれない。そこで待つ相手を
+    /// 「**結果ストリームの終端**」——これ以上テキストが来ないと判る時点——へ移した。
+    ///
+    /// **守るべき性質そのものは残っている。** 実機の `finish()` は入力を閉じてから
+    /// `finalizeAndFinishThroughEndOfInput()` を待つ（§4.3.1）ので、
+    /// **結果ストリームの終端は `finish()` の復帰と同時か、それより前**である。
+    /// 「復帰を待たない」を「終端で進む」として測り直したのがこの検査で、
+    /// 代役でその差を 5 秒に広げてある。
+    @Test("確定は finish() の復帰ではなく結果ストリームの終端で先へ進む")
+    func proceedsOnStreamEndNotOnFinishReturn() async throws {
         try await withTempRoot { root in
             let rig = makeRig(
                 root: root,
-                transcriber: StubTranscriber(StubTranscriber.Script(finishDelay: .seconds(5)))
+                transcriber: StubTranscriber(
+                    StubTranscriber.Script(
+                        finishDelay: .seconds(5), endsStreamBeforeReturning: true))
             )
             let run = Task { await rig.session.run() }
             defer { run.cancel() }
@@ -212,6 +227,77 @@ struct DictationSessionTests {
             #expect(
                 elapsed < .seconds(2),
                 "finish() の復帰を待っている（線は壊れ検知。要件値ではない。実測 \(elapsed)）")
+        }
+    }
+
+    /// **V-12: キー解放後に届く確定は 1 件とは限らない。**
+    ///
+    /// 実機の肉声で再現した欠陥である（2026-08-14。要件定義書 §2.8.4）。
+    /// 121 字・区切りの多い発話で**末尾 約 38 字が失われた**。
+    /// 「解放以降の最初の確定」で待ちを解いて `latestFinal` を同期的に読む実装では、
+    /// **その後に届いた確定は積まれても二度と読まれない。**
+    ///
+    /// > **この経路を実音声で駆動することはできなかった。** `FinalAfterReleaseTests` は
+    /// > 103 秒の合成音声を実時間で流しても「解放後に 2 件目」を 1 度も起こせていない
+    /// > （＝否定されたのではなく、起きなかった）。**代役で決定的に駆動する。**
+    @Test("キー解放後に確定が 2 件届いても、2 件目を取りこぼさない")
+    func doesNotDropSecondFinalAfterRelease() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                transcriber: StubTranscriber(
+                    StubTranscriber.Script(
+                        finalText: "前半はここまでです。",
+                        // 1 件目を読み終えた後に届かせる。**ここが V-12 の条件である。**
+                        secondFinalText: "そして後半がこれです。",
+                        secondFinalDelay: .milliseconds(150))),
+                // **整形は通さない。** V-12 は認識側の取りこぼしの話なので、
+                // 挿入文字列と確定の総和をそのまま突き合わせられる形にする。
+                refiner: SpyRefiner(result: nil)
+            )
+            try await speak(rig)
+
+            #expect(
+                rig.inserter.inserted == ["前半はここまでです。そして後半がこれです。"],
+                "解放後に届いた 2 件目の確定を取りこぼしている（V-12。実測 \(rig.inserter.inserted)）")
+            // 履歴にも欠けたまま「成功」として残ってはならない（要件定義書 §2.8.4）。
+            #expect(
+                rig.history.entries.first?.rawText == "前半はここまでです。そして後半がこれです。",
+                "欠けた本文が成功として履歴に残っている")
+        }
+    }
+
+    /// **確定が届いてもストリームが終端しないなら、締め切りで先へ進む。**
+    ///
+    /// V-12 の修正で待ち条件を「最初の確定」から「ストリーム終端」へ広げた。
+    /// **広げた側の安全弁がここである**——認識器がストリームを閉じ忘れたら、
+    /// キーを離しても永久に戻らなくなる。`drainFeed` と同じ取引
+    /// （末尾を数十 ms 失うより、戻らない方が重い）を確定待ちにも掛ける。
+    @Test("ストリームが終端しなくても締め切りで先へ進む")
+    func proceedsOnDeadlineWhenStreamNeverEnds() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                transcriber: StubTranscriber(StubTranscriber.Script(finishesStream: false)),
+                refiner: SpyRefiner(result: nil),
+                finalizeDeadline: .milliseconds(200)
+            )
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            let released = ContinuousClock.now
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+            let elapsed = ContinuousClock.now - released
+
+            #expect(rig.inserter.inserted == ["えー、生テキストです"])
+            // **線は 2 秒（壊れ検知であって要件値ではない）。** 締め切りは 200 ms なので、
+            // ここが弁別するのは「締め切りで抜ける」と「戻らない」である。
+            #expect(
+                elapsed < .seconds(2),
+                "締め切りで抜けていない（線は壊れ検知。要件値ではない。実測 \(elapsed)）")
         }
     }
 
@@ -249,7 +335,11 @@ struct DictationSessionTests {
             let rig = makeRig(
                 root: root,
                 transcriber: StubTranscriber(StubTranscriber.Script(finishesStream: false)),
-                refiner: SpyRefiner(result: "整形後テキストです", delay: .milliseconds(300))
+                refiner: SpyRefiner(result: "整形後テキストです", delay: .milliseconds(300)),
+                // **ストリームを終端しない代役なので、確定待ちは締め切りで抜ける**
+                // （V-12 の修正で待つ相手が「最初の確定」から「終端」へ変わった）。
+                // この検査の関心は締め切りの長さではないので、短くして速く通す。
+                finalizeDeadline: .milliseconds(200)
             )
             let run = Task { await rig.session.run() }
             defer { run.cancel() }
@@ -407,7 +497,10 @@ struct DictationSessionTests {
             let rig = makeRig(
                 root: root,
                 // ストリームを終端しない。1 発話目の消費タスクが生き残る。
-                transcriber: StubTranscriber(StubTranscriber.Script(finishesStream: false))
+                transcriber: StubTranscriber(StubTranscriber.Script(finishesStream: false)),
+                // **終端しない以上、確定待ちは締め切りで抜ける**（V-12 の修正）。
+                // この検査の関心は締め切りの長さではないので、短くして速く通す。
+                finalizeDeadline: .milliseconds(200)
             )
             let run = Task { await rig.session.run() }
             defer { run.cancel() }

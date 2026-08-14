@@ -70,11 +70,13 @@ public actor DictationSession {
     /// そこまでの発話は届けるべきである。
     public static let defaultMaxRecordingDuration: Duration = .seconds(120)
 
-    /// キー解放から「確定テキストが手に入る」までの締め切り。
+    /// キー解放から「確定テキストが出そろう」までの締め切り。
     ///
-    /// 実測は 40〜177 ms（V-2）なので通常はまったく効かない。**認識器が黙り込んだ
-    /// ときに録音が終わらなくなるのを防ぐためだけにある。** 締め切りに達した場合は
-    /// 暫定テキストへ縮退する（空で捨てるよりは残す）。
+    /// 待つ相手は**結果ストリームの終端**である（V-12。最初の確定では待ちを解かない）。
+    /// 実測は 50〜188 ms なので通常はまったく効かない。**認識器が黙り込んだり、
+    /// 確定を出したままストリームを閉じ忘れたりしたときに録音が終わらなくなるのを
+    /// 防ぐためだけにある。** 締め切りに達した場合は、そこまでに積んだ確定
+    /// （1 件も無ければ暫定テキスト）で先へ進む。空で捨てるよりは残す。
     public static let defaultFinalizeDeadline: Duration = .seconds(2)
 
     private let settings: SettingsStore
@@ -144,15 +146,21 @@ public actor DictationSession {
     /// 処理中に ESC が届いたか（基本設計書 §4「中断は挿入が始まる前のどの状態からでも」）。
     private var isCancelRequested = false
 
-    /// キー解放以降に確定を待っているか。**録音中の `.final` で先へ進んではならない**
-    /// （長い発話では途中で確定が出る。V-2 のテストが実測で確認している）。
+    /// 確定テキストが出そろったか。**「最初の確定が届いたか」ではない。**
     ///
+    /// キー解放後に届く確定は **1 件とは限らない**（V-12。実機の肉声で再現した）。
+    /// 最初の確定で先へ進む定義だと、その後に届いた確定は `latestFinal` へ積まれても
+    /// 二度と読まれず、**発話の末尾が失われる**（要件定義書 §2.8.4: 121 字で 約 38 字）。
+    ///
+    /// そこで**これ以上テキストが来ないと判る時点**——結果ストリームの終端——まで待つ。
+    /// 認識器が黙り込んだ場合の安全弁は締め切り（`defaultFinalizeDeadline`）が担う。
+    ///
+    /// 録音中の `.final` でも先へ進まない（長い発話では途中で確定が出る。V-2 の実測）。
     /// V-12 の実測（103 秒の読み上げを実時間で供給）では、確定は**録音中に 1 件・
     /// 解放後に 1 件**届いた。前者を `latestFinal` へ積まずに捨てる変異を当てると、
     /// **548 字のうち前半が丸ごと落ちて後半だけが挿入される**
     /// （`FinalAfterReleaseTests` がこの変異を殺す。ただし既定の 30 秒では確定が
     /// 1 件しか出ないので、`GHOST_VOICE_V12_SECONDS=103` で回したときだけ殺せる）。
-    private var isAwaitingFinal = false
     private var isFinalSettled = false
     private var finalWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -335,7 +343,6 @@ public actor DictationSession {
         phase = .recording
         latestVolatile = ""
         latestFinal = ""
-        isAwaitingFinal = false
         isFinalSettled = false
         isCancelRequested = false
         // **前の発話の計測値を残さない。** 中断や失敗で終わった発話の後に読むと、
@@ -413,13 +420,17 @@ public actor DictationSession {
             latestVolatile = text
             if phase == .recording { emit(.recording(volatileText: text)) }
         case .final(let text):
+            // **積むだけで先へ進めない。** 確定は解放の前にも後にも複数届きうる
+            // （V-12）。ここで待ちを解くと、**その後に届いた確定は二度と読まれず
+            // 発話の末尾が失われる。** 先へ進めるのは `updatesEnded` と締め切りだけ。
             latestFinal += text
-            // キー解放より前の確定は当該発話の途中経過。**ここで先へ進めてはならない。**
-            if isAwaitingFinal { settleFinal() }
         }
     }
 
     /// 結果ストリームが終わった。これ以上テキストは来ない。
+    ///
+    /// **確定待ちを解くのはここである**（V-12 の修正。それまでは「解放後の最初の確定」で
+    /// 解いていたため、後から届いた確定が読まれなかった）。
     ///
     /// **前の発話ぶんの終了で、今の発話の確定待ちを解いてはならない。**
     private func updatesEnded(for utterance: Int) {
@@ -480,28 +491,29 @@ public actor DictationSession {
         //    解析器の入力が閉じたあとに末尾が届いて、発話の末尾がそのぶん落ちる。
         await drainFeed(before: textDeadline)
 
-        // 3. 確定を撃つ。**復帰は待たない。** `.final` は `finish()` の復帰より
-        //    5〜48 ms 早く届く（V-2 実測）。復帰を待つと毎発話でそのぶんを捨てる。
-        isAwaitingFinal = true
+        // 3. 確定を撃つ。**復帰は待たない。** `finish()`
+        //    （`finalizeAndFinishThroughEndOfInput()`）の復帰より、結果ストリームの
+        //    終端の方が先か同時に来る。**待つのはストリームであって復帰ではない。**
         let transcriber = self.transcriber
         finalizeTask = Task { try? await transcriber.finish() }
 
-        // 4. `.final` の到着・結果ストリームの終端・締め切りのいずれかを待つ。
+        // 4. **結果ストリームの終端**か締め切りを待つ（V-12 の修正）。
+        //
+        //    旧定義は「解放以降の**最初の**確定」で先へ進み、`latestFinal` を
+        //    `await` を挟まず同期的に読んでいた。**その後に届いた確定は積まれても
+        //    二度と読まれず、発話の末尾が失われた**——実機の肉声で再現している
+        //    （2026-08-14。121 字の発話で末尾 約 38 字。要件定義書 §2.8.4）。
+        //    合成音声 103 秒で解放後の確定が 1 件だったのは、
+        //    **危険な条件が起きなかっただけ**である。
+        //
+        //    終端まで待てば「これ以上テキストは来ない」が保証される。**代償は
+        //    最初の確定から終端までの待ちで、そのぶん M2 が伸びる**（詳細設計書 §10）。
+        //    認識器がストリームを閉じ忘れた場合の安全弁は締め切りが担う。
         scheduleFinalDeadline(at: textDeadline)
         await awaitFinalSettled()
 
         let finalize = ContinuousClock.now - releasedAt
         // 確定が来なかった場合だけ暫定テキストへ縮退する。空で捨てるよりは残す。
-        //
-        // **ここが V-12 の欠陥の場所である**（詳細設計書 §13 / §10 の M2）。
-        // 上の待ちは「解放以降の**最初の**確定」で解け、`latestFinal` はここで
-        // `await` を挟まず同期的に読む。**その後に届いた確定は積まれても二度と読まれない。**
-        //
-        // **これは実機の肉声で再現した（2026-08-14）。** 121 字・区切りの多い発話で
-        // **末尾 約 38 字が失われた**（要件定義書 §2.8.4）。合成音声 103 秒で
-        // 解放後の確定が 1 件だったのは、**危険な条件が起きなかっただけ**である。
-        // **発話を失う欠陥として、フェーズ 2 で塞ぐ。**
-        // 録音中に届く確定は落ちない（`apply` が積むだけで先へ進まない）。
         let raw = (latestFinal.isEmpty ? latestVolatile : latestFinal)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -716,7 +728,6 @@ public actor DictationSession {
         finalDeadlineTask?.cancel()
         finalDeadlineTask = nil
         collectTask = nil
-        isAwaitingFinal = false
         isCancelRequested = false
         phase = .idle
         emit(.idle)

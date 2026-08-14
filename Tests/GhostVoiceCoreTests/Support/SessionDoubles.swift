@@ -46,6 +46,24 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
         /// `emit(.recording(...))` する）。実機では `begin()` の費用がこの窓で、
         /// 起動後の最初の 1 発話は実測 44〜540 ms かかる（詳細設計書 §10）。
         var beginDelay: Duration = .zero
+        /// **キー解放後に届く 2 件目の確定**（V-12）。nil なら 1 件だけ。
+        ///
+        /// 実機の肉声ではこれが起きて末尾 約 38 字が失われた（要件定義書 §2.8.4）。
+        /// 合成音声 103 秒では起きなかったので、**実音声に頼る検査では駆動できない。**
+        var secondFinalText: String?
+        /// 1 件目の確定から `secondFinalText` を流すまでの間隔。
+        ///
+        /// **0 にしてはならない。** 0 だと 2 件目が「1 件目で解けた待ちが後段へ
+        /// 戻る前」に積まれてしまい、**欠陥のある実装でもたまたま拾えてしまう。**
+        /// 後段が確実に `latestFinal` を読み終える程度に離す。
+        var secondFinalDelay: Duration = .zero
+        /// 結果ストリームを `finish()` が返るより**前**に終端するか。
+        ///
+        /// 実機の順序はこちらである（`finish()` は入力を閉じてから
+        /// `finalizeAndFinishThroughEndOfInput()` を待つ。§4.3.1）。
+        /// **後段が「`finish()` の復帰」ではなく「ストリームの終端」で進むこと**を
+        /// 検査するには、この 2 つを別々の時刻に置ける代役が要る。
+        var endsStreamBeforeReturning = false
     }
 
     private let script: Script
@@ -137,11 +155,23 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
             return state.continuation
         }
         if script.emitsFinal { continuation?.yield(.final(script.finalText)) }
-        if script.finishDelay > .zero { try? await Task.sleep(for: script.finishDelay) }
-        if script.finishesStream {
-            continuation?.finish()
-            state.withLock { $0.continuation = nil }
+        // **2 件目の確定。** 実機ではこれが 1 件目より後に届いて末尾が失われた（V-12）。
+        if let second = script.secondFinalText {
+            if script.secondFinalDelay > .zero {
+                try? await Task.sleep(for: script.secondFinalDelay)
+            }
+            continuation?.yield(.final(second))
         }
+        if script.finishesStream, script.endsStreamBeforeReturning { closeStream(continuation) }
+        if script.finishDelay > .zero { try? await Task.sleep(for: script.finishDelay) }
+        if script.finishesStream, !script.endsStreamBeforeReturning { closeStream(continuation) }
+    }
+
+    private func closeStream(
+        _ continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
+    ) {
+        continuation?.finish()
+        state.withLock { $0.continuation = nil }
     }
 }
 
