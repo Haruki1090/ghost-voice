@@ -131,6 +131,50 @@ private func makePlainPort() -> CFMachPort? {
     return CFMachPortCreate(kCFAllocatorDefault, { _, _, _, _ in }, &context, nil)
 }
 
+/// **この機体はタップを有効化できるか（＝キーイベント監視の権限があるか）。**
+///
+/// `CGEvent.h` は「Taps are normally enabled when created.」と定めており、
+/// **「生成できたのに無効」は権限が無いことの副作用であって OS の仕様ではない。**
+/// 権限のある機体では `.listenOnly` のタップが生成直後から有効になるため、
+/// その状況を本物で作れない。作れるかどうかをここで判定する。
+private func canOpenEnabledTap() -> Bool {
+    guard let tap = makeRealButDisabledTap() else { return false }
+    defer { CFMachPortInvalidate(tap) }
+    return CGEvent.tapIsEnabled(tap: tap)
+}
+
+/// テスト用のランループ。**プロセス共有のメインランループを触らない。**
+///
+/// 起動の成功経路は `CFRunLoopAddSource` でランループを書き換える。メインの
+/// ランループへ入れると、並列に走る他スイートと共有の資源を奪い合うことになる。
+///
+/// - Important: **`CFRunLoopGetCurrent()` を使ってはならない。** テストは協調
+///   スレッドプール上で走るため、**スレッドが消えるとそのランループも消える。**
+///   あとから `deinit` 経由で `CFRunLoopRemoveSource` すると落ちる
+///   （ミューテーションテストで実際に SIGSEGV を踏んで気付いた）。
+///   専用スレッドを 1 本立てて、プロセスの間ずっと生かしておく。
+///   ランループを回す必要は無い。source の出し入れは停止中のランループでも安全である。
+private struct RunLoopBox: @unchecked Sendable { var runLoop: CFRunLoop? }
+
+private nonisolated(unsafe) let sharedTestRunLoop: CFRunLoop = {
+    let ready = DispatchSemaphore(value: 0)
+    let box = UnsafeMutablePointer<RunLoopBox>.allocate(capacity: 1)
+    box.initialize(to: RunLoopBox(runLoop: nil))
+
+    let thread = Thread {
+        box.pointee.runLoop = CFRunLoopGetCurrent()
+        ready.signal()
+        // このスレッドが生きている限り、上のランループは有効なまま残る。
+        while true { Thread.sleep(forTimeInterval: 3600) }
+    }
+    thread.name = "GhostVoiceTests.HotkeyRunLoop"
+    thread.start()
+    ready.wait()
+    return box.pointee.runLoop!
+}()
+
+private func testRunLoop() -> CFRunLoop { sharedTestRunLoop }
+
 /// 生成だけを差し替え、有効化の可否は**本物の CoreGraphics に委ねる**。
 /// 「OS が有効化を拒む」挙動を偽物で作らずに検査するために使う。
 private struct FixedPortTapController: EventTapControlling {
@@ -188,6 +232,44 @@ private final class StubEventTapController: EventTapControlling, @unchecked Send
 /// タップを開けない機体を模す（`create` が nil を返す）。
 private func deniedController() -> StubEventTapController {
     StubEventTapController(port: nil)
+}
+
+/// `create` の**最中に**割り込みを走らせる差し替え。
+///
+/// 本物の `tapCreate` は実測で約 40 ms 掛かる。その窓で `stop()` が走る競合を
+/// 偶然に頼らず再現するために、`create` の中から任意の処理を呼べるようにする。
+private final class InterruptingTapController: EventTapControlling, @unchecked Sendable {
+    private let port: CFMachPort?
+    private let lock = NSLock()
+    private var duringCreate: (@Sendable () -> Void)?
+    private var calls: [Bool] = []
+
+    init(port: CFMachPort?) { self.port = port }
+
+    var enableCalls: [Bool] { lock.withLock { calls } }
+
+    /// `create` の中で一度だけ呼ばれる処理を仕込む。
+    func interrupt(with body: @escaping @Sendable () -> Void) {
+        lock.withLock { duringCreate = body }
+    }
+
+    func create(
+        mask: CGEventMask, callback: CGEventTapCallBack, userInfo: UnsafeMutableRawPointer?
+    ) -> CFMachPort? {
+        let body = lock.withLock { () -> (@Sendable () -> Void)? in
+            defer { duringCreate = nil }
+            return duringCreate
+        }
+        body?()
+        return port
+    }
+
+    func setEnabled(_ tap: CFMachPort, _ enabled: Bool) {
+        lock.withLock { calls.append(enabled) }
+    }
+
+    /// 有効化には常に成功したことにする（競合の検査に集中する）。
+    func isEnabled(_ tap: CFMachPort) -> Bool { true }
 }
 
 // MARK: - 判定ロジック（権限不要）
@@ -505,6 +587,48 @@ struct HotkeyDecisionNonModifierTests {
         }
     }
 
+    /// **PTT に割り当てた打鍵は挿入先アプリへ渡さない。**
+    /// 既定の Undo と同じ ⌃⌘Z を PTT にしたユーザーが、喋るたびに
+    /// 挿入先アプリで Undo / Redo を走らせることになる。
+    @Test("PTT の打鍵は抑止する（押下・キーリピート・解放）")
+    func nonModifierPttKeystrokesAreSuppressed() {
+        let modifiers: CGEventFlags = [.maskControl, .maskCommand]
+
+        let (pressed, downSuppress) = HotkeyDecision.decide(
+            type: .keyDown, keyCode: 0x06, flags: modifiers, binding: ptt, isRecording: false
+        )
+        #expect(pressed == .pressed)
+        #expect(downSuppress, "PTT の押下が挿入先アプリへ漏れている")
+
+        let (_, repeatSuppress) = HotkeyDecision.decide(
+            type: .keyDown, keyCode: 0x06, flags: modifiers, binding: ptt, isRecording: true
+        )
+        #expect(repeatSuppress, "キーリピートが挿入先アプリへ漏れている")
+
+        let (released, upSuppress) = HotkeyDecision.decide(
+            type: .keyUp, keyCode: 0x06, flags: modifiers, binding: ptt, isRecording: true
+        )
+        #expect(released == .released)
+        #expect(upSuppress, "PTT の解放が挿入先アプリへ漏れている")
+    }
+
+    /// **抑止するのは PTT として消費した打鍵だけ。**
+    /// 修飾キーが揃っていない打鍵はユーザーが普通に文字を打っているので、
+    /// 抑止すると**そのキーが打てなくなる。**
+    @Test("修飾キーが揃っていない打鍵は抑止しない")
+    func plainKeystrokeIsNotSuppressed() {
+        let (_, downSuppress) = HotkeyDecision.decide(
+            type: .keyDown, keyCode: 0x06, flags: [], binding: ptt, isRecording: false
+        )
+        #expect(!downSuppress, "ただの Z が打てなくなっている")
+
+        // 押下を通したのに keyUp だけ消すと、下流アプリのキー状態が狂う。
+        let (_, upSuppress) = HotkeyDecision.decide(
+            type: .keyUp, keyCode: 0x06, flags: [], binding: ptt, isRecording: false
+        )
+        #expect(!upSuppress)
+    }
+
     /// 押しっぱなしのキーリピートで pressed を撒き散らさない。
     @Test("キーリピートの keyDown では pressed を二度出さない")
     func nonModifierRepeatDoesNotRepress() {
@@ -547,7 +671,7 @@ struct StubHotkeyMonitorTests {
 
 // MARK: - CGEventTapHotkeyMonitor（権限が無くても検査できる範囲）
 
-@Suite("CGEventTapHotkeyMonitor の起動")
+@Suite("CGEventTapHotkeyMonitor の起動", .serialized)
 struct CGEventTapHotkeyMonitorStartTests {
 
     /// タップを開けないとき、**黙って死んだ監視器を返してはならない。**
@@ -576,11 +700,21 @@ struct CGEventTapHotkeyMonitorStartTests {
     /// **生成できたことは動くことを意味しない。** `.listenOnly` は権限が無くても
     /// 非 nil を返すが、そのタップは恒久的に無効で 1 件もイベントを配送しない。
     /// ここで弾かないと「start に成功したのにホットキーが効かない」になる。
-    @Test("生成できても有効化できないタップは tapDisabledAtStart を投げる")
+    ///
+    /// **権限のある機体では実行できない。** `CGEvent.h` の
+    /// 「Taps are normally enabled when created.」のとおり、権限があれば
+    /// `.listenOnly` のタップは生成直後から有効になり、「生成できたのに無効」を
+    /// 本物で作れないためである（偽物で作ると OS の挙動を検査したことにならない）。
+    /// V-4 を回す機体ではこのテストは skip される。
+    @Test(
+        "生成できても有効化できないタップは tapDisabledAtStart を投げる",
+        .enabled(if: !canOpenEnabledTap(), "権限がある機体では本物の無効なタップを作れない")
+    )
     func throwsWhenTapCannotBeEnabled() throws {
         let disabled = try #require(
             makeRealButDisabledTap(), "OS が無効なタップを返さなくなった。前提が変わっている"
         )
+        defer { CFMachPortInvalidate(disabled) }
         #expect(!CGEvent.tapIsEnabled(tap: disabled), "このタップは無効であるはず")
 
         let box = TapBox(port: disabled)
@@ -588,12 +722,57 @@ struct CGEventTapHotkeyMonitorStartTests {
             binding: .rightOption,
             listenAccessProbe: { false },
             accessibilityProbe: { false },
-            tapController: FixedPortTapController(port: box)
+            tapController: FixedPortTapController(port: box),
+            runLoop: testRunLoop()
         )
+        // 万一 start が成功しても、タップをランループに置き去りにしない。
+        defer { monitor.stop() }
 
         #expect(throws: HotkeyError.tapDisabledAtStart) {
             try monitor.start()
         }
+    }
+
+    /// 有効化できなかったタップは、**無効化してから**捨てる。
+    /// `stop()` と同じ順（無効化 → invalidate）に揃える。
+    @Test("有効化できなかったタップは無効化してから捨てる")
+    func failedTapIsDisabledBeforeDiscard() throws {
+        let port = try #require(makePlainPort())
+        // OS が有効化を拒む機体を模す。
+        let controller = StubEventTapController(port: port, canEnable: false)
+        let monitor = CGEventTapHotkeyMonitor(
+            binding: .rightOption,
+            listenAccessProbe: { false },
+            accessibilityProbe: { false },
+            tapController: controller,
+            runLoop: testRunLoop()
+        )
+        defer { monitor.stop() }
+
+        #expect(throws: HotkeyError.tapDisabledAtStart) { try monitor.start() }
+        #expect(controller.enableCalls == [true, false], "無効化せずに捨てている")
+    }
+
+    /// **無効なポートからはランループソースを作れない。**
+    /// `CFMachPortCreateRunLoopSource` は `CFRunLoopSource!`（暗黙アンラップ）を返すので、
+    /// nil をそのまま `CFRunLoopAddSource` へ流すと**プロセスごと落ちる。**
+    /// 常駐アプリのクラッシュは沈黙した失敗より悪い。エラーとして返すこと。
+    @Test("ランループソースを作れないポートでも落ちずに投げる")
+    func invalidPortThrowsInsteadOfCrashing() throws {
+        let port = try #require(makePlainPort())
+        CFMachPortInvalidate(port)  // ソースを作れない状態にする
+
+        let monitor = CGEventTapHotkeyMonitor(
+            binding: .rightOption,
+            listenAccessProbe: { false },
+            accessibilityProbe: { false },
+            tapController: StubEventTapController(port: port),
+            runLoop: testRunLoop()
+        )
+        defer { monitor.stop() }
+
+        #expect(throws: HotkeyError.tapDisabledAtStart) { try monitor.start() }
+        #expect(!monitor.isActive)
     }
 
     /// 二重起動はタップを二枚開いて解放を取りこぼす。黙って許してはならない。
@@ -650,7 +829,8 @@ struct CGEventTapHotkeyMonitorStartTests {
             binding: .rightOption,
             listenAccessProbe: { false },
             accessibilityProbe: { false },
-            tapController: controller
+            tapController: controller,
+            runLoop: testRunLoop()
         )
         defer { monitor.stop() }
 
@@ -670,7 +850,8 @@ struct CGEventTapHotkeyMonitorStartTests {
             binding: .rightOption,
             listenAccessProbe: { false },
             accessibilityProbe: { false },
-            tapController: controller
+            tapController: controller,
+            runLoop: testRunLoop()
         )
 
         try monitor.start()
@@ -679,6 +860,82 @@ struct CGEventTapHotkeyMonitorStartTests {
         // 停止では無効化する。有効なまま放置するとイベントを掴んだままになる。
         monitor.stop()
         #expect(controller.enableCalls == [true, false])
+    }
+
+    /// **`stop()` を呼ばずに解放しても落ちない。**
+    ///
+    /// タップは `Unmanaged.passUnretained(self)` で `self` を retain せずに
+    /// 参照している。`deinit` で無効化し損ねると、解放済みのインスタンスへ
+    /// コールバックが飛ぶ。アプリ終了時に必ず通る経路である。
+    @Test("start に成功したまま解放しても落ちない")
+    func deinitAfterSuccessfulStartIsSafe() throws {
+        let port = try #require(makePlainPort())
+        do {
+            let monitor = CGEventTapHotkeyMonitor(
+                binding: .rightOption,
+                listenAccessProbe: { false },
+                accessibilityProbe: { false },
+                tapController: StubEventTapController(port: port),
+                runLoop: testRunLoop()
+            )
+            try monitor.start()
+            #expect(monitor.isActive)
+            // stop() を呼ばずにスコープを抜ける（deinit に任せる）
+        }
+        // ここまで来れば deinit が例外なく走っている。
+        #expect(Bool(true))
+    }
+
+    /// **`start()` の最中に `stop()` が走っても、`.stopped` を巻き戻さない。**
+    ///
+    /// `create` は実測で約 40 ms 掛かる。その間 `tap` はまだ nil なので、割り込んだ
+    /// `stop()` は破棄すべきタップを見つけられずに終わっている。ここで `.running` へ
+    /// 巻き戻すと、**誰にも参照されない有効なタップがランループに残り、監視器は
+    /// `.running` を名乗るのにストリームは終端済み**という沈黙した失敗になる。
+    @Test("start の最中に stop が走ったら stopped を投げ、タップを残さない")
+    func stopDuringStartDoesNotResurrect() async throws {
+        let port = try #require(makePlainPort())
+        let controller = InterruptingTapController(port: port)
+        let monitor = CGEventTapHotkeyMonitor(
+            binding: .rightOption,
+            listenAccessProbe: { false },
+            accessibilityProbe: { false },
+            tapController: controller,
+            runLoop: testRunLoop()
+        )
+        // タップ生成の「最中」に停止が割り込む。
+        controller.interrupt { monitor.stop() }
+
+        #expect(throws: HotkeyError.stopped) { try monitor.start() }
+
+        // 生成してしまったタップは、こちらの責任で無効化して捨てる。
+        #expect(controller.enableCalls.contains(false), "生成したタップを無効化していない")
+        #expect(!monitor.isActive, ".running を名乗っている")
+
+        // 終端したストリームを持つ監視器を、黙って再起動させない。
+        #expect(throws: HotkeyError.stopped) { try monitor.start() }
+
+        let drained = await drain(monitor.events)
+        #expect(drained.finished)
+    }
+
+    /// 失敗した `start()` の後始末が `.stopped` を `.idle` へ巻き戻さないこと。
+    /// 巻き戻すと以後の `start()` が成功し、終端済みのストリームを持つ監視器を返す。
+    @Test("start が失敗する最中に stop が走っても、あとの start は stopped を投げる")
+    func stopDuringFailingStartKeepsStopped() {
+        let controller = InterruptingTapController(port: nil)  // create は nil を返す
+        let monitor = CGEventTapHotkeyMonitor(
+            binding: .rightOption,
+            listenAccessProbe: { false },
+            accessibilityProbe: { false },
+            tapController: controller,
+            runLoop: testRunLoop()
+        )
+        controller.interrupt { monitor.stop() }
+
+        #expect(throws: HotkeyError.self) { try monitor.start() }
+        // .idle へ戻していたら、ここが成功してしまう。
+        #expect(throws: HotkeyError.stopped) { try monitor.start() }
     }
 
     /// **`stop()` はストリームを終端しなければならない。** 終端しないと、
@@ -690,7 +947,8 @@ struct CGEventTapHotkeyMonitorStartTests {
             binding: .rightOption,
             listenAccessProbe: { false },
             accessibilityProbe: { false },
-            tapController: StubEventTapController(port: port)
+            tapController: StubEventTapController(port: port),
+            runLoop: testRunLoop()
         )
         try monitor.start()
         _ = monitor.handle(
@@ -829,10 +1087,16 @@ struct CGEventTapHotkeyMonitorHandleTests {
     }
 
     @Test("録音していないときの ESC は素通しする")
-    func escapePassesThroughWhenIdle() {
+    func escapePassesThroughWhenIdle() async {
         let monitor = makeMonitor()
         let escape = makeEvent(keyCode: 0x35, flags: [])
         #expect(monitor.handle(type: .keyDown, event: escape) != nil)
+
+        // 素通しに加えて、誰も録音していないのにイベントを流していないこと。
+        monitor.stop()
+        let drained = await drain(monitor.events)
+        #expect(drained.finished)
+        #expect(drained.events.isEmpty, "録音していないのにイベントが流れている")
     }
 
     /// 中断のあとは録音していない状態に戻る。戻らないと次の押下が無視される。
@@ -894,6 +1158,36 @@ struct CGEventTapHotkeyMonitorHandleTests {
         let drained = await drain(monitor.events)
         #expect(drained.finished, "stop したのにストリームが終端していない")
         #expect(drained.events.isEmpty)
+    }
+
+    /// **`.tapDisabledByUserInput` は「無効化が要求された」という意味である**
+    /// （`CGEvent.h`: "or a user requests taps be disabled"）。
+    /// 張り直すのは要求を無視して蘇ることなので行わない。
+    @Test("tapDisabledByUserInput では再有効化しない")
+    func doesNotReEnableOnUserInput() async {
+        let monitor = makeMonitor()
+        _ = monitor.handle(
+            type: .flagsChanged,
+            event: makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption))
+        )
+        _ = monitor.handle(type: .tapDisabledByUserInput, event: makeEvent(keyCode: 0, flags: []))
+
+        #expect(monitor.reEnableAttempts == 0, "要求を無視してタップを蘇らせている")
+        // 取りこぼした解放の代わりに中断は出す。出さないと録音が終わらない。
+        let events = await collect(monitor.events, count: 2)
+        #expect(events == [.pressed, .cancelled])
+    }
+
+    /// **無制限に張り直すと、無効化と `.cancelled` の応酬が止まらなくなる。**
+    /// `events` は無制限バッファなので、際限なく積み上がる。
+    @Test("再有効化には上限があり、超えたら諦める")
+    func reEnableIsBounded() {
+        let monitor = makeMonitor()
+        let notice = makeEvent(keyCode: 0, flags: [])
+        for _ in 0..<(CGEventTapHotkeyMonitor.maxReEnableAttempts + 5) {
+            _ = monitor.handle(type: .tapDisabledByTimeout, event: notice)
+        }
+        #expect(monitor.reEnableAttempts == CGEventTapHotkeyMonitor.maxReEnableAttempts)
     }
 
     /// **停止したあとに再有効化してはならない。** 止めたはずのタップが蘇る。

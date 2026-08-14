@@ -38,7 +38,10 @@ public enum HotkeyError: Error, Equatable, Sendable {
     /// **要求したマスクから該当ビットが落とされ、空になった時点で NULL が返る。**
     /// つまり nil は「権限が無い」の権威ある答えであり、事前照会より信用できる。
     case eventTapNotPermitted(TapPermissionSnapshot)
-    /// タップは生成できたが有効化できなかった。**この状態のタップは 1 件も配送しない。**
+    /// タップは生成できたが、使える状態にならなかった。
+    ///
+    /// 有効化できなかった場合（**この状態のタップは 1 件も配送しない**）と、
+    /// ランループソースを作れなかった場合（無効な `CFMachPort` を渡された）を含む。
     case tapDisabledAtStart
     case alreadyRunning
     /// `stop()` 済みの監視器を再起動しようとした。ストリームは終端済みで復活しない。
@@ -91,27 +94,46 @@ public enum HotkeyDecision {
     ) -> (event: HotkeyEvent?, suppress: Bool) {
 
         let isDown: Bool
+        /// この打鍵を PTT として消費したか（＝挿入先アプリへ渡さないか）。
+        let consumed: Bool
 
         if binding.isModifierOnly {
             // 修飾キーは keyDown / keyUp を出さない。flagsChanged だけが手掛かり。
             guard type == .flagsChanged else { return (nil, false) }
             isDown = isModifierDown(keyCode: binding.keyCode, flags: flags, binding: binding)
+
+            // **修飾キーの flagsChanged は決して抑止しない。**
+            // 抑止すると下流アプリが修飾状態を見失い、⌥+矢印などが壊れる。
+            // 右 Option 単独の押下はほとんどのアプリで無害である（設計書 §2.4）。
+            consumed = false
         } else {
             // **修飾キー以外は flagsChanged を出さない。** keyUp を見なければ
             // 解放を検出できず、録音が永遠に終わらない。
+            //
+            // **そしてこちらは抑止する。** 修飾キーを抑止しない理由（下流が修飾状態を
+            // 見失う）は文字キーには当てはまらない。抑止しないと、たとえば既定の
+            // Undo と同じ ⌃⌘Z を PTT に割り当てたユーザーは、喋るたびに挿入先アプリで
+            // Undo / Redo を走らせることになる。**ユーザーが PTT として割り当てた打鍵は
+            // PTT だけのものである。**
             switch type {
-            case .keyDown: isDown = flags.contains(binding.modifiers.cgEventFlags)
-            case .keyUp: isDown = false
-            default: return (nil, false)
+            case .keyDown:
+                isDown = flags.contains(binding.modifiers.cgEventFlags)
+                // 修飾キーが揃っていなければ、ユーザーはただ文字を打っている。通す。
+                consumed = isDown
+            case .keyUp:
+                isDown = false
+                // 押下を消費していたなら、対になる keyUp も消費する。
+                // 押下を通したのに keyUp だけ消すと、下流アプリのキー状態が狂う。
+                consumed = isRecording
+            default:
+                return (nil, false)
             }
         }
 
-        // 修飾キーの flagsChanged は決して抑止しない。
-        // 抑止すると下流アプリが修飾状態を見失い、⌥+矢印などが壊れる。
         switch (isDown, isRecording) {
-        case (true, false): return (.pressed, false)
-        case (false, true): return (.released, false)
-        default: return (nil, false)
+        case (true, false): return (.pressed, consumed)
+        case (false, true): return (.released, consumed)
+        default: return (nil, consumed)
         }
     }
 

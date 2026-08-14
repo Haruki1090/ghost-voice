@@ -116,29 +116,51 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     private let accessibilityProbe: @Sendable () -> Bool
     private let tapController: any EventTapControlling
 
-    /// 下の 4 つを守る。**`tap` と `runLoopSource` も含める。**
+    /// タップを張るランループ。**本番は必ずメインのランループである。**
+    /// テストがプロセス共有のメインランループを触らずに済むよう差し替え口にしてある。
+    private let runLoop: CFRunLoop
+
+    /// 応答しないタップを張り直す上限。
+    ///
+    /// 無制限に張り直すと、無効化と `.cancelled` の応酬が止まらなくなる。
+    static let maxReEnableAttempts = 10
+
+    /// 下の 5 つを守る。**`tap` と `runLoopSource` も含める。**
     /// コールバックはランループのスレッドから、`start` / `stop` は別のスレッドから来る。
     private let lock = NSLock()
     private var phase: Phase = .idle
     private var isRecording = false
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    /// タップが無効化され、張り直さないと決めた。以後ホットキーは反応しない。
+    private var tapDead = false
 
     private let reEnables = Atomic<Int>(0)
 
     /// タップの再有効化を試みた回数。テストからの観測用。
     var reEnableAttempts: Int { reEnables.load(ordering: .relaxed) }
 
+    /// タップが張られていて、まだ生きているか。
+    ///
+    /// **`start()` が成功しても、あとで無効化されて false になりうる**
+    /// （`handleTapDisabled`）。ホットキーが黙って効かなくなる唯一の経路なので、
+    /// Task 10 / 11 はここを見てユーザーへ知らせること。
+    public var isActive: Bool {
+        lock.withLock { phase == .running && !tapDead }
+    }
+
     public init(
         binding: HotkeyBinding,
         listenAccessProbe: @escaping @Sendable () -> Bool = { CGPreflightListenEventAccess() },
         accessibilityProbe: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
-        tapController: any EventTapControlling = SystemEventTapController()
+        tapController: any EventTapControlling = SystemEventTapController(),
+        runLoop: CFRunLoop = CFRunLoopGetMain()
     ) {
         self.binding = binding
         self.listenAccessProbe = listenAccessProbe
         self.accessibilityProbe = accessibilityProbe
         self.tapController = tapController
+        self.runLoop = runLoop
         (events, continuation) = AsyncStream<HotkeyEvent>.makeStream()
     }
 
@@ -183,8 +205,13 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         } catch {
             // **失敗しても .idle へ戻す。** 権限を与えたユーザーが
             // もう一度試せなくなるのは、権限フローとして成立しない。
+            //
+            // ただし**割り込んだ `stop()` が付けた `.stopped` は巻き戻さない。**
+            // 巻き戻すと以後の `start()` が成功してしまい、終端済みのストリームを
+            // 持つ監視器を黙って返すことになる（`startAfterStopThrows` が
+            // 守ろうとしている不変条件が、まさにこの経路で破れる）。
             lock.lock()
-            phase = .idle
+            if phase == .starting { phase = .idle }
             lock.unlock()
             throw error
         }
@@ -209,14 +236,36 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         tapController.setEnabled(created, true)
         guard tapController.isEnabled(created) else {
             // 生成できたのに無効。このまま返すと沈黙した失敗になる。
+            // 破棄の手順は `stop()` と同じ順（無効化 → invalidate）に揃える。
+            tapController.setEnabled(created, false)
             CFMachPortInvalidate(created)
             throw HotkeyError.tapDisabledAtStart
         }
 
-        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, created, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        // **`CFRunLoopSource!` は暗黙アンラップである。** 無効な `CFMachPort` を渡すと
+        // nil が返り、そのまま `CFRunLoopAddSource` へ流すと**プロセスごと落ちる。**
+        // 常駐アプリのクラッシュは沈黙した失敗より悪い。エラーとして返す。
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, created, 0) else {
+            tapController.setEnabled(created, false)
+            CFMachPortInvalidate(created)
+            throw HotkeyError.tapDisabledAtStart
+        }
+        CFRunLoopAddSource(runLoop, source, .commonModes)
 
+        // **`stop()` がここまでの間に走っていたかを確かめる。**
+        // `create` は実測で約 40 ms 掛かる。その間 `tap` はまだ nil なので、
+        // 割り込んだ `stop()` は破棄すべきタップを見つけられずに終わっている。
+        // ここで `.running` へ巻き戻すと、**誰にも参照されない有効なタップが
+        // run loop に残り、監視器は `.running` を名乗るのにストリームは終端済み**
+        // という、`.listenOnly` と同じ形の沈黙した失敗になる。後始末はこちらの責任。
         lock.lock()
+        guard phase != .stopped else {
+            lock.unlock()
+            tapController.setEnabled(created, false)
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFMachPortInvalidate(created)
+            throw HotkeyError.stopped
+        }
         tap = created
         runLoopSource = source
         phase = .running
@@ -241,7 +290,7 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
             CFMachPortInvalidate(currentTap)
         }
         if let source {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
         }
         if !wasStopped { continuation.finish() }
     }
@@ -259,7 +308,7 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
 
         // **キーイベントではない通知が来る。** ここでキーコードを読むと無意味な値になる。
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            return handleTapDisabled(event)
+            return handleTapDisabled(type: type, event: event)
         }
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
@@ -281,26 +330,59 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         return decision.suppress ? nil : Unmanaged.passUnretained(event)
     }
 
-    /// **タップは重い処理をすると OS に無効化される**（`kCGEventTapDisabledByTimeout`）。
+    /// タップが無効化されたときの通知。**2 種類あり、意味が違う。**
     ///
-    /// 放置すると**ホットキーが二度と反応しない。** アプリは生きたままなので
-    /// ユーザーからは原因が判らない。再有効化する。
+    /// `CGEvent.h` はこう定めている。
+    ///
+    /// > Taps are normally enabled when created. **If a tap becomes unresponsive or
+    /// > a user requests taps be disabled**, an appropriate `kCGEventTapDisabled...`
+    /// > event is passed to the registered `CGEventTapCallBack` function.
+    ///
+    /// | 通知 | 意味 | 扱い |
+    /// |---|---|---|
+    /// | `.tapDisabledByTimeout` | タップが応答しなくなった | **再有効化する**（上限あり） |
+    /// | `.tapDisabledByUserInput` | **無効化が要求された** | **再有効化しない** |
+    ///
+    /// - `byTimeout` を放置すると**ホットキーが二度と反応しない。** アプリは
+    ///   生きたままなのでユーザーからは原因が判らない。だから張り直す。
+    /// - `byUserInput` を張り直すのは**要求を無視して蘇ること**なので行わない。
+    ///
+    /// **どちらも無制限には扱わない。** 原因不明の連続無効化に対して張り直し続けると、
+    /// 無効化と `.cancelled` の応酬が止まらなくなる（`events` は無制限バッファである）。
+    /// `maxReEnableAttempts` 回で諦め、`isActive` が false になる。
     ///
     /// 無効化されていた間に PTT キーの解放を取りこぼしている可能性があるため、
     /// 録音中だったなら `.cancelled` を出す。**出さないと録音が終わらない状態で固まる。**
-    private func handleTapDisabled(_ event: CGEvent) -> Unmanaged<CGEvent>? {
+    ///
+    /// - Important: 諦めた場合、**ホットキーは以後反応しない。** 監視器を作り直す以外に
+    ///   復帰の手立ては無い。Task 10 / 11 は `isActive` を見てユーザーへ知らせること。
+    private func handleTapDisabled(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         lock.lock()
-        let stopped = (phase == .stopped)
         let currentTap = tap
         let wasRecording = isRecording
-        if !stopped { isRecording = false }
+        var shouldReEnable = false
+
+        // **停止済みなら何もしない。** 自分で止めたタップを蘇らせてはならない。
+        // `stop()` はロック下で `phase = .stopped` と `isRecording = false` を先に
+        // 済ませてから `setEnabled(false)` を呼ぶので、その無効化に由来する通知が
+        // ここへ来ても必ずこの分岐で止まる。
+        if phase != .stopped {
+            isRecording = false
+            if type == .tapDisabledByUserInput {
+                // 無効化が要求された。蘇らせない。
+                tapDead = true
+            } else if reEnables.load(ordering: .relaxed) >= Self.maxReEnableAttempts {
+                tapDead = true
+            } else {
+                shouldReEnable = true
+            }
+        }
         lock.unlock()
 
-        // 自分で止めたタップを蘇らせない。
-        guard !stopped else { return Unmanaged.passUnretained(event) }
-
-        reEnables.add(1, ordering: .relaxed)
-        if let currentTap { tapController.setEnabled(currentTap, true) }
+        if shouldReEnable {
+            reEnables.add(1, ordering: .relaxed)
+            if let currentTap { tapController.setEnabled(currentTap, true) }
+        }
         if wasRecording { continuation.yield(.cancelled) }
         return Unmanaged.passUnretained(event)
     }
