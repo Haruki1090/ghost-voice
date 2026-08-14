@@ -88,7 +88,7 @@ swift build -c release
 | `localeIdentifier` | `ja-JP` | 認識言語 |
 | `transcriberKind` | `dictation` | `dictation` / `speech`。日本語では `dictation` が優位（実測 CER 3.02 % 対 3.21 %） |
 | `refinementEnabled` | `true` | LLM 整形の有効化 |
-| `refinementTimeoutMs` | `750` | **整形の打ち切り時間。目標値（NFR-P4 の 500 ms）とは別の数**（詳細設計書 §10） |
+| `refinementTimeoutMs` | `750` | **整形の打ち切り時間。目標値（NFR-P4 の 500 ms）とは別の数**（詳細設計書 §10）。**実機では 40 字以上の発話が 8 件中 8 件この時間で打ち切られ、生テキストのまま挿入された**（要件定義書 §2.8.4）。**長い発話でも整形したいなら、この値を上げること**（NFR-P6 の 1 秒は超える） |
 | `historyLimit` | `50` | 履歴の保持件数 |
 
 固有名詞は `vocabulary.json` に登録すると整形時に補正される。
@@ -220,7 +220,8 @@ swift build
 
 ```bash
 # 直近の挿入経路を見る
-python3 -c "import json,pathlib;d=json.loads(pathlib.Path.home().joinpath('Library/Application Support/GhostVoice/history.json').read_text());print(d[-1]['insertionMethod'], repr(d[-1]['refinedText'] or d[-1]['rawText']))"
+# **最新は d[0] である。** HistoryStore.append は先頭挿入なので、d[-1] は最古を指す。
+python3 -c "import json,pathlib;d=json.loads(pathlib.Path.home().joinpath('Library/Application Support/GhostVoice/history.json').read_text());e=d[0];print(e['insertionMethod'], '整形:', 'あり' if e.get('refinedText') else 'なし（打ち切り）', repr(e.get('refinedText') or e['rawText']))"
 ```
 
 | アプリ | 挿入できたか | 経路（`insertionMethod`） | 備考 |
@@ -251,10 +252,15 @@ python3 -c "import json,pathlib;d=json.loads(pathlib.Path.home().joinpath('Libra
 2. **`[metrics]` の `insert`。** Pasteboard 経路では復元待ち 120 ms が乗るので、
    AX 経路（0.1〜5.5 ms）とは桁が変わる。**これは劣化ではなく、測っている量が変わっただけである**
    （Task 10 申し送り【2】）。`total` が 1000 ms（NFR-P6）に収まるかを見る
-3. **長い発話（20 秒程度、区切りを多く入れる）を 1 回。** キー解放後に確定が 2 回届くと
-   **2 件目は読まれずに落ちる**（V-12。この経路は今も残っている）。合成音声 103 秒では
-   その条件が**起きなかった**だけなので、ここで見たいのは**肉声**での再現。
-   落ちたら詳細設計書 §10 の M2 の定義から見直す
+3. **長い発話での末尾の欠落（V-12。実機で再現済み）。** キー解放後に確定が 2 回届くと
+   **2 件目は読まれずに落ちる。2026-08-14 の実機で、121 字の発話の末尾 約 38 字が
+   失われた**（要件定義書 §2.8.4）。**再現の有無ではなく、どの長さ・どの話し方で
+   起きるかを見る。** `[録音中]` の暫定表示の末尾と、挿入されたテキストの末尾を
+   突き合わせること（履歴の `rawText` でも見られる）
+4. **整形が効いたかどうか（実機で 40 字以上は 8 件中 0 件）。** 履歴の `refinedText` が
+   無ければ打ち切られている。**発話の長さと `refine` の実測を組にして記録する**——
+   打ち切り 750 ms は 3 秒の合成発話で決めた値で、実用の発話長では足りない
+   （要件定義書 §2.8.4）。フェーズ 2 の判断材料になる
 
 **結果の記入先**: 詳細設計書 §11.3 の表（V-3）、上の表（V-4）、§13 と要件定義書 §7 の状況欄。
 
