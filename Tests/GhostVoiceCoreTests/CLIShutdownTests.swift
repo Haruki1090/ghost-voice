@@ -137,13 +137,24 @@ struct CLIShutdownTests {
     /// 順序に意味がある（`Shutdown` の注記）。**待つ → 止める → 見届ける** の順でなければ、
     /// 押しっぱなしのキーの解放が届かなくなったり、挿入の途中で落ちたりする。
     @Test("終了は「待つ・止める・見届ける」の順で行い、見届けを飛ばさない")
-    func shutdownFollowsTheOrder() async {
+    func shutdownFollowsTheOrder() async throws {
         let order = CallOrder()
         let gate = ShutdownGate()
         let writer = CollectingWriter()
 
+        // **門を待機以外にしておく。** 新品の門（＝最初から待機）で測ると
+        // `waitUntilIdle` が即座に戻るので、**待ちを止めた後ろへ動かしても順序が変わらない**
+        // （この検査だけでは「待つ→止める」を固定できない）。
+        await gate.observe(.inserting)
+        let release = Task {
+            try? await Task.sleep(for: .milliseconds(100))
+            order.record("idle")
+            await gate.observe(.idle)
+        }
+        defer { release.cancel() }
+
         await Shutdown.perform(
-            gate: gate, grace: .seconds(1),
+            gate: gate, grace: .seconds(5),
             stopHotkey: { order.record("stop") },
             awaitRun: {
                 order.record("awaitRun.start")
@@ -156,7 +167,7 @@ struct CLIShutdownTests {
             },
             writer: writer)
 
-        #expect(order.calls == ["stop", "awaitRun.start", "awaitRun.end", "finalState"])
+        #expect(order.calls == ["idle", "stop", "awaitRun.start", "awaitRun.end", "finalState"])
     }
 
     // MARK: - 本物の状態機械を通した終了

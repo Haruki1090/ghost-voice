@@ -86,6 +86,12 @@ public enum CommandLineOptions {
             case "--help", "-h":
                 if let error = claim(.help, argument) { return error }
             case "--paste-restore-delay-ms":
+                // **後勝ちで黙って上書きしない。** 同じファイルで「知らない旗は黙って
+                // 無視しない」と決めている以上、値を取る旗の重複も同じ扱いにする。
+                // 指定した値と違う値で動いていることに気づけないのが最も困る。
+                guard options.pasteRestoreDelay == nil else {
+                    return .usageError("--paste-restore-delay-ms は 1 回だけ指定できます")
+                }
                 index = arguments.index(after: index)
                 guard index < arguments.endIndex else {
                     return .usageError("--paste-restore-delay-ms には値が要ります")

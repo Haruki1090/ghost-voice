@@ -413,8 +413,8 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 |---|---|
 | App Sandbox | **無効**（AX API に必須） |
 | Hardened Runtime | 有効 |
-| 必要な Info.plist | `NSMicrophoneUsageDescription`, `NSSpeechRecognitionUsageDescription` |
-| 必要な TCC 権限 | マイク、音声認識、アクセシビリティ（`kTCCServiceAccessibility` と `kTCCServicePostEvent` の両方）、キーイベント監視（`kTCCServiceListenEvent` / 入力監視。ホットキーの `CGEventTap` に要る） |
+| 必要な Info.plist | `NSMicrophoneUsageDescription`（**`NSSpeechRecognitionUsageDescription` は不要**。`SpeechAnalyzer` は音声認識の TCC を要求しない。実測 V-14） |
+| 必要な TCC 権限 | マイク、アクセシビリティ（`kTCCServiceAccessibility` と `kTCCServicePostEvent` の両方）、キーイベント監視（`kTCCServiceListenEvent` / 入力監視。ホットキーの `CGEventTap` に要る）。**音声認識は不要**（実測 V-14） |
 | `LSUIElement` | `true`（Dock に表示しない） |
 | 配布 | Developer ID 署名 + notarization。Mac App Store は不可（要件定義書 §5） |
 

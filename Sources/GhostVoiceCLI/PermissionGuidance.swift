@@ -113,6 +113,13 @@ public enum PermissionGuidance {
         if !status.listenEventAccess {
             lines.append("  - 入力監視の許可がありません。右 Option の押下を受け取れません。")
         }
+        // **終了コードは PTT が動くかしか見ていない。** アクセシビリティが無くても 0 になる。
+        // ここを黙ると、終了コードだけを見た人が AX 無しのまま V-3 に入り、
+        // 全アプリを `clipboardOnly` と記録することになる。
+        if !status.accessibilityTrusted {
+            lines.append("  - アクセシビリティの許可がありません。AX 直接挿入が使えません。")
+            lines.append("    **V-3（アプリ別の挿入経路）はこの状態では意味を持ちません。**")
+        }
         if !status.postEventAccess {
             lines.append("  - キー送出の許可がありません。AX 経路が使えないアプリでは、テキストは")
             lines.append("    クリップボードに残るだけになります（履歴の insertionMethod は clipboardOnly）。")

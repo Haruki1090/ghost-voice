@@ -121,6 +121,12 @@ public actor DictationSession {
 
     /// キー解放以降に確定を待っているか。**録音中の `.final` で先へ進んではならない**
     /// （長い発話では途中で確定が出る。V-2 のテストが実測で確認している）。
+    ///
+    /// V-12 の実測（103 秒の読み上げを実時間で供給）では、確定は**録音中に 1 件・
+    /// 解放後に 1 件**届いた。前者を `latestFinal` へ積まずに捨てる変異を当てると、
+    /// **548 字のうち前半が丸ごと落ちて後半だけが挿入される**
+    /// （`FinalAfterReleaseTests` がこの変異を殺す。ただし既定の 30 秒では確定が
+    /// 1 件しか出ないので、`GHOST_VOICE_V12_SECONDS=103` で回したときだけ殺せる）。
     private var isAwaitingFinal = false
     private var isFinalSettled = false
     private var finalWaiters: [CheckedContinuation<Void, Never>] = []

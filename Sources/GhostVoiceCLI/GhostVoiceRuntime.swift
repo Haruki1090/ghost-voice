@@ -259,6 +259,10 @@ public enum GhostVoiceRuntime {
                 // **ここが `exit()` の唯一の入口である**（Task 10 申し送り【1】）。
                 // 挿入の途中で落とすと、⌘V の後・クリップボード復元の前で消えて
                 // テキストがどこにも残らない。
+                //
+                // **`CFRunLoopRun()` の後にも `exit()` を置いてはならない。**
+                // 下の while ループがその理由（`stopHotkey` は自分でランループの
+                // ソースを外すので、そこが 2 つ目の出口になりかける）。
                 await Shutdown.perform(
                     gate: gate,
                     stopHotkey: { monitor.stop() },
@@ -281,8 +285,34 @@ public enum GhostVoiceRuntime {
 
         // `CGEventTap` は `CFRunLoopGetMain()` に載る（Task 9 申し送り）。
         // **メインのランループを回し続けないとキーイベントが届かない。**
-        CFRunLoopRun()
-        exit(0)
+        //
+        // **`CFRunLoopRun()` が戻っても `exit()` してはならない。**
+        //
+        // 終了処理の 1 手目（`Shutdown.perform` の `stopHotkey`）は
+        // `CGEventTapHotkeyMonitor.stop()` を呼び、**自分でメインのランループから
+        // ソースを外す。** そこでランループが空になって戻るなら、その瞬間は
+        // 挿入の途中でありうる。ここで落とすと、⌘V の送出後・クリップボードの復元前に
+        // プロセスが消えて発話が失われる（申し送り【1】が名指しした失敗）。
+        //
+        // 実測（2026-08-14 / M3 / macOS 26.5.2。TCC 不要の使い捨てプログラム）:
+        // **この機体では戻らない。** メインのランループには常に他のソース
+        // （メインキューのポート）が載っており、`CFMachPort` 由来のソースを
+        // 最後の 1 本として外しても `CFRunLoopRunInMode` は復帰しなかった。
+        // ソースを 1 本も張らない対照実験でも `kCFRunLoopRunFinished` は返らず、
+        // 2 秒後に `kCFRunLoopRunTimedOut` だった。**つまり到達しない。**
+        // しかしこれは CoreFoundation の実装の性質であって契約ではないので、
+        // 「戻らないから安全」に寄りかからず、戻った場合の分岐をここに書く。
+        while !isShuttingDown.load(ordering: .relaxed) {
+            CFRunLoopRun()
+            // 戻った＝ソースが尽きた。終了要求が無いなら張り直す。
+            // 空のまま即座に戻り続ける状態（＝タップが死んでいる）では 10 Hz で回るが、
+            // その状態は watchdog が利用者へ知らせる。**黙って終わるよりはよい。**
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        // 終了処理が走っている。**`exit()` はそちらが行う**（唯一の入口）。
+        // 主スレッドはここで寝かせる。`dispatchMain()` は戻らない。
+        dispatchMain()
     }
 
     /// Ctrl-C（SIGINT）と `kill`（SIGTERM）を捕まえる。

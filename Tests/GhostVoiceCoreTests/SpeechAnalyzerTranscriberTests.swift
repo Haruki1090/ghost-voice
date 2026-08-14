@@ -99,6 +99,43 @@ struct Streaming {
         return transcriber
     }
 
+    /// V-14: **`SpeechAnalyzer` は音声認識の TCC（`kTCCServiceSpeechRecognition`）を要求しない。**
+    ///
+    /// 要件定義書は当初これを必要権限に挙げていた。実際には
+    /// `SFSpeechRecognizer.authorizationStatus()` が `.notDetermined` のまま認識が通る。
+    /// **この検査が無いと、権限の案内（FR-10 / `--check`）に音声認識が無いことが
+    /// 「実装漏れ」なのか「要らないから」なのか、読む側から区別できない。**
+    ///
+    /// 許可済みの機体では前提（未確認のまま）が作れないので、そのときは走らせない。
+    @Test(
+        "V-14: 音声認識の許可が未確認のままでも認識できる",
+        .enabled(if: SFSpeechRecognizer.authorizationStatus() != .authorized,
+                 "この機体では音声認識が許可済みで、未確認のままの検証ができない")
+    )
+    func recognizesWithoutSpeechRecognitionAuthorization() async throws {
+        let before = SFSpeechRecognizer.authorizationStatus()
+        let transcriber = try await prepared()
+        let format = try #require(await transcriber.requiredAudioFormat)
+        let buffers = try SpeechFixtures.buffers(
+            from: SpeechFixtures.audioURL, to: format, limitSeconds: 3)
+
+        let stream = try await transcriber.begin()
+        for buffer in buffers { await transcriber.feed(SpeechFixtures.detachedCopy(of: buffer)) }
+        try await transcriber.finish()
+
+        var finalText = ""
+        for try await update in stream {
+            if case .final(let text) = update { finalText += text }
+        }
+
+        print("V-14 音声認識の許可: 認識前 \(before.rawValue) / 認識後 "
+              + "\(SFSpeechRecognizer.authorizationStatus().rawValue)（0=notDetermined）")
+        #expect(!finalText.isEmpty, "音声認識の許可なしでは認識できていない")
+        // **要求もしていないこと**を見る。黙ってダイアログを出す実装になっていないか。
+        #expect(SFSpeechRecognizer.authorizationStatus() == before,
+                "認識の過程で音声認識の許可状態が変わった")
+    }
+
     @Test("prepare すると認識器の要求形式が決まる")
     func exposesRequiredAudioFormat() async throws {
         let transcriber = try await prepared()

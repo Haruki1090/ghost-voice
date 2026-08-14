@@ -61,6 +61,18 @@ struct CLIOptionsTests {
                 == .run(RunOptions(pasteRestoreDelay: .zero)))
     }
 
+    /// 値を取る旗の重複を後勝ちにすると、**指定した値と違う値で動いていることに
+    /// 気づけない。** 動作を決める旗（`--check` など）の重複と同じ扱いにする。
+    @Test("復元待ちを 2 回指定したら拒否する")
+    func duplicatePasteRestoreDelayIsRejected() throws {
+        let parsed = CommandLineOptions.parse([
+            "--paste-restore-delay-ms", "300", "--paste-restore-delay-ms", "50",
+        ])
+        let message = try #require(parsed.usageErrorMessage)
+        #expect(message.contains("--paste-restore-delay-ms"))
+        #expect(message.contains("1 回"))
+    }
+
     /// **知らない旗を黙って無視してはならない。** 綴り違いのまま
     /// 「指定したはずの設定が効いている」と信じることになる。
     @Test("知らない旗はその名前を添えて拒否する")

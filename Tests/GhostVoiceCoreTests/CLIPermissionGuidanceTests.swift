@@ -124,6 +124,19 @@ struct CLIPermissionGuidanceTests {
         #expect(report.contains("クリップボード"))
     }
 
+    /// **終了コードは PTT が動くかしか見ない。** アクセシビリティが無くても 0 になるので、
+    /// 報告の側で「V-3 はこの状態では意味を持たない」と言わないと、
+    /// 終了コードだけを見た人が全アプリを `clipboardOnly` と記録することになる。
+    @Test("アクセシビリティが無いときは V-3 が成立しないと述べる")
+    func reportWarnsThatV3NeedsAccessibility() {
+        let missing = PermissionGuidance.report(
+            status(accessibility: false), storageRoot: URL(filePath: "/tmp/gv"))
+        let granted = PermissionGuidance.report(status(), storageRoot: URL(filePath: "/tmp/gv"))
+        #expect(missing.contains("使える見込み: はい"))  // PTT 自体は動く
+        #expect(missing.contains("V-3"))
+        #expect(!granted.contains("V-3"))
+    }
+
     @Test("報告には設定ファイルの置き場所が載っている")
     func reportShowsStorageRoot() {
         let report = PermissionGuidance.report(

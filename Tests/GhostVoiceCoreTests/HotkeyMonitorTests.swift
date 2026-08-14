@@ -154,15 +154,25 @@ private func canOpenEnabledTap() -> Bool {
 ///   （ミューテーションテストで実際に SIGSEGV を踏んで気付いた）。
 ///   専用スレッドを 1 本立てて、プロセスの間ずっと生かしておく。
 ///   ランループを回す必要は無い。source の出し入れは停止中のランループでも安全である。
-private struct RunLoopBox: @unchecked Sendable { var runLoop: CFRunLoop? }
+/// 立てたスレッドから受け取るための受け皿。
+///
+/// **`UnsafeMutablePointer` を `Thread` のクロージャへ渡してはならない。**
+/// ポインタは非 Sendable なので `swift test` の出力に警告が残り続ける
+/// （それ自体が壊れるわけではないが、警告に慣れると本物の警告を見落とす）。
+/// 受け渡しは参照型 + ロックで行う。
+private final class RunLoopBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var runLoop: CFRunLoop?
+    func set(_ loop: CFRunLoop) { lock.withLock { runLoop = loop } }
+    var value: CFRunLoop? { lock.withLock { runLoop } }
+}
 
 private nonisolated(unsafe) let sharedTestRunLoop: CFRunLoop = {
     let ready = DispatchSemaphore(value: 0)
-    let box = UnsafeMutablePointer<RunLoopBox>.allocate(capacity: 1)
-    box.initialize(to: RunLoopBox(runLoop: nil))
+    let box = RunLoopBox()
 
     let thread = Thread {
-        box.pointee.runLoop = CFRunLoopGetCurrent()
+        box.set(CFRunLoopGetCurrent())
         ready.signal()
         // このスレッドが生きている限り、上のランループは有効なまま残る。
         while true { Thread.sleep(forTimeInterval: 3600) }
@@ -170,7 +180,7 @@ private nonisolated(unsafe) let sharedTestRunLoop: CFRunLoop = {
     thread.name = "GhostVoiceTests.HotkeyRunLoop"
     thread.start()
     ready.wait()
-    return box.pointee.runLoop!
+    return box.value!
 }()
 
 private func testRunLoop() -> CFRunLoop { sharedTestRunLoop }
