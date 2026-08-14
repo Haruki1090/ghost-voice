@@ -26,7 +26,7 @@ struct LaunchSequenceTests {
             settings: SettingsStore(rootURL: root),
             history: HistoryStore(rootURL: root, limit: 10),
             vocabulary: VocabularyStore(rootURL: root),
-            permissions: AppPermissionStatus(
+            permissions: PermissionStatus(
                 microphoneStatus: "未確認", microphoneAuthorized: false,
                 accessibilityTrusted: false, listenEventAccess: false, postEventAccess: false,
                 secureInputEnabled: false, bundleIdentifier: nil),

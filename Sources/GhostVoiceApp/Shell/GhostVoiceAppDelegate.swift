@@ -59,7 +59,7 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // **照会だけ。ここではダイアログを出さない。**
-        let permissions = AppPermissions.current()
+        let permissions = PermissionInquiry.current()
         AppDiagnostics.note(AppPermissionGuidance.report(permissions))
         if options.requestsPermissions {
             // 一覧に載せるために要求を出す。**載らないと利用者はトグルを見つけられない。**

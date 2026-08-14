@@ -27,74 +27,6 @@ final class CollectingWriter: ConsoleWriting, @unchecked Sendable {
 @Suite("CLI: 終了の待ち合わせ")
 struct CLIShutdownTests {
 
-    // MARK: - ShutdownGate
-
-    @Test("待機中なら即座に戻る")
-    func idleGateReturnsImmediately() async {
-        let gate = ShutdownGate()
-        #expect(await gate.waitUntilIdle(within: .seconds(5)) == .idle)
-    }
-
-    @Test("挿入中なら待機へ戻るまで戻らない")
-    func gateWaitsForIdle() async throws {
-        let gate = ShutdownGate()
-        await gate.observe(.inserting)
-
-        // **「戻っていない」ことを表明する。** ここを書かないと、常に即座に戻る実装でも
-        // 検査が通ってしまう（待ち合わせの検査が空虚に真になる典型）。
-        let returned = Atomic<Bool>(false)
-        let waiter = Task {
-            let outcome = await gate.waitUntilIdle(within: .seconds(10))
-            returned.store(true, ordering: .relaxed)
-            return outcome
-        }
-        try await Task.sleep(for: .milliseconds(50))
-        #expect(returned.load(ordering: .relaxed) == false)
-        await gate.observe(.idle)
-        #expect(await waiter.value == .idle)
-    }
-
-    /// `.failed` の直後には必ず `.idle` が続く（`DictationSession` の契約）。
-    /// **`.failed` を待機と読み違えると、その直後の後始末を待たずに終わる。**
-    @Test("失敗の表示は待機ではない")
-    func failedIsNotIdle() async throws {
-        let gate = ShutdownGate()
-        await gate.observe(.failed(.noSpeechRecognized))
-        let returned = Atomic<Bool>(false)
-        let waiter = Task {
-            let outcome = await gate.waitUntilIdle(within: .seconds(10))
-            returned.store(true, ordering: .relaxed)
-            return outcome
-        }
-        try await Task.sleep(for: .milliseconds(50))
-        #expect(returned.load(ordering: .relaxed) == false)
-        await gate.observe(.idle)
-        #expect(await waiter.value == .idle)
-    }
-
-    @Test("猶予を過ぎたら打ち切って、打ち切ったことを返す")
-    func gateTimesOut() async {
-        let gate = ShutdownGate()
-        await gate.observe(.recording(volatileText: ""))
-        let started = ContinuousClock.now
-        let outcome = await gate.waitUntilIdle(within: .milliseconds(150))
-        let elapsed = ContinuousClock.now - started
-        #expect(outcome == .timedOut)
-        #expect(elapsed >= .milliseconds(150))
-    }
-
-    /// 状態の列が終わった時点で、セッションは処理中の発話を見届けている
-    /// （`run()` は `completionTask` を待ってから終端する）。
-    @Test("状態の列が終わったら待機とみなす")
-    func gateReleasesWhenStreamFinishes() async throws {
-        let gate = ShutdownGate()
-        await gate.observe(.inserting)
-        let waiter = Task { await gate.waitUntilIdle(within: .seconds(10)) }
-        try await Task.sleep(for: .milliseconds(50))
-        await gate.streamFinished()
-        #expect(await waiter.value == .idle)
-    }
-
     // MARK: - 単一の消費者
 
     @Test("状態の列を読みながら、書き出しと待ち合わせの両方へ配る")
@@ -157,87 +89,23 @@ struct CLIShutdownTests {
         #expect(writer.text.contains("[metrics]"))
     }
 
-    /// 順序に意味がある（`Shutdown` の注記）。**待つ → 止める → 見届ける** の順でなければ、
-    /// 押しっぱなしのキーの解放が届かなくなったり、挿入の途中で落ちたりする。
-    @Test("終了は「待つ・止める・見届ける」の順で行い、見届けを飛ばさない")
-    func shutdownFollowsTheOrder() async throws {
-        let order = CallOrder()
-        let gate = ShutdownGate()
-        let writer = CollectingWriter()
+    // MARK: - 端末向けの体裁
 
-        // **門を待機以外にしておく。** 新品の門（＝最初から待機）で測ると
-        // `waitUntilIdle` が即座に戻るので、**待ちを止めた後ろへ動かしても順序が変わらない**
-        // （この検査だけでは「待つ→止める」を固定できない）。
-        await gate.observe(.inserting)
-        let release = Task {
-            try? await Task.sleep(for: .milliseconds(100))
-            order.record("idle")
-            await gate.observe(.idle)
-        }
-        defer { release.cancel() }
-
-        await Shutdown.perform(
-            gate: gate, grace: .seconds(5),
-            stopHotkey: { order.record("stop") },
-            awaitRun: {
-                order.record("awaitRun.start")
-                try? await Task.sleep(for: .milliseconds(100))
-                order.record("awaitRun.end")
-            },
-            isBusy: {
-                order.record("isBusy")
-                return false
-            },
-            writer: writer)
-
-        // **完全一致では固定できない。** 待ちの間に状態機械へ確認する
-        // （門は 1 手遅れるため。`Shutdown` の注記）ので `isBusy` は複数回呼ばれる。
-        // 固定したいのは**順序の不変条件**である。
-        let calls = order.calls
-        let idle = try #require(calls.firstIndex(of: "idle"), "待機を観測していない")
-        let stop = try #require(calls.firstIndex(of: "stop"), "監視を止めていない")
-        let runStart = try #require(calls.firstIndex(of: "awaitRun.start"), "run() を見届けていない")
-        let runEnd = try #require(calls.firstIndex(of: "awaitRun.end"))
-
-        #expect(idle < stop, "待機へ戻る前に監視を止めている（押しっぱなしの解放が届かない）")
-        #expect(stop < runStart, "監視を止める前に run() を待っている")
-        #expect(runStart < runEnd)
-        #expect(calls.last == "isBusy", "見届けた後に最終状態を見ていない")
-    }
-
-    /// **門は状態機械より 1 手遅れる。**
+    /// **文言は Core が持ち、CLI が足すのは前後の余白だけである。**
     ///
-    /// 押下の直後に終了要求が来ると、門はまだ「待機」を指している（`.recording` が
-    /// まだ配送されていない）。そこで監視を止めると、**キー解放が二度と届かず発話が消える。**
-    /// 負荷を掛けた `swift test` で `shutdownWaitsForKeyRelease` が実際に落ちて判った窓。
-    @Test("門が待機を指していても、状態機械が処理中なら止めない")
-    func waitsWhenGateLagsBehindTheStateMachine() async {
-        let gate = ShutdownGate()  // 何も観測していない＝待機を指す
+    /// 待ちの案内は `SessionNarration` の進行表示（`\r` で行を上書きする）の途中に
+    /// 割り込むので、**必ず行を改めてから出す。** ここが崩れると、
+    /// 「PTT キーを離してください」が消しかけの行に重なって読めなくなる。
+    @Test("待ちの案内は行を改めてから出し、文言そのものは Core のものを使う")
+    func consoleFramesTheAnnouncement() {
         let writer = CollectingWriter()
-        // `Atomic` は ~Copyable でクロージャ内の `#expect` に載せられない。参照型を使う。
-        let busy = MutableFlag(true)
-        let stopped = MutableFlag(false)
+        let waiting = ShutdownAnnouncement.waiting(grace: .seconds(10))
+        writer.announce(waiting)
+        #expect(writer.writes == ["\n" + waiting.text + "\n"])
 
-        // 少し遅れて発話が終わる（＝状態機械が待機へ戻る）
-        let release = Task {
-            try? await Task.sleep(for: .milliseconds(200))
-            busy.value = false
-        }
-        defer { release.cancel() }
-
-        await Shutdown.perform(
-            gate: gate, grace: .seconds(5),
-            stopHotkey: {
-                // **止める瞬間に、状態機械はもう待機でなければならない。**
-                #expect(!busy.value, "処理中に監視を止めた（発話が失われる）")
-                stopped.value = true
-            },
-            awaitRun: {},
-            isBusy: { busy.value },
-            writer: writer)
-
-        #expect(stopped.value)
-        #expect(!writer.text.contains("打ち切ります"), "待てるのに打ち切っている")
+        let other = CollectingWriter()
+        other.announce(.finished)
+        #expect(other.writes == [ShutdownAnnouncement.finished.text + "\n"])
     }
 
     // MARK: - 本物の状態機械を通した終了
@@ -290,7 +158,7 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .seconds(10),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                isBusy: { await session.isBusy }, writer: writer)
+                isBusy: { await session.isBusy }, announce: { writer.announce($0) })
 
             #expect(inserter.inserted == ["整形後テキストです"])
             await narration.value
@@ -339,7 +207,7 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .seconds(10),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                isBusy: { await session.isBusy }, writer: writer)
+                isBusy: { await session.isBusy }, announce: { writer.announce($0) })
             await release.value
 
             #expect(
@@ -381,7 +249,7 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .seconds(10),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                isBusy: { await session.isBusy }, writer: writer)
+                isBusy: { await session.isBusy }, announce: { writer.announce($0) })
             await release.value
 
             #expect(inserter.inserted == ["整形後テキストです"])
@@ -415,7 +283,7 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .milliseconds(150),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                isBusy: { await session.isBusy }, writer: writer)
+                isBusy: { await session.isBusy }, announce: { writer.announce($0) })
 
             #expect(inserter.inserted.isEmpty)
             // **黙って捨ててはならない。** 発話が失われたことを言う。

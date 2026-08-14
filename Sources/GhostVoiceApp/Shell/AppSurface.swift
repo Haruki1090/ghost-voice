@@ -44,7 +44,7 @@ public struct RunLoopEntry: Sendable {
 /// それをすると鍵の意味が無くなる。
 @MainActor
 public protocol AppSurface: AnyObject {
-    /// 終了時に呼ばれる。**発話の処理はここでは待たない**（それは `AppTermination` の仕事）。
+    /// 終了時に呼ばれる。**発話の処理はここでは待たない**（それは `GhostVoiceCore.Shutdown` の仕事）。
     func teardown()
 }
 
@@ -59,7 +59,7 @@ public struct AppServices: Sendable {
     public let history: HistoryStore
     public let vocabulary: VocabularyStore
     /// 起動時に照会した権限（**ダイアログは出していない**）。
-    public let permissions: AppPermissionStatus
+    public let permissions: PermissionStatus
     /// キー監視を開始できなかった理由。`nil` なら開始できている。
     public let hotkeyFailure: HotkeyError?
 
@@ -68,7 +68,7 @@ public struct AppServices: Sendable {
         settings: SettingsStore,
         history: HistoryStore,
         vocabulary: VocabularyStore,
-        permissions: AppPermissionStatus,
+        permissions: PermissionStatus,
         hotkeyFailure: HotkeyError?
     ) {
         self.session = session

@@ -8,7 +8,7 @@ import GhostVoiceCore
 /// `DictationSession.stateUpdates` は `AsyncStream` であり、**消費者は 1 つに限る**
 /// （複数の `next()` を同時に待つと異常終了する）。その 1 本は HUD が使う。
 /// **器がここで読んでしまうと HUD が読めなくなる**ので、器は読まない。
-/// 終了の待ち合わせも `isBusy` の照会だけで済ませてある（`AppTermination`）。
+/// 終了の待ち合わせも `isBusy` の照会だけで済ませてある（`GhostVoiceCore.Shutdown`）。
 @MainActor
 public final class AppSessionRuntime {
 
@@ -72,28 +72,25 @@ public final class AppSessionRuntime {
         return runtime
     }
 
-    /// 終了の段取り。**`AppTermination` の順序どおりに畳む。**
-    public func shutdown(grace: Duration = AppTermination.defaultGrace) async {
+    /// 終了の段取り。**段取りは Core に 1 つだけある**（`GhostVoiceCore.Shutdown`）。
+    ///
+    /// ここが渡すのは本物の依存と出力先だけである。順序（待つ → 止める → 見届ける）も
+    /// 文言も CLI と共有する——**2 箇所にあると必ずずれ、両方とも自分のテストでは緑になる。**
+    ///
+    /// - Note: **門（`ShutdownGate`）は渡さない。** 門は `stateUpdates` を消費している
+    ///   経路だけが持てるが、その 1 本は HUD が使う。ここは `isBusy` の照会だけで待つ。
+    public func shutdown(grace: Duration = Shutdown.defaultGrace) async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
         watchdog?.cancel()
 
-        AppDiagnostics.note(
-            "[終了] 進行中の発話を待っています…（録音中なら PTT キーを離してください。"
-                + "\(grace) 待っても待機へ戻らなければ、その発話は失われます）")
-
-        let outcome = await AppTermination.waitUntilIdle(grace: grace) { [session] in
-            await session.isBusy
-        }
-        if outcome == .timedOut {
-            AppDiagnostics.note("[終了] \(grace) 待っても待機へ戻りませんでした。打ち切ります。")
-        }
-
-        monitor.stop()
-        await runTask?.value
-        if await session.isBusy {
-            AppDiagnostics.note("[終了] 発話の途中で終了したため、この発話は挿入されませんでした。")
-        }
-        AppDiagnostics.note("[終了] Ghost Voice を終了しました。")
+        // `@MainActor` の外へ渡すものを先に取り出す（`Task` と actor はそのまま渡せる）。
+        let runTask = self.runTask
+        await Shutdown.perform(
+            grace: grace,
+            stopHotkey: { [monitor] in monitor.stop() },
+            awaitRun: { await runTask?.value },
+            isBusy: { [session] in await session.isBusy },
+            announce: { AppDiagnostics.note($0.text) })
     }
 }
