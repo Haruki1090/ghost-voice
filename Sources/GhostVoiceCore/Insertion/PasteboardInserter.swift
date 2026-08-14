@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 import Synchronization
@@ -14,18 +15,68 @@ public protocol PasteShortcutSending: Sendable {
     func send() -> Bool
 }
 
+/// キーイベント送出の許可（`kTCCServicePostEvent`）を保持する箱。
+///
+/// **照会をキャッシュするために存在する。** `CGPreflightPostEventAccess()` は
+/// 実測で**毎回 10.6 ms**（初回 16.7 ms / 最大 24.7 ms、50 回計測）掛かる。
+/// 挿入のたびに呼ぶと NFR-P5 の 50 ms 予算の 2 割をここで使う。
+///
+/// 比較のため同条件で測った他の照会:
+///
+/// | API | 初回 | 2 回目以降の p50 |
+/// |---|---|---|
+/// | `AXIsProcessTrusted()` | 42.7 ms | 0.001 ms（プロセス内でキャッシュされている） |
+/// | `CGPreflightPostEventAccess()` | 16.7 ms | **10.586 ms** |
+/// | `IsSecureEventInputEnabled()` | 23.8 ms | 0.000 ms |
+///
+/// 権限は実行中に変わりうるので、**アプリ起動時と権限フローを通過した直後に
+/// `refresh()` を呼ぶこと。**
+public final class PostEventAuthorization: Sendable {
+
+    /// 本番で使う共有インスタンス。生成時に一度だけ照会する。
+    public static let shared = PostEventAuthorization()
+
+    private let probe: @Sendable () -> Bool
+    private let granted = Atomic<Bool>(false)
+
+    /// - Parameter probe: 実際の照会。テストは偽物を挿して呼ばれ方を数える。
+    public init(probe: @escaping @Sendable () -> Bool = { CGPreflightPostEventAccess() }) {
+        self.probe = probe
+        refresh()
+    }
+
+    /// 保持している許可状態。**照会は行わない**ので安価。
+    public var isGranted: Bool { granted.load(ordering: .relaxed) }
+
+    /// 照会し直して保持し直す。起動時と権限フロー通過時に呼ぶ。
+    @discardableResult
+    public func refresh() -> Bool {
+        let value = probe()
+        granted.store(value, ordering: .relaxed)
+        return value
+    }
+}
+
 /// `CGEvent` で ⌘V を送る実装。
 public struct SystemPasteShortcutSender: PasteShortcutSending {
 
     private static let vKeyCode: CGKeyCode = 0x09
 
-    public init() {}
+    private let authorization: PostEventAuthorization
+    private let isSecureInputEnabled: @Sendable () -> Bool
 
-    /// **キーイベントの送出は AX の許可を要する。**
+    public init(
+        authorization: PostEventAuthorization = .shared,
+        isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
+    ) {
+        self.authorization = authorization
+        self.isSecureInputEnabled = isSecureInputEnabled
+    }
+
+    /// **キーイベントの送出は専用の許可を要し、さらに secure input に阻まれる。**
     ///
-    /// 実測（macOS 26.5.2 / M3、`AXIsProcessTrusted() == false` のプロセスが
-    /// 自分の最前面ウィンドウへ ⌘V を送る。Edit > Paste を持つメインメニューを
-    /// 用意して「⌘V の結び先が無い」交絡は除いてある）:
+    /// 実測（macOS 26.5.2 / M3、許可の無いプロセスが自分の最前面ウィンドウへ ⌘V を送る。
+    /// `Edit > Paste` を持つメインメニューを用意して「⌘V の結び先が無い」交絡は除いてある）:
     ///
     /// | 送出方法 | 貼り付いた回数 |
     /// |---|---|
@@ -38,7 +89,25 @@ public struct SystemPasteShortcutSender: PasteShortcutSending {
     /// 送出したつもりで成功を報告すると、履歴には `.pasteboard` と記録されるのに
     /// テキストはどこにも入っておらず、しかもクリップボードは復元済み——
     /// つまり**発話が消えたうえに成功として残る**。だから送る前にここで弾く。
-    public var canSend: Bool { AXIsProcessTrusted() }
+    ///
+    /// 門は 2 つある。**どちらが欠けても同じ結末になる。**
+    ///
+    /// 1. **`CGPreflightPostEventAccess()`**（`kTCCServicePostEvent`）。
+    ///    `AXIsProcessTrusted()`（`kTCCServiceAccessibility`）**ではない。**
+    ///    両者は別のレコードなので、片方だけ true の状態は原理的にありうる。
+    ///    この機体では両方 false で一致したが、それは値の一致であって同一性ではない。
+    ///    照会が高くつくので `PostEventAuthorization` でキャッシュしている。
+    /// 2. **secure input が無効であること。** 他プロセスがパスワード欄などで
+    ///    secure input を有効にしている間、合成キーイベントは配送されない。
+    ///    TCC とは無関係なので、許可があっても届かない。
+    ///    `IsSecureEventInputEnabled()` は実測 0.000 ms なので**毎回見る**
+    ///    （状態が刻々と変わるため、キャッシュしてはならない）。
+    ///
+    /// - Note: `canSend` を見てから `send()` するまでの隙に secure input が
+    ///   有効化される可能性は残る。窓は数 ms で、ここでは閉じられない。
+    public var canSend: Bool {
+        authorization.isGranted && !isSecureInputEnabled()
+    }
 
     public func send() -> Bool {
         guard let source = CGEventSource(stateID: .combinedSessionState),
@@ -133,7 +202,15 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
         guard sender.send() else {
             // **ここで復元してはならない。** 貼り付いてもいないのにクリップボードを
             // 元へ戻すと、発話がどこにも残らない。ユーザーの元の内容を失う代償を
-            // 払ってでもテキストを残す（詳細設計書 §6.3「復元失敗時」）。
+            // 払ってでもテキストを残す。
+            //
+            // **これは Task 8 で新設した判断であり、既存規定の適用ではない。**
+            // 詳細設計書 §6.3 に元からあったのは「**復元**失敗時」の規定で、
+            // 「**送出**失敗時」については何も定めていなかった。
+            // 「クリップボードを壊さない」を捨てて「発話を失わない」を取っている。
+            //
+            // 本番でここへ来るのは `CGEvent` の**生成**に失敗した場合だけである。
+            // TCC と secure input に由来する失敗は `canInsert()` が先に弾く。
             return false
         }
 

@@ -1,6 +1,9 @@
 import Testing
 import AppKit
+import Carbon.HIToolbox
+import CoreGraphics
 import Foundation
+import Synchronization
 @testable import GhostVoiceCore
 
 @Suite("PasteboardInserter")
@@ -156,7 +159,9 @@ struct PasteboardInserterTests {
 
     /// **発話を失わないことが最優先（基本設計書 §230）。** 送出できなかったのに復元すると、
     /// 貼り付いてもいないテキストがクリップボードからも消えて、発話がどこにも残らない。
-    /// ユーザーの元の内容を失う代償を払ってでもテキストを残す（詳細設計書 §6.3）。
+    /// ユーザーの元の内容を失う代償を払ってでもテキストを残す。
+    /// **この判断は Task 8 で新設したもの**で、詳細設計書 §6.3 に元からあった
+    /// 「**復元**失敗時」の規定とは別物である（そちらは復元処理が失敗した場合を指す）。
     @Test("⌘V を送れなかったらテキストをクリップボードに残す")
     func keepsTextWhenSendFails() async {
         await withNamedPasteboard { pasteboard in
@@ -235,5 +240,162 @@ struct PasteboardInserterTests {
     @Test("既定の復元待ち時間は 120 ms")
     func defaultRestoreDelayIsPinned() {
         #expect(PasteboardInserter.defaultRestoreDelay == .milliseconds(120))
+    }
+}
+
+/// 送出できる状況かの判定。**ここが緩むと「発話が消えたうえに成功として履歴に残る」**
+/// という、このタスクで塞いだはずの経路が再発する。
+///
+/// `.serialized` にしてあるのは `secureInputBlocksDefaultSender` が
+/// **システム全体の secure input 状態を一時的に変える**ため。同じスイート内の
+/// 他のテストと重ならないようにしている。
+@Suite("SystemPasteShortcutSender の送出可否", .serialized)
+struct SystemPasteShortcutSenderTests {
+
+    /// 呼ばれた回数を数える偽の照会。
+    private final class Probe: Sendable {
+        private let calls = Atomic<Int>(0)
+        private let value: Atomic<Bool>
+
+        init(_ initial: Bool) { value = Atomic<Bool>(initial) }
+
+        var callCount: Int { calls.load(ordering: .relaxed) }
+        func set(_ new: Bool) { value.store(new, ordering: .relaxed) }
+
+        func probe() -> Bool {
+            calls.add(1, ordering: .relaxed)
+            return value.load(ordering: .relaxed)
+        }
+    }
+
+    private func sender(
+        granted: Bool, secureInput: @escaping @Sendable () -> Bool = { false }
+    ) -> SystemPasteShortcutSender {
+        SystemPasteShortcutSender(
+            authorization: PostEventAuthorization(probe: { granted }),
+            isSecureInputEnabled: secureInput
+        )
+    }
+
+    @Test("許可があり secure input が無効なら送出できる")
+    func canSendWhenGrantedAndNotSecure() {
+        #expect(sender(granted: true).canSend)
+    }
+
+    /// `AXIsProcessTrusted()`（`kTCCServiceAccessibility`）ではなく
+    /// `CGPreflightPostEventAccess()`（`kTCCServicePostEvent`）が門番である。
+    /// 別レコードなので、片方だけ true の状態は原理的にありうる。
+    @Test("送出の許可が無ければ適用外")
+    func cannotSendWithoutPostEventAccess() {
+        #expect(!sender(granted: false).canSend)
+    }
+
+    /// **TCC とは別の失敗要因。** 他プロセスがパスワード欄などで secure input を
+    /// 有効にしている間、許可があっても合成キーイベントは配送されない。
+    /// ここを見ないと「退避 → 送出（届かない）→ 復元 → true」を通り、
+    /// 発話が消えたうえで `.pasteboard` として履歴に残る。
+    @Test("secure input が有効なら許可があっても適用外")
+    func cannotSendWhileSecureInputIsEnabled() {
+        #expect(!sender(granted: true, secureInput: { true }).canSend)
+        #expect(!sender(granted: false, secureInput: { true }).canSend)
+    }
+
+    /// secure input は刻々と変わる（ユーザーがパスワード欄へ移った瞬間に有効になる）。
+    /// **キャッシュしてはならない。** 毎回見ていることを呼び出し回数で確かめる。
+    @Test("secure input は判定のたびに見に行く")
+    func secureInputIsCheckedEveryTime() {
+        let checks = Atomic<Int>(0)
+        let enabled = Atomic<Bool>(false)
+        let sender = SystemPasteShortcutSender(
+            authorization: PostEventAuthorization(probe: { true }),
+            isSecureInputEnabled: {
+                checks.add(1, ordering: .relaxed)
+                return enabled.load(ordering: .relaxed)
+            }
+        )
+
+        #expect(sender.canSend)
+        #expect(sender.canSend)
+        #expect(checks.load(ordering: .relaxed) == 2, "secure input をキャッシュしている")
+
+        // 途中で有効化されたら、次の判定から反映されること。
+        enabled.store(true, ordering: .relaxed)
+        #expect(!sender.canSend, "secure input の変化を拾えていない")
+        #expect(checks.load(ordering: .relaxed) == 3)
+    }
+
+    /// **照会のキャッシュ。** `CGPreflightPostEventAccess()` は実測 p50 10.6 ms
+    /// （最大 24.7 ms）掛かる。挿入のたびに呼ぶと NFR-P5 の 50 ms 予算の 2 割を失う。
+    @Test("送出の許可は判定のたびには照会しない")
+    func postEventAccessIsCached() {
+        let probe = Probe(true)
+        let authorization = PostEventAuthorization(probe: probe.probe)
+        #expect(probe.callCount == 1, "生成時に一度だけ照会する")
+
+        let sender = SystemPasteShortcutSender(
+            authorization: authorization, isSecureInputEnabled: { false }
+        )
+        for _ in 0..<10 { #expect(sender.canSend) }
+
+        #expect(probe.callCount == 1, "判定のたびに照会している（実測 10.6 ms/回）")
+    }
+
+    /// 権限は実行中に変わる。**キャッシュするからには更新の口が要る。**
+    /// アプリ起動時と権限フロー通過時に呼ぶ。
+    @Test("refresh すると許可の変化を取り込む")
+    func refreshPicksUpChanges() {
+        let probe = Probe(false)
+        let authorization = PostEventAuthorization(probe: probe.probe)
+        let sender = SystemPasteShortcutSender(
+            authorization: authorization, isSecureInputEnabled: { false }
+        )
+
+        #expect(!sender.canSend)
+
+        probe.set(true)
+        #expect(!sender.canSend, "refresh していないのに変化が見えている")
+
+        #expect(authorization.refresh())
+        #expect(sender.canSend)
+        #expect(probe.callCount == 2, "生成時 1 回 + refresh 1 回")
+    }
+
+    /// 既定の組み立てが実 API を見ていること。値そのものは機体の権限状態に依存するので、
+    /// **実 API と一致すること**だけを見る（規律: 権限のある機体でも正しく動くこと）。
+    @Test("既定の送出器は実 API の状態を映す")
+    func defaultSenderReflectsSystemState() {
+        let expected = CGPreflightPostEventAccess() && !IsSecureEventInputEnabled()
+        #expect(SystemPasteShortcutSender().canSend == expected)
+    }
+
+    /// **既定の secure input 判定が本当に `IsSecureEventInputEnabled()` を見ているか**を、
+    /// 実際に secure input を有効化して確かめる。
+    ///
+    /// **送出許可の側は true を注入する。** ここを実 API のままにすると、権限の無い機体では
+    /// `canSend` が secure input と無関係にもともと false で、
+    /// 「有効化したら false だった」が**何も検査していないアサーション**になる
+    /// （実際に一度そう書いて、ミューテーション #49 が生き残ったことで判明した）。
+    /// 有効化の前後で値が変わることまで見る。
+    ///
+    /// - Important: **システム全体の状態を一時的に変える。** `EnableSecureEventInput()` は
+    ///   参照カウント方式（実測: 2 回有効化 → 1 回解除では有効のまま、2 回解除で無効）なので、
+    ///   `defer` で必ず釣り合いを取る。有効な窓は実測 17 ms。
+    ///   プロセスが途中で落ちた場合もプロセス終了時に解除される。
+    @Test("secure input を有効にすると既定の判定が送出不可へ変わる")
+    func secureInputBlocksDefaultSender() throws {
+        try #require(!IsSecureEventInputEnabled(), "他プロセスが secure input を有効にしている")
+
+        // secure input 以外の門は開けておく。閉じたままだと差が出ず、何も検査できない。
+        // `isSecureInputEnabled` は既定のまま＝実 API を使う。
+        let sender = SystemPasteShortcutSender(
+            authorization: PostEventAuthorization(probe: { true })
+        )
+        #expect(sender.canSend, "有効化前は送れる前提が崩れている")
+
+        try #require(EnableSecureEventInput() == noErr)
+        defer { _ = DisableSecureEventInput() }
+
+        #expect(IsSecureEventInputEnabled(), "有効化できていない（前提が崩れている）")
+        #expect(!sender.canSend, "既定の判定が secure input を見ていない")
     }
 }

@@ -5,6 +5,10 @@ import Foundation
 ///
 /// AX は一部アプリ（Electron 製など）で無言失敗するため、経路を一本に絞れない（R-4）。
 ///
+/// - Important: 一段目の「失敗」は **AX API のステータス**でしか判定できない。
+///   成功を返しながら何も入らない無言失敗は素通りし、`.ax` として記録される
+///   （`AccessibilityInserter` の注記を参照）。
+///
 /// ```
 /// AccessibilityInserter が適用可能か判定
 ///   ├─ 可 → 実行 → 成功: .ax / 失敗: 次へ
