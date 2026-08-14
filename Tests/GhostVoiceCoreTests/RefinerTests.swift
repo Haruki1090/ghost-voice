@@ -17,16 +17,27 @@ struct RefinerTests {
 
     /// 打ち切りは「nil が返る」だけでは測れない。作業の完了を待ってから nil を返す
     /// 実装でも `out == nil` は通ってしまうので、経過時間で打ち切りの有無を見る。
+    ///
+    /// **線の決め方（規律 10）。** ここが弁別するのは「打ち切った（50 ms）」と
+    /// 「作業の完了を待った（5 秒）」で、**2 秒はその間に置いた壊れ検知の線であって
+    /// 要件値ではない**（要件は NFR-P4 の 500 ms で、それを見るのは実機の中央値の検査）。
+    ///
+    /// **遅い側を 400 ms から 5 秒へ広げた。** 実測すると `Task.sleep(50ms)` の
+    /// 実所要は p50 54 ms・**最大 167 ms**（静かなプロセス / n=200）で、
+    /// 同一プロセスで実時間の音声認識が走っている間は **859 ms** まで伸びた
+    /// （Task 11 で実際にこの検査が落ちた値）。旧構成は「線 300 ms・遅い側 400 ms」で、
+    /// **ノイズの幅が両者の隙間より大きかった。** 線を上げるだけでは弁別が消えるので、
+    /// **速い側と遅い側の距離そのものを広げてある**（緑の経路の所要は変わらない）。
     @Test("タイムアウトすると作業の完了を待たずに nil を返す")
     func timesOut() async {
-        let stub = StubRefiner(result: "整形結果", delay: .milliseconds(400))
+        let stub = StubRefiner(result: "整形結果", delay: .seconds(5))
 
         let start = ContinuousClock.now
         let out = await stub.refine("生", locale: .jaJP, terms: [], timeout: .milliseconds(50))
         let elapsed = ContinuousClock.now - start
 
         #expect(out == nil)
-        #expect(elapsed < .milliseconds(300), "打ち切りが効いていない: \(elapsed)")
+        #expect(elapsed < .seconds(2), "打ち切りが効いていない（線は壊れ検知。要件値ではない）: \(elapsed)")
     }
 
     @Test("時間内なら結果を返す")
@@ -46,9 +57,13 @@ struct RefinerTests {
 
     /// 空白だけの認識結果に LLM を回しても意味が無く、その時間ぶん挿入が遅れる。
     /// 「遅延を待たずに」返ることまで見ないと、素通しの実装と区別が付かない。
+    ///
+    /// **線は 2 秒（壊れ検知であって要件値ではない）。** 弁別するのは
+    /// 「素通しした（0 ms）」と「整形へ回した（5 秒）」。`timesOut` と同じ理由で
+    /// 遅い側を広げてある（実測ノイズは最大 167 ms、飽和時 859 ms）。
     @Test("空白のみの入力は整形へ回さず nil を返す")
     func blankInputShortCircuits() async {
-        let stub = StubRefiner(result: "整形結果", delay: .milliseconds(400))
+        let stub = StubRefiner(result: "整形結果", delay: .seconds(5))
 
         for raw in ["", " ", "\n", "  \n\t "] {
             let start = ContinuousClock.now
@@ -56,7 +71,9 @@ struct RefinerTests {
             let elapsed = ContinuousClock.now - start
 
             #expect(out == nil, "入力 \(raw.debugDescription)")
-            #expect(elapsed < .milliseconds(300), "整形へ回している: \(raw.debugDescription) \(elapsed)")
+            #expect(
+                elapsed < .seconds(2),
+                "整形へ回している（線は壊れ検知。要件値ではない）: \(raw.debugDescription) \(elapsed)")
         }
     }
 
@@ -66,16 +83,22 @@ struct RefinerTests {
     ///
     /// `Task.sleep` はキャンセルに応じてしまうので、この性質の検証には使えない
     /// （待つ実装でも速く返り、区別が付かない）。応じない作業を用意している。
+    ///
+    /// **線は 2 秒（壊れ検知であって要件値ではない）。** 弁別するのは
+    /// 「打ち切った（50 ms）」と「応じない作業の完了を待った（5 秒）」。
+    /// 旧構成は「線 500 ms・遅い側 2 秒」で、実測ノイズ（飽和時 859 ms）が線を越えた。
     @Test("打ち切りに応じない作業でも時間内に返る")
     func doesNotWaitForUncancellableWork() async {
         let start = ContinuousClock.now
         let out = await withTimeout(.milliseconds(50)) {
-            await uncancellableWork(seconds: 2, returning: "遅れて完了")
+            await uncancellableWork(seconds: 5, returning: "遅れて完了")
         }
         let elapsed = ContinuousClock.now - start
 
         #expect(out == nil)
-        #expect(elapsed < .milliseconds(500), "打ち切った作業の完了を待っている: \(elapsed)")
+        #expect(
+            elapsed < .seconds(2),
+            "打ち切った作業の完了を待っている（線は壊れ検知。要件値ではない）: \(elapsed)")
     }
 
     @Test("時間内に終わった作業の値を withTimeout が返す")
@@ -226,7 +249,14 @@ struct FoundationModelRefinerDegradationTests {
             let elapsed = ContinuousClock.now - start
 
             #expect(out == nil, "\(reason)")
-            #expect(elapsed < .milliseconds(100), "モデルを呼びに行っている: \(reason) \(elapsed)")
+            // **線は 1 秒（壊れ検知であって要件値ではない）。**
+            // ここは遅い側を広げられない（相手が実モデル）。ただし利用不可のモデルへの
+            // 往復は速く失敗するので、この線が実際に捕まえるのは**ハングと桁違いの回帰**である。
+            // 100 ms だと実測ノイズ（最大 167 ms、飽和時 859 ms）で落ちるだけで、
+            // 弁別力はほとんど増えない。
+            #expect(
+                elapsed < .seconds(1),
+                "モデルを呼びに行っている（線は壊れ検知。要件値ではない）: \(reason) \(elapsed)")
         }
     }
 
@@ -360,7 +390,16 @@ struct FoundationModelRefinerDeviceTests {
         let elapsed = ContinuousClock.now - start
 
         #expect(out == nil)
-        #expect(elapsed < .milliseconds(100), "モデルへ投げている: \(elapsed)")
+        // **線は 1 秒（壊れ検知であって要件値ではない）。**
+        //
+        // 弁別の相手は実モデルの往復である。**当初はウォーム実測の 280〜410 ms を
+        // 相手だと見て 250 ms に置こうとしたが、それは推測だった。** ガードを外す変異を
+        // 当てて実測すると **1.771 秒と 3.603 秒**（2 回。空白のプロンプトは短い応答に
+        // ならない）。**最小の観測 1.771 秒に対しても線は 1.8 倍下**にあり、実測ノイズ
+        // （`Task.sleep` の遅れは静かなプロセスで最大 167 ms、飽和時 859 ms）より上にある。
+        #expect(
+            elapsed < .seconds(1),
+            "モデルへ投げている（線は壊れ検知。要件値ではない）: \(elapsed)")
     }
 
     /// `prewarm()` は「ロードの開始を促す」だけでは足りず、捨て推論まで通して初めて

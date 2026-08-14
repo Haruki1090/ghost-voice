@@ -188,7 +188,7 @@ struct DictationSessionTests {
         try await withTempRoot { root in
             let rig = makeRig(
                 root: root,
-                transcriber: StubTranscriber(StubTranscriber.Script(finishDelay: .seconds(1)))
+                transcriber: StubTranscriber(StubTranscriber.Script(finishDelay: .seconds(5)))
             )
             let run = Task { await rig.session.run() }
             defer { run.cancel() }
@@ -202,8 +202,14 @@ struct DictationSessionTests {
             let elapsed = ContinuousClock.now - released
 
             #expect(rig.inserter.inserted == ["整形後テキストです"])
-            // finish() は 1 秒掛かる。300 ms で通るなら、待っていない。
-            #expect(elapsed < .milliseconds(300), "finish() の復帰を待っている（実測 \(elapsed)）")
+            // **線は 2 秒（壊れ検知であって要件値ではない）。** 要件は NFR-P6（1000 ms）で、
+            // それを見るのは M5 の実測である。ここが弁別するのは「`finish()` の復帰を
+            // 待っていない（数 ms）」と「待った（5 秒）」。
+            // 旧構成は「線 300 ms・遅い側 1 秒」で、実測ノイズ（同一プロセスで実時間の
+            // 音声認識が走る間は 859 ms まで伸びた）が隙間を越えた。距離の方を広げてある。
+            #expect(
+                elapsed < .seconds(2),
+                "finish() の復帰を待っている（線は壊れ検知。要件値ではない。実測 \(elapsed)）")
         }
     }
 
@@ -905,7 +911,7 @@ struct DictationSessionTests {
     func startupDoesNotBlockOnPrewarm() async throws {
         try await withTempRoot { root in
             let refiner = SpyRefiner(result: "整形後テキストです")
-            refiner.prewarmDelay = .seconds(3)
+            refiner.prewarmDelay = .seconds(5)
             let rig = makeRig(root: root, refiner: refiner)
 
             let started = ContinuousClock.now
@@ -916,7 +922,12 @@ struct DictationSessionTests {
             try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
             let elapsed = ContinuousClock.now - started
 
-            #expect(elapsed < .seconds(1), "捨て推論の完了を待っている（実測 \(elapsed)）")
+            // **線は 2 秒（壊れ検知であって要件値ではない）。** 弁別するのは
+            // 「捨て推論を待たない（数 ms）」と「待つ（5 秒）」。実測ノイズの最大は
+            // 静かなプロセスで 167 ms、飽和時で 859 ms。
+            #expect(
+                elapsed < .seconds(2),
+                "捨て推論の完了を待っている（線は壊れ検知。要件値ではない。実測 \(elapsed)）")
             #expect(rig.audio.prepareCount == 1, "音声エンジンのウォームアップは待つ")
 
             // **待たないことと、呼ばないことは違う。** 上の検査だけだと、捨て推論を
