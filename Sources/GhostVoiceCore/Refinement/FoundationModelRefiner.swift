@@ -57,7 +57,7 @@ public final class FoundationModelRefiner: Refining {
         )
 
         guard let output else { return nil }
-        // **辞書も渡す。** 残存率の検査は「頼んだ置換を当てた後の入力」と比べる
+        // **辞書も渡す。** 追加字数の検査は「頼んだ置換を当てた後の入力」と比べる
         // （渡さないと FR-6 の置換が逸脱と区別できない。`RefinementGuard` の表）。
         return RefinementGuard.accept(output, refinementOf: raw, terms: terms)
     }
@@ -67,7 +67,11 @@ public final class FoundationModelRefiner: Refining {
     /// 打ち切った生成がこのセッションを掴んだまま残ることはありうる（`withTimeout` は
     /// 待たない）が、そのセッションは二度と参照されないので `concurrentRequests` に
     /// はならない。
-    private func generate(prompt: String, locale: Locale, timeout: Duration) async -> String? {
+    ///
+    /// **`internal` にしてあるのは計測のため。** `RefinementGuard` が何を捨てているかは
+    /// 「捨てる前の出力」を見ないと切り分けられない（`refine` は捨てた事実しか返さない）。
+    /// V-37 の切り分けで実際にこれが要った。公開 API ではない。
+    func generate(prompt: String, locale: Locale, timeout: Duration) async -> String? {
         let session = LanguageModelSession(
             instructions: RefinementPrompt.instructions(for: locale)
         )
