@@ -9,6 +9,17 @@ public enum InsertionMethod: String, Codable, Sendable {
     case pasteboard
     /// 挿入に失敗し、クリップボードへ残すのみに留めた
     case clipboardOnly
+    /// 挿入していない。**ESC で中断された発話**がこれになる。
+    ///
+    /// 基本設計書 §4 は「中断時、録音済み内容は破棄せず履歴に残す」と定めている。
+    /// 中断された発話は一度も挿入経路を通っていないので、`.ax` / `.pasteboard` /
+    /// `.clipboardOnly` のどれで記録しても事実に反する。特に `.clipboardOnly` は
+    /// 「クリップボードに残っている」という嘘になり、Task 8 が潰した
+    /// 「成功と記録されるのにテキストがどこにも無い」と同じ形の欠陥になる。
+    ///
+    /// 整形も経ていないため `refinedText` は nil であり、`undoCandidate` の
+    /// 対象にはならない（戻すべき挿入が存在しない）。効くのは FR-9 の再挿入だけである。
+    case notInserted
 }
 
 /// 挿入を試みた結果。

@@ -55,4 +55,11 @@ public protocol AudioCapturing: AnyObject, Sendable {
     /// - Important: **消費者は 1 つに限ること。** `AsyncStream` は複数の
     ///   `next()` を同時に待つと異常終了する。
     var level: AsyncStream<Float> { get }
+
+    /// 形式変換に失敗して**捨てた**バッファの数。
+    ///
+    /// - Important: **インスタンス生涯の累計であり、発話ごとにはリセットされない。**
+    ///   発話単位の値が要る場合は録音の前後で読んで差分を取ること
+    ///   （`DictationSession` が `Metrics.Sample.droppedBuffers` でそれを行う）。
+    var droppedBufferCount: Int { get }
 }
