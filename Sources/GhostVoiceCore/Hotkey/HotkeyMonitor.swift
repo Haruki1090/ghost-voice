@@ -22,6 +22,35 @@ public protocol HotkeyMonitor: AnyObject, Sendable {
     func start() throws
     func stop()
 
+    /// いま監視している PTT のバインド。
+    ///
+    /// **`Settings.hotkey` の写しではない。** 設定を保存しても `rebind(to:)` を
+    /// 呼ぶまで監視器は古いキーを見ている。設定画面は 2 つが食い違っていないかを
+    /// これで確かめられる。
+    ///
+    /// - Note: MainActor から同期で読んでよい（ロックを取るだけ）。
+    var currentBinding: HotkeyBinding { get }
+
+    /// PTT のバインドを差し替える（欠落 9 / 持ち越し項目 10）。
+    ///
+    /// フェーズ 1 では `binding` が init 固定で、**設定画面で PTT キーを変えても
+    /// プロセスを再起動するまで効かなかった。** `stop()` はストリームを終端し
+    /// （`AsyncStream` は終端を取り消せない）作り直しには `DictationSession` が
+    /// `let` で握っている監視器を差し替える必要があるので、**同じインスタンスの中で
+    /// タップだけを張り替える。**
+    ///
+    /// - Important: **録音中に呼ぶと `.interrupted` が流れる。** 新しいバインドでは
+    ///   古いキーの解放が届かないので、放っておくと録音が終わらない
+    ///   （持ち越し項目 14 と同じ形の穴になる）。`.cancelled` ではないので、
+    ///   そこまでの発話は確定して挿入される（基本設計書 §7 の縮退表）。
+    /// - Important: 設定画面は**録音していないとき**に呼ぶこと。上の縮退はあくまで保険である。
+    /// - Important: **MainActor から呼んでよい。** ファイル I/O は行わない
+    ///   （タップの生成は実測で約 40 ms 掛かるので、設定を変えた瞬間だけに限ること）。
+    /// - Throws: `HotkeyError.stopped` — `stop()` 済み。`HotkeyError.alreadyRunning` —
+    ///   `start()` の最中。張り替えに失敗した場合は `start()` と同じ失敗
+    ///   （`eventTapNotPermitted` / `tapDisabledAtStart`）を投げ、監視器は停止した状態になる。
+    func rebind(to binding: HotkeyBinding) throws
+
     /// セッションが**確定〜整形の処理中**かを知らせる。
     ///
     /// **これが無いと、キーを離した後の ESC が中断として届かない。**
@@ -279,14 +308,34 @@ public final class StubHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     private let continuation: AsyncStream<HotkeyEvent>.Continuation
     private let lock = NSLock()
     private var busyCalls: [Bool] = []
+    private var binding: HotkeyBinding
+    private var rebindCalls: [HotkeyBinding] = []
+    private var isStopped = false
 
-    public init() {
+    public init(binding: HotkeyBinding = .rightOption) {
+        self.binding = binding
         (events, continuation) = AsyncStream<HotkeyEvent>.makeStream()
     }
 
     public func start() throws {}
-    public func stop() { continuation.finish() }
+    public func stop() {
+        lock.withLock { isStopped = true }
+        continuation.finish()
+    }
     public func emit(_ event: HotkeyEvent) { continuation.yield(event) }
+
+    public var currentBinding: HotkeyBinding { lock.withLock { binding } }
+
+    /// `rebind` の呼ばれ方。**設定画面が監視器へ反映したか**を見る。
+    public var rebindings: [HotkeyBinding] { lock.withLock { rebindCalls } }
+
+    public func rebind(to newBinding: HotkeyBinding) throws {
+        try lock.withLock {
+            guard !isStopped else { throw HotkeyError.stopped }
+            binding = newBinding
+            rebindCalls.append(newBinding)
+        }
+    }
 
     /// `setSessionBusy` の呼ばれ方。**セッションが処理中を知らせているか**を見る。
     public var sessionBusyCalls: [Bool] { lock.withLock { busyCalls } }

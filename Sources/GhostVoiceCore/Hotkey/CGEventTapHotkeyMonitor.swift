@@ -111,7 +111,6 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     public let events: AsyncStream<HotkeyEvent>
     private let continuation: AsyncStream<HotkeyEvent>.Continuation
 
-    private let binding: HotkeyBinding
     private let listenAccessProbe: @Sendable () -> Bool
     private let accessibilityProbe: @Sendable () -> Bool
     private let tapController: any EventTapControlling
@@ -125,9 +124,13 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     /// 無制限に張り直すと、無効化と `.interrupted` の応酬が止まらなくなる。
     static let maxReEnableAttempts = 10
 
-    /// 下の 5 つを守る。**`tap` と `runLoopSource` も含める。**
-    /// コールバックはランループのスレッドから、`start` / `stop` は別のスレッドから来る。
+    /// 下の 6 つを守る。**`binding` / `tap` / `runLoopSource` も含める。**
+    /// コールバックはランループのスレッドから、`start` / `stop` / `rebind` は
+    /// 別のスレッドから来る。
     private let lock = NSLock()
+    /// 監視している PTT のバインド。**`rebind(to:)` で差し替わる**ので、
+    /// 読むときは必ずロックの中で読むこと（`handle` は既にそうしている）。
+    private var binding: HotkeyBinding
     private var phase: Phase = .idle
     private var isRecording = false
     /// セッションが確定〜整形の処理中か（`setSessionBusy`）。
@@ -150,6 +153,11 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     /// Task 10 / 11 はここを見てユーザーへ知らせること。
     public var isActive: Bool {
         lock.withLock { phase == .running && !tapDead }
+    }
+
+    /// いま監視している PTT のバインド（`HotkeyMonitor` の契約）。
+    public var currentBinding: HotkeyBinding {
+        lock.withLock { binding }
     }
 
     public init(
@@ -201,10 +209,11 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         case .idle:
             phase = .starting
         }
+        let current = binding
         lock.unlock()
 
         do {
-            try openTap()
+            try openTap(binding: current)
         } catch {
             // **失敗しても .idle へ戻す。** 権限を与えたユーザーが
             // もう一度試せなくなるのは、権限フローとして成立しない。
@@ -220,7 +229,9 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         }
     }
 
-    private func openTap() throws {
+    /// - Parameter binding: **ロックの中で読み取った写しを渡すこと。**
+    ///   `rebind(to:)` と競合しうるので、生成の最中に差し替わった値を使ってはならない。
+    private func openTap(binding: HotkeyBinding) throws {
         let context = Unmanaged.passUnretained(self).toOpaque()
 
         let created = tapController.create(
@@ -283,8 +294,75 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.withLock { isSessionBusy = busy }
     }
 
+    /// PTT のバインドを差し替える（`HotkeyMonitor` の契約。欠落 9 / 持ち越し項目 10）。
+    ///
+    /// **タップを張り替える。** 監視するイベント種別はバインドで変わる（修飾キー単独では
+    /// `keyUp` を含めない。詳細設計書 §2.1）ので、`binding` を書き換えるだけでは
+    /// **⌃⌘Z へ変えたときに解放を検出できず、録音が永遠に終わらない。**
+    ///
+    /// **ストリームは終端しない。** `stop()` して作り直す形にすると、`DictationSession` が
+    /// `let` で握っている監視器を差し替える必要があり、公開 API か組み立て方の変更になる
+    /// （持ち越し項目 10 の指摘）。同じインスタンスの中でタップだけを替えれば波及しない。
+    ///
+    /// - Important: **録音中に呼ぶと `.interrupted` を出す。** 古いキーの解放はもう
+    ///   届かないので、出さないと録音が終わらない状態で固まる（項目 14 と同じ形）。
+    ///   `.cancelled` ではないので、そこまでの発話は確定して挿入される。
+    public func rebind(to newBinding: HotkeyBinding) throws {
+        lock.lock()
+        switch phase {
+        case .stopped:
+            lock.unlock()
+            throw HotkeyError.stopped
+        case .starting:
+            // 起動の最中。`create` は実測で約 40 ms 掛かる。ここで割り込むと、
+            // 開きかけのタップと張り替えたタップが二重になる。
+            lock.unlock()
+            throw HotkeyError.alreadyRunning
+        case .idle:
+            binding = newBinding
+            let wasRecording = isRecording
+            isRecording = false
+            lock.unlock()
+            if wasRecording { continuation.yield(.interrupted) }
+            return
+        case .running:
+            let oldTap = tap
+            let oldSource = runLoopSource
+            let wasRecording = isRecording
+            binding = newBinding
+            tap = nil
+            runLoopSource = nil
+            isRecording = false
+            // 新しいタップには再有効化の予算を渡し直す。古いタップの回数を持ち越すと、
+            // 張り替えたのに 1 回で諦めることがある。
+            tapDead = false
+            reEnables.store(0, ordering: .relaxed)
+            // **`.starting` を通る。** 一旦 `.idle` にすると、その隙に `start()` が
+            // 成功してタップが二枚になる。
+            phase = .starting
+            lock.unlock()
+
+            teardown(tap: oldTap, source: oldSource)
+            if wasRecording { continuation.yield(.interrupted) }
+
+            do {
+                try openTap(binding: newBinding)
+            } catch {
+                // **動いているふりをしない。** 権限を直した利用者が `start()` で
+                // やり直せるよう `.idle` へ戻す（`stop()` が付けた `.stopped` は巻き戻さない）。
+                lock.lock()
+                if phase == .starting { phase = .idle }
+                lock.unlock()
+                throw error
+            }
+        }
+    }
+
     /// 停止する。**ストリームは終端し、以後この監視器は再起動できない**
     /// （`AsyncStream` は終端を取り消せない）。再開したい場合は作り直すこと。
+    ///
+    /// - Note: PTT キーを変えたいだけなら `rebind(to:)` を使うこと。こちらを通すと
+    ///   ストリームが終端し、監視器を作り直すしかなくなる。
     public func stop() {
         lock.lock()
         let currentTap = tap
@@ -297,14 +375,21 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         phase = .stopped
         lock.unlock()
 
-        if let currentTap {
-            tapController.setEnabled(currentTap, false)
-            CFMachPortInvalidate(currentTap)
+        teardown(tap: currentTap, source: source)
+        if !wasStopped { continuation.finish() }
+    }
+
+    /// タップとランループソースを捨てる。**順序は無効化 → 取り外し → invalidate。**
+    /// `stop()` と `rebind(to:)` で同じ手順を使う（片方だけ順序が違うと、
+    /// 捨てたはずのタップへコールバックが飛ぶ窓ができる）。
+    private func teardown(tap: CFMachPort?, source: CFRunLoopSource?) {
+        if let tap {
+            tapController.setEnabled(tap, false)
+            CFMachPortInvalidate(tap)
         }
         if let source {
             CFRunLoopRemoveSource(runLoop, source, .commonModes)
         }
-        if !wasStopped { continuation.finish() }
     }
 
     private static let callback: CGEventTapCallBack = { _, type, event, refcon in
