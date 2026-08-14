@@ -160,22 +160,28 @@ public struct AccessibilityInserter: PrimaryInserting {
         return accessibility.isSelectedTextRangeSettable(element)
     }
 
+    /// - Important: **書き込みは世代の錠の中で行う**（`InsertionEpoch.withExclusiveWrite`）。
+    ///   同じ組の差し替え（`TextReplacer.replace`）と重なると、片方が読み戻した内容と
+    ///   実際の内容がずれる。以前は「差し替えを actor 上で同期に走らせる」ことで
+    ///   重なりを塞いでいたが、**その代償として最大 6 秒 actor が塞がっていた。**
     public func tryInsert(_ text: String) async -> InsertionAttempt {
-        // `canInsert()` とは別にフォーカスを取り直す。その隙にフォーカスが動きうるので、
-        // 自プロセス判定はここでも掛ける。
-        guard let element = accessibility.focusedElement(),
-              let pid = safeTargetProcessIdentifier(element)
-        else { return .failed }
+        epoch.withExclusiveWrite {
+            // `canInsert()` とは別にフォーカスを取り直す。その隙にフォーカスが動きうるので、
+            // 自プロセス判定はここでも掛ける。
+            guard let element = accessibility.focusedElement(),
+                  let pid = safeTargetProcessIdentifier(element)
+            else { return .failed }
 
-        // **書き込みの前に選択位置を読む。** 書いた後では「どこから書いたか」が判らない
-        // （下記）。読むのは整数 2 つで、文字は含まない。
-        let before = capturesReplacementAnchor ? accessibility.selectedRange(of: element) : nil
+            // **書き込みの前に選択位置を読む。** 書いた後では「どこから書いたか」が判らない
+            // （下記）。読むのは整数 2 つで、文字は含まない。
+            let before = capturesReplacementAnchor ? accessibility.selectedRange(of: element) : nil
 
-        guard accessibility.setSelectedText(text, on: element) else { return .failed }
+            guard accessibility.setSelectedText(text, on: element) else { return .failed }
 
-        // **ここから先で何が起きても、テキストは既に入っている。**
-        // 錨が取れなければ差し替えを諦めるだけで、挿入は成功のまま返す。
-        return .inserted(anchor: anchor(for: text, on: element, pid: pid, before: before))
+            // **ここから先で何が起きても、テキストは既に入っている。**
+            // 錨が取れなければ差し替えを諦めるだけで、挿入は成功のまま返す。
+            return .inserted(anchor: anchor(for: text, on: element, pid: pid, before: before))
+        }
     }
 
     /// 書き込んだ場所の錨を作る。取れなければ nil（＝後から差し替えない）。

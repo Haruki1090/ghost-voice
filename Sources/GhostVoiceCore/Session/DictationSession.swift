@@ -275,6 +275,11 @@ public actor DictationSession {
     /// 挿入時刻からではない——(a) では挿入と差し替えの間に最大 NFR-P6b ぶんの隔たりがある）。
     private var undoExpiry: ContinuousClock.Instant?
     private var undoExpiryTask: Task<Void, Never>?
+    /// 進行中の Undo。**`isBusy` には数えない**（`pendingRevision` と同じ理由）。
+    ///
+    /// `run()` のループから待たずに起こす。待つと、AX が詰まる相手で
+    /// **その間の PTT が丸ごと処理されない**（最終レビュー 視点3 の指摘 2）。
+    private var undoTask: Task<Void, Never>?
 
     /// 確定テキストが出そろったか。**「最初の確定が届いたか」ではない。**
     ///
@@ -653,7 +658,8 @@ public actor DictationSession {
             // キー解放を受け取れなくなっただけなので、最大録音時間の満了と同じく
             // **確定として扱い、そこまでの発話を届ける。** 利用者は喋っていたのだから。
             case .interrupted: stopRecording(cancelled: false)
-            case .undoRequested: performUndo()
+            // **待たない。** 待つとイベントループが止まり、その間の PTT が処理されない。
+            case .undoRequested: beginUndo()
             }
         }
         await completionTask?.value
@@ -662,6 +668,8 @@ public actor DictationSession {
         // 待つと終了が最大 NFR-P6b（既定 3 秒）延びる（設計 opus §3.3）。
         pendingRevision?.cancel()
         pendingRevision = nil
+        undoTask?.cancel()
+        undoTask = nil
         levelTask?.cancel()
         levelTask = nil
         assetTask?.cancel()
@@ -1202,20 +1210,31 @@ public actor DictationSession {
     /// 整形が返った（あるいは打ち切られた）。**ここが唯一、欄を後から書き換える場所である。**
     ///
     /// - Important: **`replacer.replace` は同期で、AX を 12 回呼ぶ**（実測 2026-08-15）。
-    ///   actor の上で同期に走らせているのは意図である——**その間に挿入が割り込めない**
-    ///   ことが、世代の照合と実際の書き込みのあいだに窓を作らないための保証になる。
-    ///   代償は、そのあいだに PTT が押されると `startRecording` が待たされること
-    ///   （NFR-P1 の 50 ms の予算を食う）。
+    ///   **actor の上では走らせない**（`runOffActor`）。
+    ///
+    ///   フェーズ 2 の途中まで actor 上で同期に走らせており、その意図は
+    ///   「世代の照合と実際の書き込みのあいだに挿入が割り込めないこと」だった。
+    ///   **代償が重すぎた**——AX の往復の上限は 1 回 0.5 秒（`SystemAccessibility`）なので、
+    ///   固まった相手では**最大 12×0.5 = 約 6 秒 actor が塞がる。**
+    ///   その間 `run()` は `for await event in hotkey.events` から再開できず、
+    ///   **PTT の押下も解放も、届いているのに処理されない**——
+    ///   利用者は喋っているのに録音が始まらず、**発話が丸ごと落ちる**
+    ///   （最終レビュー 視点3 の指摘 2）。しかも `beginPendingRevision` は
+    ///   意図的に `.idle` へ戻して次の PTT を受け付ける設計なので、
+    ///   これは例外ではなく**通常経路**である。
+    ///
+    ///   **割り込みは別の手段で塞いだ**——世代の錠（`InsertionEpoch.withExclusiveWrite`）で
+    ///   挿入と差し替えを直列化する。**同じ組で作られる**ことが既に規律なので、
+    ///   配線が増えない。
     ///
     ///   **実測（V-36 / 詳細設計書 §10.1 / 代役の欄・実ディスク書き込み）**:
-    ///   押下 → 録音開始は 中央値 1.3 ms / 最大 3.5 ms（低負荷）、
-    ///   中央値 2.3 ms / 最大 2.7 ms（負荷下）。**配線ぶんは予算を食わない。**
-    ///   待たされる量はほぼ `12 × AX 1 往復 + 2 ms` で、
-    ///   **1 往復が約 4 ms を超える相手では 50 ms を破る。**
+    ///   AX 1 往復あたり 10 ms を注入した相手で、押下 → 録音開始は
+    ///   **166.5 ms（低負荷）/ 168.7 ms（負荷下）→ 対処後 2 ms 台**。
+    ///   注入 0 ms では前後とも 3 ms 未満で変わらない。
     ///   実アプリでの 1 往復のコストは未実測（V-28 / V-36）。
     ///
-    /// - Important: **ここに同期の作業を足さないこと。** 足せば実アプリでの余裕が
-    ///   そのぶん減る。`RevisionBlockingRegressionTests` が 25 ms の線で見張っている
+    /// - Important: **ここに actor を握ったままの同期作業を足さないこと。**
+    ///   `RevisionBlockingRegressionTests` が壊れ検知の線で見張っている
     ///   （**線は壊れ検知であって要件値ではない**）。
     private func applyRevision(
         _ refined: String?,
@@ -1224,7 +1243,7 @@ public actor DictationSession {
         utterance: Int,
         releasedAt: ContinuousClock.Instant,
         refineStart: ContinuousClock.Instant
-    ) {
+    ) async {
         pendingRevision = nil
         // **この発話がまだ「直近」か。** 次の発話が始まっていたら、状態も計測値も
         // そちらのものなので触らない（差し替えそのものは撃ってよい——欄を触るのは
@@ -1232,7 +1251,9 @@ public actor DictationSession {
         let isCurrent = (utterance == self.utterance)
         let canShowState = isCurrent && phase == .idle
         defer {
-            if canShowState {
+            // **actor を手放している間に次の発話が始まっていることがある。**
+            // そのときの状態はそちらのものなので、ここからは触らない。
+            if canShowState, utterance == self.utterance, phase == .idle {
                 hotkey.setSessionBusy(false)
                 emit(.idle)
             }
@@ -1274,9 +1295,10 @@ public actor DictationSession {
         }
 
         if canShowState { emit(.revising) }
-        let result = replacer.replace(anchor, with: refined)
+        // **actor を手放して走らせる**（上の注記）。世代の錠が挿入との重なりを塞ぐ。
+        let result = await Self.runOffActor { replacer.replace(anchor, with: refined) }
         let revision = ContinuousClock.now - releasedAt
-        if isCurrent {
+        if utterance == self.utterance {
             latestMetrics = latestMetrics?.rewriting(refine: refineElapsed, revision: revision)
         }
 
@@ -1294,6 +1316,24 @@ public actor DictationSession {
             // 履歴・クリップボード・告知・以後の締め出しの 4 重で受けてある。
             notify(.textMayHaveBeenLost)
         }
+    }
+
+    /// **actor を手放して、同期の AX 往復を走らせる。**
+    ///
+    /// `TextReplacer.replace` / `undo` は同期で AX を最大 12 回叩く。1 往復の上限は
+    /// 0.5 秒（`SystemAccessibility.messagingTimeout`）なので、固まった相手では
+    /// **約 6 秒**掛かる。それを actor の上で走らせると、その間
+    /// **PTT の押下も解放も処理されず、発話が丸ごと落ちる**（最終レビュー 視点3 の指摘 2）。
+    ///
+    /// - Important: **`Task.detached` である。** 呼び出し元がキャンセルされても
+    ///   途中で畳まない——AX の書き込みは途中で止められる操作ではなく、
+    ///   止まった先の欄がどうなっているか判らなくなる（`.lost` を自分で作ることになる）。
+    /// - Important: **重なりは世代の錠が塞ぐ**（`InsertionEpoch.withExclusiveWrite`）。
+    ///   actor を手放しても、同じ組の挿入と AX の書き込みが交錯することは無い。
+    private static func runOffActor<T: Sendable>(
+        _ body: @escaping @Sendable () -> T
+    ) async -> T {
+        await Task.detached(priority: .userInitiated) { body() }.value
     }
 
     /// 保留中の差し替えを取りやめる（ESC / FR-7 の 1 行目）。
@@ -1341,9 +1381,24 @@ public actor DictationSession {
     /// 成功した差し替えからしか作られないので、**`.clipboardOnly` の発話へ
     /// Undo を撃つ経路は型として存在しない。**
     ///
+    /// **Undo を始める。待たない。**
+    ///
+    /// `run()` のイベントループから呼ばれるので、**ここで待つとループが止まる。**
+    /// `undo` は `replace` と同じ原始操作なので、AX が詰まる相手では最大約 6 秒掛かる。
+    /// その間ループが止まると、**PTT の押下も解放も処理されない**
+    /// （最終レビュー 視点3 の指摘 2。`applyRevision` と同じ形が `performUndo` にもあった）。
+    ///
+    /// - Note: 続けて 2 回撃たれても二重には戻さない。`performUndo` は書き換えの前に
+    ///   `clearUndoTarget()` するので、2 回目は錨を見つけられず縮退（クリップボードへの
+    ///   取り出し）へ落ちる。**これは 10 秒窓を過ぎた場合とまったく同じ結末である。**
+    private func beginUndo() {
+        undoTask = Task { [weak self] in await self?.performUndo() }
+    }
+
     /// - Important: **`replace` と同じ原始操作を逆向きに使うだけである。**
     ///   したがって secure input 中は同じ判定で拒否される（`TextReplacer.replace`）。
-    private func performUndo() {
+    /// - Important: **`replacer.undo` は actor を手放して走らせる**（`runOffActor`）。
+    private func performUndo() async {
         // 差し替えがまだ保留中なら、**取りやめるだけ。何も書き換えない**（FR-7 の 1 行目）。
         if pendingRevision != nil, undoAnchor == nil {
             cancelPendingRevision()
@@ -1363,8 +1418,10 @@ public actor DictationSession {
 
         let canShowState = (phase == .idle)
         if canShowState { emit(.revising) }
-        let result = replacer.undo(anchor)
-        if canShowState { emit(.idle) }
+        // **actor を手放して走らせる**（`runOffActor` の注記）。
+        let result = await Self.runOffActor { replacer.undo(anchor) }
+        // 手放している間に次の発話が始まっていることがある。そのときの状態はそちらのもの。
+        if canShowState, phase == .idle { emit(.idle) }
 
         switch result {
         case .replaced:

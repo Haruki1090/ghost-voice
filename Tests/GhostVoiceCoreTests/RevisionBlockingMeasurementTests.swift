@@ -109,6 +109,7 @@ struct RevisionBlockingMeasurement {
             let settings = SettingsStore(rootURL: root)
             try settings.update { $0.refinementApplyMode = .afterInsert }
             let hotkey = StubHotkeyMonitor()
+            let history = HistoryStore(rootURL: root, limit: 200)
             let session = DictationSession(
                 settings: settings,
                 hotkey: hotkey,
@@ -116,7 +117,7 @@ struct RevisionBlockingMeasurement {
                 transcriber: StubTranscriber(finalText: "えー、整形される発話です"),
                 refiner: StubRefiner(result: "整形された発話です。", delay: .milliseconds(200)),
                 insertion: BlockingWorld.stack(accessibility: accessibility),
-                history: HistoryStore(rootURL: root, limit: 200),
+                history: history,
                 vocabulary: VocabularyStore(rootURL: root),
                 isSecureInputEnabled: { false },
                 postEventAuthorization: PostEventAuthorization(probe: { false })
@@ -128,14 +129,22 @@ struct RevisionBlockingMeasurement {
             defer { run.cancel() }
 
             for pass in 1...Self.passes {
+                let baseline = history.entries.count
                 hotkey.emit(.pressed)
                 try await waitUntil("\(pass) 回目の録音が始まる") {
                     if case .recording = await session.state { return true }
                     return false
                 }
                 hotkey.emit(.released)
-                try await waitUntil("\(pass) 回目が待機へ戻る", timeout: .seconds(30)) {
-                    await session.state == .idle
+                // **挿入が終わった時点で仕掛ける。**「`.idle` になったら」で待つと、
+                // (a) の分岐は挿入直後と差し替え後の 2 回 `.idle` になるので、
+                // 2 回目を掴んだ標本は「差し替えの最中に押せなかった」まま
+                // 30 秒待って落ちる（対処前後の両方で観測した）。
+                // 履歴に載るのは挿入の直後・差し替えの開始より前なので、ここが唯一の
+                // 「必ず差し替えより前」の目印である。**この発話ぶんが増えたことを見る**
+                // （件数の絶対値で見ると、前の周回の分で既に成立していて早すぎる）。
+                try await waitUntil("\(pass) 回目の挿入が終わる", timeout: .seconds(30)) {
+                    history.entries.count > baseline
                 }
 
                 let pressedAt = PressStamp()
@@ -423,38 +432,51 @@ final class BackgroundLoad: Sendable {
 
 // MARK: - 常時走る退行検知（計測ではない）
 
-/// **差し替えの「配線ぶん」が actor を握り続けていないことを、毎回の `swift test` で見る。**
+/// **差し替えが actor を握り続けていないことを、毎回の `swift test` で見る。**
 ///
-/// V-36 の実測（2026-08-15 / MacBook Pro M3 / macOS 26.5.2）で判ったのは、
-/// **待たされる量は AX の往復コストがすべて**だということである:
+/// V-36 の実測（2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2 / 各 5 標本）:
 ///
-/// | AX 1 往復の注入 | 押下 → 録音開始（最大） |
+/// | AX 1 往復の注入 | 押下 → 録音開始（最大） 対処前 → **対処後** |
 /// |---|---|
-/// | 0 ms（代役の欄） | **3.5 ms（低負荷） / 2.7 ms（負荷下）** |
-/// | 2 ms | 35.1 / 35.6 ms |
-/// | 10 ms | 146.6 / 151.4 ms |
+/// | 0 ms（代役の欄） | 1.9 / 2.5 ms → **2.7 / 2.6 ms** |
+/// | 2 ms | 39.1 / 37.9 ms → **2.0 / 2.2 ms** |
+/// | 10 ms | 164.2 / 170.0 ms → **3.1 / 3.0 ms** |
 ///
-/// 差し替えは AX を **12 回**呼ぶので、待たされる量はおよそ `12 × 往復 + 2 ms`。
-/// **往復が 4 ms を超える相手では NFR-P1（50 ms）を破る。**
+/// （各セルは 低負荷 / 負荷下。負荷は `yes` 16 本）
 ///
-/// ここが守るのは**その 12 回に 13 回目を足させないこと**——
-/// actor を握ったまま同期の作業（ディスク・ネットワーク・別の AX 往復）を
-/// 増やす変更が入れば、実アプリでの余裕がそのぶん減る。
+/// **対処前は「待たされる量 ≒ 12 × AX 1 往復」だった**——差し替えを
+/// `DictationSession` の actor 上で同期に走らせていたためである。AX の往復の上限は
+/// 1 回 0.5 秒なので、**固まった相手では最大約 6 秒 actor が塞がり、
+/// その間 PTT の押下も解放も処理されない**（＝喋っているのに録音が始まらず、
+/// 発話が丸ごと落ちる。最終レビュー 視点3 の指摘 2）。
+///
+/// **対処後は往復コストに依存しない。** 差し替えは actor を手放して走り
+/// （`DictationSession.runOffActor`）、挿入との重なりは世代の錠
+/// （`InsertionEpoch.withExclusiveWrite`）が塞ぐ。
+///
+/// ここが守るのは**その性質そのもの**——
+/// **AX が遅い相手でも押下が待たされないこと**である。
+/// だから注入 0 ms では測らない（対処前でも通ってしまい、何も掴めない）。
 ///
 /// **線は 25 ms（壊れ検知であって要件値ではない）。** 要件は NFR-P1 の 50 ms で、
 /// それを見るのは実アプリでの計測（V-36 / V-28）である。
-/// 実測の最大 3.5 ms に対して 7 倍、要件値の半分に置いてある。
+/// 注入 10 ms での実測 最大 3.1 ms に対して 8 倍、対処前の 164 ms に対しては 1/6.5 で、
+/// **actor を握る実装へ戻した瞬間に赤くなる。**
 @Suite("差し替えが PTT を待たせないこと（V-36 の退行検知）")
 struct RevisionBlockingRegressionTests {
 
-    @Test("差し替えの最中に PTT を押しても、押下から録音開始までが壊れ検知の線を割らない")
+    @Test("AX が遅い相手でも、差し替えの最中の押下から録音開始までが壊れ検知の線を割らない")
     func pressDuringRevisionStaysResponsive() async throws {
         try await withTempRoot { root in
+            // **1 往復 10 ms を注入する。** 0 ms だと差し替えが actor を握っていても
+            // 通ってしまい、この検査は何も掴まない（対処前の実測 2.5 ms）。
             let accessibility = LatencyInjectingAccessibility(
-                BlockingWorld.accessibility(for: BlockingWorld.freshField()), perCall: .zero)
+                BlockingWorld.accessibility(for: BlockingWorld.freshField()),
+                perCall: .milliseconds(10))
             let settings = SettingsStore(rootURL: root)
             try settings.update { $0.refinementApplyMode = .afterInsert }
             let hotkey = StubHotkeyMonitor()
+            let history = HistoryStore(rootURL: root, limit: 20)
             let session = DictationSession(
                 settings: settings,
                 hotkey: hotkey,
@@ -462,7 +484,7 @@ struct RevisionBlockingRegressionTests {
                 transcriber: StubTranscriber(finalText: "えー、整形される発話です"),
                 refiner: StubRefiner(result: "整形された発話です。", delay: .milliseconds(50)),
                 insertion: BlockingWorld.stack(accessibility: accessibility),
-                history: HistoryStore(rootURL: root, limit: 20),
+                history: history,
                 vocabulary: VocabularyStore(rootURL: root),
                 isSecureInputEnabled: { false },
                 postEventAuthorization: PostEventAuthorization(probe: { false })
@@ -476,8 +498,12 @@ struct RevisionBlockingRegressionTests {
                 return false
             }
             hotkey.emit(.released)
-            try await waitUntil("待機へ戻る", timeout: .seconds(30)) {
-                await session.state == .idle
+            // **挿入が終わった時点で仕掛ける。** (a) の分岐は挿入直後と差し替え後の
+            // 2 回 `.idle` になるので、`.idle` で待つと 2 回目を掴んで
+            // 「差し替えの最中に押せなかった」まま落ちうる。履歴に載るのは
+            // 挿入の直後・差し替えの開始より前なので、ここが唯一の確かな目印である。
+            try await waitUntil("挿入が終わる", timeout: .seconds(30)) {
+                !history.entries.isEmpty
             }
 
             // **差し替えの最初の AX 呼び出しに合わせて押す。** 時計で狙うと

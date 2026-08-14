@@ -245,7 +245,20 @@ public final class TextReplacer: Sendable {
     ///
     /// - Returns: **`.replaced` 以外は「欄を書き換えていない」。**
     ///   `.lost` だけが「判らない」で、そこは退避・告知・締め出しを済ませてある。
+    /// - Important: **同期である。AX の往復を最大 12 回行う**（1 往復の上限は 0.5 秒）。
+    ///   **actor の上で呼んではならない**——相手が固まると最大約 6 秒 actor が塞がり、
+    ///   その間 PTT の押下も解放も処理されない（＝喋っているのに録音が始まらない。
+    ///   最終レビュー 視点3 の指摘 2）。`DictationSession` は `runOffActor(_:)` を通す。
+    /// - Important: 世代の照合から書き込みまでを**世代の錠**の中で行う
+    ///   （`InsertionEpoch.withExclusiveWrite`）。actor を手放しても、同じ組の挿入とは
+    ///   重ならない。
     public func replace(_ anchor: ReplacementAnchor, with replacement: String)
+        -> ReplacementResult
+    {
+        epoch.withExclusiveWrite { replaceExclusively(anchor, with: replacement) }
+    }
+
+    private func replaceExclusively(_ anchor: ReplacementAnchor, with replacement: String)
         -> ReplacementResult
     {
         // --- ここから: AX の往復を伴わない判定（安い順） ---

@@ -45,8 +45,24 @@ public enum RangeMatch: String, Sendable, Equatable {
 /// 次の発話の挿入が始まった時点で、前の発話の差し替えは撃ってはならない
 /// （設計 opus §3.3「直列性と後始末」）。破棄しても生テキストは欄に残るので、
 /// **いつ破棄しても「何も書き換えていない」状態で終わる。**
+/// ## 書き込みの直列化もここが持つ
+///
+/// 挿入（`AccessibilityInserter.tryInsert`）と差し替え（`TextReplacer.replace`）は
+/// **同じ入力欄を同じ AX API で書き換える。** 重なると、片方が読み戻した内容と
+/// 実際の内容がずれ、**利用者の欄が壊れる。**
+///
+/// フェーズ 2 の途中まで、この重なりは「差し替えを `DictationSession` の actor 上で
+/// 同期に走らせる」ことで塞いでいた。**その代償が重すぎた**——AX の往復が詰まる相手では
+/// 最大 12×0.5 = 約 6 秒 actor が塞がり、その間 PTT の押下も解放も処理されない
+/// （＝喋っているのに録音が始まらず、発話が丸ごと落ちる。最終レビュー 視点3 の指摘 2）。
+///
+/// そこで**直列化だけをここへ移した。** 世代とロックは「同じ組で作られる」ことが
+/// 既に規律になっている（`InsertionStack`）ので、**新しく 3 つ目の共有物を配線しなくて済む。**
 public final class InsertionEpoch: Sendable {
     private let value = Atomic<UInt64>(1)
+    /// AX への書き込みを直列化する錠。**再帰しない**ので、
+    /// この中からもう一度 `withExclusiveWrite` を呼んではならない。
+    private let writeLock = NSLock()
 
     public init() {}
 
@@ -57,6 +73,19 @@ public final class InsertionEpoch: Sendable {
     @discardableResult
     public func advance() -> UInt64 {
         value.add(1, ordering: .relaxed).newValue
+    }
+
+    /// **同じ組の挿入と差し替えが、AX の書き込みで重ならないようにする。**
+    ///
+    /// - Important: **actor の上で呼んではならない。** 相手が固まっていれば
+    ///   最大で AX の上限（1 往復 0.5 秒）×往復数だけ待つ。呼び出し側は
+    ///   `DictationSession.runOffActor(_:)` のように actor を手放してから入ること。
+    /// - Important: **再帰しない。** 世代の照合と書き込みを 1 つの区間に閉じるための
+    ///   錠なので、区間の中で AX 以外の重い作業（ディスク・待ち合わせ）をしないこと。
+    public func withExclusiveWrite<R>(_ body: () -> R) -> R {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        return body()
     }
 }
 
