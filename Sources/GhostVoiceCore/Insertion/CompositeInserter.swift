@@ -86,13 +86,19 @@ public struct CompositeInserter: TextInserting {
     /// **最後の砦は Pasteboard 経路と同じクリップボードを見ていなければならない。**
     /// 別の `NSPasteboard` を掴んだ最後の砦を組むと、残したテキストが
     /// ユーザーには見えない場所へ行く。同じインスタンスを二役で渡している。
+    ///
+    /// - Parameter restoreDelay: ⌘V の送出からクリップボードを戻すまでの待ち。
+    ///   **実測 35 ms は下限であり上限ではない**（`PasteboardInserter.defaultRestoreDelay`
+    ///   の留保 2 つ）。相手が重いアプリで貼り付けが空振りするなら、ここを延ばして試す。
     public static func system(
         accessibility: any AccessibilityProbing = SystemAccessibility(),
         pasteboard: NSPasteboard = .general,
         sender: any PasteShortcutSending = SystemPasteShortcutSender(),
+        restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) -> CompositeInserter {
-        let pasteboardInserter = PasteboardInserter(pasteboard: pasteboard, sender: sender)
+        let pasteboardInserter = PasteboardInserter(
+            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay)
         return CompositeInserter(
             primary: AccessibilityInserter(accessibility: accessibility),
             fallback: pasteboardInserter,
