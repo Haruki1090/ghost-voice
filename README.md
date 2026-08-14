@@ -59,7 +59,58 @@ swift build -c release
 - **Ctrl-C** で終了する。**進行中の発話は最後まで見届けてから終了する**（挿入の途中でプロセスを
   落とすと、⌘V の送出後・クリップボードの復元前で消えてテキストがどこにも残らないため）
 
+## Ghost Voice.app（フェーズ 2）
+
+常駐アプリ（Dock に出ない `LSUIElement`）を組み立てる。**コマンド 1 本で完結する。**
+
+```bash
+Scripts/make-app.sh                  # ビルド → .app の組み立て → 署名。.build/app/Ghost Voice.app ができる
+Scripts/make-app.sh --allow-adhoc    # 署名用の証明書が無い環境向け（**権限が保たれない**。下記）
+Scripts/make-app.sh --help
+```
+
+`.xcodeproj` は作らない。SwiftPM の実行ファイルをスクリプトが `.app` へ組み立てる
+（`swift build` / `swift test` の走らせ方を変えないため）。
+
+> **署名は Apple Development 証明書で行う（既定）。ad-hoc は既定にしない。**
+> ad-hoc 署名の designated requirement は cdhash 単体で、**実装を 1 行変えて再ビルドしただけで
+> 別のアプリとして扱われる**。TCC の許可は designated requirement に紐づくので、
+> ad-hoc のままだと**ビルドのたびに権限を付け直す**ことになる。
+> 証明書で署名すれば、実コードを変えて再ビルドしても designated requirement は 1 文字も変わらない（実測）。
+> 証明書はキーチェーンにあるものが自動で使われる（`security find-identity -v -p codesigning`）。
+
+| 起動引数 | 内容 |
+|---|---|
+| （なし） | 常駐して PTT ディクテーションを行う。足りない権限があれば要求を出す（**ダイアログが出る**） |
+| `--shell-only` | **器だけを起動する。** マイクもキー監視も一切触らないので TCC のダイアログが出ない。フォーカスや配置の確認用 |
+| `--no-permission-prompts` | セッションは動かすが、権限の要求は出さない |
+
+```bash
+open ".build/app/Ghost Voice.app"                       # 通常起動
+open ".build/app/Ghost Voice.app" --args --shell-only   # 器だけ
+```
+
+起動時の案内（権限の 4 項目など）は**標準エラーと unified log の両方**へ出る。
+Finder から起動すると標準エラーはどこにも出ないので、こちらで読む:
+
+```bash
+log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
+```
+
 ## 必要な権限
+
+**フェーズ 1（CLI `ghost-voice`）とフェーズ 2（`Ghost Voice.app`）で、許可を与える相手が変わる。**
+どちらも「許可は責任プロセスに付く」という同じ規則の帰結である。
+
+| 起動するもの | 許可を与える相手 | システム設定の一覧に出る名前 |
+|---|---|---|
+| `ghost-voice`（素の実行ファイル） | **起動元のターミナルアプリ** | ターミナルアプリの名前（`ghost-voice` は現れない） |
+| `Ghost Voice.app` | **Ghost Voice 自身**（`open` 起動時の親は launchd） | `Ghost Voice` |
+
+**`.app` はターミナルアプリの許可を 1 つも引き継がない**（実測。詳細設計書 §9）。
+フェーズ 1 の利用者は 4 つとも付け直しになる → 下の「フェーズ 2: `Ghost Voice.app` への移行」。
+
+### フェーズ 1（CLI）の場合
 
 **許可の対象は `ghost-voice` ではなく、これを起動しているターミナルアプリである。**
 素の実行ファイルの TCC 権限は責任プロセス（起動元のアプリ）に紐づくので、
@@ -76,6 +127,18 @@ swift build -c release
 （`SFSpeechRecognizer.authorizationStatus()` が `notDetermined` のまま認識できることを実測で確認）。
 
 許可を与えたら、**ターミナルアプリを再起動してから** `--check` で確認すること。
+
+### フェーズ 2（`Ghost Voice.app`）の場合
+
+| 権限 | ペイン | 一覧に載せる方法 | 無いとどうなるか |
+|---|---|---|---|
+| マイク | プライバシーとセキュリティ > マイク | **初回起動時のダイアログで完結する** | 押しても録音が始まらない |
+| 入力監視 | プライバシーとセキュリティ > 入力監視 | アプリが要求を出すと一覧に載る。**トグルは手で入れる** | **右 Option の押下を受け取れない**（PTT がまったく反応しない） |
+| アクセシビリティ | プライバシーとセキュリティ > アクセシビリティ | 同上 | AX 直接挿入ができない |
+| キー送出 | プライバシーとセキュリティ > アクセシビリティ | 上と同じトグル | ⌘V を送れず、テキストはクリップボードに残るだけになる |
+
+> **アクセシビリティのトグル 1 つの裏に TCC のレコードは 2 つある**（`kTCCServiceAccessibility` と
+> `kTCCServicePostEvent`）。片方だけ有効な状態は原理的にありうるので、アプリは 2 つを別々に照会して案内する。
 
 ## 設定
 
@@ -278,3 +341,95 @@ GHOST_VOICE_V12_SECONDS=103 swift test --filter FinalAfterRelease
 確定待ち、ロケールや認識種別の既定）、および OS を更新したとき。
 出力の `V-12 解放後に届いた確定` が **2 件以上になったら、その分の文字が落ちている**
 （詳細設計書 §13 の V-12 と §10 の M2 を更新すること）。
+
+---
+
+## フェーズ 2: `Ghost Voice.app` への移行（フェーズ 1 の利用者が踏む手順）
+
+**フェーズ 1 でターミナルアプリへ与えた 4 つの許可は、`Ghost Voice.app` には 1 つも引き継がれない。**
+`.app` は Finder / Dock / `open` から起動された瞬間に自分自身が責任プロセスになり、
+起動元とは別のアプリとして扱われるためである（実測。詳細設計書 §9 の表）。
+**4 つとも付け直しになる。これは避けられない。**
+
+### 1. 組み立てる（1 分）
+
+```bash
+Scripts/make-app.sh
+```
+
+最後に `codesign -d -r-` の出力（designated requirement）が表示される。
+**`cdhash` という語が出ていたら、そのビルドは権限を保てない。**
+証明書で署名できていれば `identifier "com.haruki1090.GhostVoice" and anchor apple generic and …` になる。
+
+### 2. 置き場所を決める（**後から変えない**）
+
+```bash
+cp -R ".build/app/Ghost Voice.app" /Applications/
+```
+
+> TCC のレコードはアプリのパスも見る。`~/Downloads` で許可してから `/Applications` へ移すと、
+> 許可を付け直す羽目になりうる（**移動で無効になるかは未実測** = V-20）。
+> **先に置き場所を決めてから許可すること。**
+
+### 3. 起動して、要求を出させる（1 分）
+
+```bash
+open "/Applications/Ghost Voice.app"
+```
+
+- **マイクのダイアログが出たら「許可」を選ぶ。** ここだけはダイアログで完結する
+- 入力監視とアクセシビリティは、アプリが要求を出した時点で**システム設定の一覧に載る**
+  （その場では許可されない。載せることが目的である）
+
+**ターミナルから `Ghost Voice.app/Contents/MacOS/GhostVoice` を直接叩かないこと。**
+その経路ではターミナルの許可を借りて動いてしまい、「動いているのに Finder から起動すると
+動かない」という切り分け不能な状態になる（アプリはこれを検出して警告する）。
+
+### 4. システム設定で 2 つのトグルを入れる（2 分）
+
+1. **システム設定 > プライバシーとセキュリティ > 入力監視** で `Ghost Voice` を**オン**
+   - 何のためか: 右 Option の押下を受け取る（`CGEvent.tapCreate` / `kTCCServiceListenEvent`）
+   - 無いとどうなるか: **PTT がまったく反応しない**
+2. **システム設定 > プライバシーとセキュリティ > アクセシビリティ** で `Ghost Voice` を**オン**
+   - 何のためか: フォーカス中の入力欄へ直接入れる（`kTCCServiceAccessibility`）と ⌘V を送る（`kTCCServicePostEvent`）
+   - 無いとどうなるか: **文字は入らず、クリップボードに残るだけになる**
+
+### 5. 終了して起動し直す（**必須**）
+
+アクセシビリティ系の許可は**プロセスの起動時に読まれる**ので、付与しただけでは反映されない。
+
+```bash
+osascript -e 'quit app "Ghost Voice"' 2>/dev/null || pkill -f "Ghost Voice.app/Contents/MacOS/GhostVoice"
+open "/Applications/Ghost Voice.app"
+log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
+```
+
+ログの権限一覧が **4 行とも ✓** になっていることを確認する。
+
+### 6. フェーズ 1 の許可の後片付け（任意）
+
+ターミナルアプリへ与えた許可は、**移行が完全に終わるまで外さないこと**
+（外すと CLI の `ghost-voice` が動かなくなる）。他の用途でも使っているならそのまま残してよい。
+
+### 7. 移行のあとに必ず行う検証（権限を付けた人にしか実施できない）
+
+| ID | 何を見るか | 手順 | 記入先 |
+|---|---|---|---|
+| **V-16** | **`NSApp.run()` の下で `CGEventTap` のキーイベントが届くか** | `Ghost Voice.app` を通常起動し、テキストエディタで右 Option を押しながら短く喋って離す。**挿入されれば成立。まったく反応しなければ不成立**（その場合はフェーズ 1 の CLI が動くかを先に確かめ、権限側の問題と切り分ける） | 詳細設計書 §13 |
+| **V-21** | 発話の途中の終了要求で発話が失われないか | 右 Option を押している最中に `pkill -TERM -f "Ghost Voice.app/Contents/MacOS/GhostVoice"`。**キーを離すまで終わらず**、離すと挿入まで走ってから終了すること | 詳細設計書 §13 |
+| **V-17** | 再ビルドで許可が消えないか | 上記が通った後に `Scripts/make-app.sh` を走らせ直し、`/Applications` のものを置き換えて起動。**4 項目が許可のままであること** | 詳細設計書 §13 |
+
+**V-16 が通らない場合**、キーイベントがメインのランループへ届いていない。
+フェーズ 1 の CLI（`CFRunLoopRun()` を自前で回す）では届いていたので、
+`NSApplication.run()` との組み合わせが原因である可能性が高い。
+その場合は `CGEventTapHotkeyMonitor` の `runLoop:` を差し替えて専用スレッドで回す形が候補になる。
+
+### うまくいかないときに疑う順序
+
+| 症状 | 疑うところ |
+|---|---|
+| PTT がまったく反応しない | 入力監視。**起動し直したか**（許可は起動時に読まれる） |
+| 文字が入らずクリップボードに残る | アクセシビリティ（+ キー送出）。secure input が有効な欄ではないか |
+| 一覧に `Ghost Voice` が出てこない | 一度起動して要求を出させる。それでも出なければ `.app` の署名（`codesign --verify --strict`） |
+| ビルドし直したら許可が外れた | designated requirement が変わっている。`codesign -d -r-` に `cdhash` が出ていないか（ad-hoc 署名になっていないか） |
+| バンドル ID を変えた | **全部やり直しになる。** 変えないこと |

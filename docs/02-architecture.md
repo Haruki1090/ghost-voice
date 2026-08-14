@@ -426,7 +426,11 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 |---|---|
 | App Sandbox | **無効**（AX API に必須） |
 | Hardened Runtime | 有効 |
-| 必要な Info.plist | `NSMicrophoneUsageDescription`（**`NSSpeechRecognitionUsageDescription` は不要**。`SpeechAnalyzer` は音声認識の TCC を要求しない。実測 V-14） |
+| 必要な Info.plist | `NSMicrophoneUsageDescription`（**`NSSpeechRecognitionUsageDescription` は不要**。`SpeechAnalyzer` は音声認識の TCC を要求しない。実測 V-14）。**アクセシビリティ・入力監視・キー送出に対応する usage description キーは存在しない**（tccd が参照するキーを列挙して確認。`NSAccessibilityUsageDescription` のような名前を書いても無視されるだけで、この 3 つは利用者がシステム設定で追加する形式である）。実体は `Resources/Info.plist` |
+| 必要な entitlements | `com.apple.security.app-sandbox = false` / `com.apple.security.device.audio-input = true`（Hardened Runtime 下でのマイク使用。**「無いと開けない」ことは未実測**＝ V-19）。`com.apple.security.automation.apple-events` は**書かない**（Apple Events を使わない）。実体は `Resources/GhostVoice.entitlements` |
+| バンドルの作り方 | **`.xcodeproj` は作らない。** SwiftPM の実行ファイル（`GhostVoice`）を `Scripts/make-app.sh` が `Ghost Voice.app` へ組み立てて署名する。`swift build` / `swift test` の走らせ方を変えないため |
+| 開発中の署名 | **Apple Development 証明書。ad-hoc は採らない。** ad-hoc の designated requirement は cdhash 単体で、実コードを 1 行変えるだけで別物になり、**ビルドのたびに利用者へ権限を付け直させる**ことになる（実測。詳細設計書 §9）。証明書が無い環境向けに `--allow-adhoc` を用意するが、スクリプトがその欠点を警告する |
+| `CFBundleIdentifier` | `com.haruki1090.GhostVoice`。**二度と変えない**（DR に焼き込まれ、変えると TCC の許可がすべて失われる） |
 | 必要な TCC 権限 | マイク、アクセシビリティ（`kTCCServiceAccessibility` と `kTCCServicePostEvent` の両方）、キーイベント監視（`kTCCServiceListenEvent` / 入力監視。ホットキーの `CGEventTap` に要る）。**音声認識は不要**（実測 V-14） |
 | `LSUIElement` | `true`（Dock に表示しない） |
 | 配布 | Developer ID 署名 + notarization。Mac App Store は不可（要件定義書 §5） |

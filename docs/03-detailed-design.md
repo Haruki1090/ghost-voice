@@ -1300,6 +1300,55 @@ public protocol PermissionChecking: Sendable {
 `kAXTrustedCheckOptionPrompt` は `var` 宣言なので Swift 6 の並行性検査を通らない。
 文字列 `"AXTrustedCheckOptionPrompt"` を直接使う（値は実測で確認した）。
 
+### `.app` はターミナルアプリの許可を 1 つも引き継がない（実測 / 2026-08-14 / フェーズ 2）
+
+上の「推論」の隣にある事実が実測で埋まった。**同一の `.app`**（`Info.plist` と署名を持つ）を
+2 通りの経路で起動し、**照会だけ**を行った結果である（要求系 API は 1 つも呼んでいない）。
+
+| 照会項目 | ターミナルから実行ファイルを直接叩いた | `open`（LaunchServices）で `.app` を起動した |
+|---|---|---|
+| `Bundle.main.bundleIdentifier` | 同じバンドル ID | 同じバンドル ID |
+| `AVCaptureDevice.authorizationStatus(for: .audio)` | **`.authorized`** | **`.notDetermined`** |
+| `AXIsProcessTrusted()` | **true** | **false** |
+| `CGPreflightListenEventAccess()` | **true** | **false** |
+| `CGPreflightPostEventAccess()` | **true** | **false** |
+| `getppid()` | ターミナルの pid | **1（launchd）** |
+
+→ **`.app` は Finder / Dock / `open` から起動された瞬間に自分自身が責任プロセスになる。**
+ターミナルアプリが持っている 4 つの許可は 1 つも引き継がれない。
+
+**フェーズ 2 の帰結は 2 つある。**
+
+1. **利用者は 4 つの権限を `Ghost Voice` へ付け直すことになる。** これは避けられない。
+   移行手順は [README](../README.md) の「フェーズ 2: `Ghost Voice.app` への移行」にある。
+2. **案内の名指し先が起動経路で変わる。** CLI（`GhostVoiceCLI.PermissionGuidance`）は
+   起動元のターミナルアプリを名指しし、アプリ（`GhostVoiceApp.AppPermissionGuidance`）は
+   `Ghost Voice` を名指しする。**どちらもその経路では正しく、矛盾していない。**
+   同じ規則（許可は責任プロセスに付く）の当然の帰結である。
+
+> **ターミナルから `Ghost Voice.app/Contents/MacOS/GhostVoice` を直接叩かせないこと。**
+> その経路ではターミナルの許可を借りて動いてしまい、「動いているのに Finder から起動すると
+> 動かない」という切り分け不能な状態になる。アプリはこれを検出して警告する
+> （`Bundle.main.bundleIdentifier == nil` を見る。`.app` の中から起動していれば非 nil）。
+
+### 許可を与える相手はビルドのたびに変わってはならない（実測 / 2026-08-14 / フェーズ 2）
+
+TCC の許可は署名の **designated requirement（DR）** に紐づく。したがって
+**DR がビルドのたびに変わる署名方式を採ってはならない。**
+
+| 署名 | DR | 実コードを 1 行変えて再ビルドしたとき |
+|---|---|---|
+| ad-hoc（`codesign -s -`） | `cdhash H"…"` のみ | **DR ごと別物になる**（cdhash が変わるため） |
+| Apple Development 証明書 | `identifier "com.haruki1090.GhostVoice" and anchor apple generic and certificate leaf[subject.CN] = "…" and certificate 1[…]` | **DR は 1 文字も変わらない**（実測。同一ソースで 2 回、実コードを変えて 1 回、戻して 2 回の計 5 回のビルドで確認） |
+
+`CDHash` は同一ソースの再ビルドでは一致したが、**編集して戻すと別の値になった**
+（`8b0814fc…` → `153a82d8…` → 戻した後 `1229950c…`）。
+**つまり cdhash は「ソースが同じなら同じ」ではない。** DR に cdhash を入れる方式
+（ad-hoc の既定）が権限の保持と両立しない理由がここにある。
+
+**`CFBundleIdentifier` は二度と変えないこと。** DR に焼き込まれるので、変えると
+TCC の許可はすべて失われ、システム設定の一覧に古い項目が残る。
+
 ---
 
 ## 10. 性能計測（Metrics）
@@ -1729,3 +1778,9 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-15 | **アイドル時の CPU（NFR-P7 の 1 % 未満）** | **V-3 の実施時**（常駐起動が要る） | **未実施。** `AVAudioEngine` を起動したまま常駐する設計（§3.2）なので、**測るまで判らない**。`ghost-voice` を起動して `top -pid <pid>` を 1 分見る。要件定義書 §4.2 に目標値だけがあり、検証項目が無かった（開発サイクル §3 の適用漏れ。フェーズ 1 の最終レビュー M-3） |
 | V-13 | **素の実行ファイル（`.app` バンドル無し）でマイクを開けるか** | 実装 §12-11 | **完了（Task 11）。** 開ける。`--mic-check` で 1 秒に 10 バッファ / 48000 フレーム（48000 Hz / 1 ch、取りこぼし 0）。バンドル ID は nil、署名も `Info.plist` も無い。**許可は責任プロセス（起動元のターミナルアプリ）に紐づく**（§3.3）。**要求（ダイアログ）だけは素のバイナリから出せないという §3.3 の実測はそのまま有効である** |
 | V-14 | **音声認識の TCC（`kTCCServiceSpeechRecognition`）が要るか** | 実装 §12-11 | **完了（Task 11）。要らない。** `SFSpeechRecognizer.authorizationStatus()` が `.notDetermined` のまま `SpeechAnalyzer` の認識が通り、認識の前後で状態も変わらない（`recognizesWithoutSpeechRecognitionAuthorization`）。要件定義書 FR-10 / 必要権限、基本設計書 §10（権限とビルド構成。`NSSpeechRecognitionUsageDescription` も不要）、本書 §9 の照会表からも外した。**`--check` が音声認識を持たないのは実装漏れではない** |
+| V-16 | **`NSApplication.run()` の下で `CGEventTap` のキーイベントが届くか** | **フェーズ 2 で最初に潰す**（`.app` の権限付与の直後） | **未実施（入力監視の許可が要る）。** タップは `CFRunLoopGetMain()` の `.commonModes` に載り、`NSApp.run()` はメインの CFRunLoop を回すので**両立するはず**だが、フェーズ 1 の CLI は `CFRunLoopRun()` を自前で回していたため、この組み合わせは 1 度も動いていない。**ここが通らないと PTT がまったく反応しない。** 手順は [README](../README.md) の「フェーズ 2: `Ghost Voice.app` への移行」 |
+| V-17 | **証明書署名した `.app` の TCC 許可が、再ビルド後も残るか** | V-16 の後（権限を付けた状態で 1 度） | **未実施。** ただし前提である「実コードを変えて再ビルドしても DR が 1 文字も変わらない」は**実測済み**（§9）。許可を付けた後に `Scripts/make-app.sh` を走らせ直し、4 項目の照会値が変わらないことを見る |
+| V-18 | **ad-hoc 署名 + DR 固定（`-r='designated => identifier "…"'`）でも許可が残るか** | OSS 公開の前（証明書を持たない人の経路） | **未実施。** tccd が与えた DR をそのまま許可レコードの csreq に使うのか、独自に cdhash を含む要件を組み立てるのかが判っていない（`TCC.db` はフルディスクアクセスが無く読めない）。**残らないなら `--allow-adhoc` の警告文を「開発中の一時的な手段」に書き換える** |
+| V-19 | **Hardened Runtime 下で `com.apple.security.device.audio-input` が無いとマイクを開けないか** | 任意（entitlements を削るときに） | **未実施。** Apple の仕様として付けているが、「無いと開けない」ことは測っていない。entitlement 有り／無しの 2 バンドルで `--mic-check` 相当を走らせる |
+| V-20 | **`.app` を移動すると許可が無効になるか**（`~/Downloads` → `/Applications`） | 権限付与の後 | **未実施。** 手順書は「置き場所を後から変えないこと」で回避している。無効になるなら手順書の警告を強める |
+| V-21 | **発話の途中の終了要求（⌘Q / SIGTERM）で発話が失われないか（`.app` 版）** | V-16 の後 | **未実施。** `applicationShouldTerminate` は `.terminateLater` を返し、`AppTermination.waitUntilIdle` が待機へ戻るまで待ってからホットキーを止める（CLI の `Shutdown.perform` と同じ順序）。**器だけの起動（`--shell-only`）では発話が無いのでこの経路を通らない。** 実発話で確認が要る |
