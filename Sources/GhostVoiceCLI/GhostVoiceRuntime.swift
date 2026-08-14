@@ -28,7 +28,10 @@ public enum GhostVoiceRuntime {
             exit(2)
         case .check:
             let status = currentPermissions()
-            out.write(PermissionGuidance.report(status, storageRoot: StorageRoot.default))
+            out.write(
+                PermissionGuidance.report(
+                    status, storageRoot: StorageRoot.default,
+                    unreadable: unreadableStorageFiles()))
             // **見るのは「PTT が動くか」＝マイクと入力監視だけ。**
             // アクセシビリティが無くても 0 を返す（PTT は動くため）。V-3 はその状態では
             // 意味を持たないので、**そのことは報告の本文が言う**（`report` の該当行）。
@@ -115,6 +118,22 @@ public enum GhostVoiceRuntime {
             """)
     }
 
+    /// 読み込みに失敗したファイルの名前。
+    ///
+    /// **3 つのストアを実際に開いて確かめる。** `--check` は常駐と別プロセスなので、
+    /// ここで開くこと自体が「いま読めるか」の検査になっている。
+    /// - Parameter root: 既定は実際の置き場所。**検査からは一時ルートを渡す**
+    ///   （利用者の実ファイルを壊さずに、結線ごと確かめられるようにするため）。
+    static func unreadableStorageFiles(root: URL = StorageRoot.default) -> [String] {
+        var names: [String] = []
+        if SettingsStore(rootURL: root).loadFailure != nil { names.append("settings.json") }
+        if VocabularyStore(rootURL: root).loadFailure != nil { names.append("vocabulary.json") }
+        if HistoryStore(rootURL: root, limit: Settings.default.historyLimit).loadFailure != nil {
+            names.append("history.json")
+        }
+        return names
+    }
+
     // MARK: - マイクの実地確認
 
     /// マイクを 1 秒だけ開き、実際にバッファが届くかを見る。
@@ -192,6 +211,17 @@ public enum GhostVoiceRuntime {
         let settingsStore = SettingsStore()
         let settings = settingsStore.settings
 
+        // **設定を読めなかったことは、起動時に必ず言う。**
+        // 黙ると「設定を書き換えたのに効かない」だけが症状として残る（最終レビュー I-4）。
+        if settingsStore.loadFailure != nil {
+            err.write(
+                """
+                [警告] settings.json を読めませんでした。**既定値で動作しています。**
+                JSON の書式を確認してください。書き換えた設定は 1 つも効いていません。
+
+                """)
+        }
+
         // **監視器は 1 つだけ作る。** 2 つ作ると、`DictationSession` が読むのと
         // 実際にタップを張っているものが別になり、押しても何も起きない。
         let monitor = CGEventTapHotkeyMonitor(binding: settings.hotkey)
@@ -211,7 +241,11 @@ public enum GhostVoiceRuntime {
             settings: settingsStore,
             hotkey: monitor,
             audio: EngineAudioCapture(),
-            transcriber: SpeechAnalyzerTranscriber(),
+            transcriber: SpeechAnalyzerTranscriber(onAssetInstallationStart: {
+                // **初回起動でモデルが未導入だと、ここで数分待つ。**
+                // 黙って待つと「押しても何も起きない」だけが見える（最終レビュー M-6）。
+                err.write("[準備中] 音声認識モデルを導入しています。完了するまで押しても反応しません…\n")
+            }),
             refiner: FoundationModelRefiner(),
             inserter: CompositeInserter.system(
                 restoreDelay: options.pasteRestoreDelay ?? PasteboardInserter.defaultRestoreDelay),

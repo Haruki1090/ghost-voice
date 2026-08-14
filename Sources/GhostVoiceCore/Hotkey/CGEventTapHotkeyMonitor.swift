@@ -122,7 +122,7 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
 
     /// 応答しないタップを張り直す上限。
     ///
-    /// 無制限に張り直すと、無効化と `.cancelled` の応酬が止まらなくなる。
+    /// 無制限に張り直すと、無効化と `.interrupted` の応酬が止まらなくなる。
     static let maxReEnableAttempts = 10
 
     /// 下の 5 つを守る。**`tap` と `runLoopSource` も含める。**
@@ -130,6 +130,9 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     private let lock = NSLock()
     private var phase: Phase = .idle
     private var isRecording = false
+    /// セッションが確定〜整形の処理中か（`setSessionBusy`）。
+    /// **`isRecording` とは別の量である。** キーを離した後も真でありうる。
+    private var isSessionBusy = false
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     /// タップが無効化され、張り直さないと決めた。以後ホットキーは反応しない。
@@ -272,6 +275,14 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.unlock()
     }
 
+    /// セッションが処理中かを知らせる（`HotkeyMonitor` の契約）。
+    ///
+    /// **hot path から見えるのはこのフラグの読み取りだけ**（`handle` は権限照会に
+    /// 触れないのと同じ理由で、ここでも余計な仕事をしない）。
+    public func setSessionBusy(_ busy: Bool) {
+        lock.withLock { isSessionBusy = busy }
+    }
+
     /// 停止する。**ストリームは終端し、以後この監視器は再起動できない**
     /// （`AsyncStream` は終端を取り消せない）。再開したい場合は作り直すこと。
     public func stop() {
@@ -282,6 +293,7 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         tap = nil
         runLoopSource = nil
         isRecording = false
+        isSessionBusy = false
         phase = .stopped
         lock.unlock()
 
@@ -317,11 +329,11 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.lock()
         let decision = HotkeyDecision.decide(
             type: type, keyCode: keyCode, flags: flags,
-            binding: binding, isRecording: isRecording
+            binding: binding, isRecording: isRecording, isSessionBusy: isSessionBusy
         )
         switch decision.event {
         case .pressed: isRecording = true
-        case .released, .cancelled: isRecording = false
+        case .released, .cancelled, .interrupted: isRecording = false
         case nil: break
         }
         lock.unlock()
@@ -348,11 +360,16 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     /// - `byUserInput` を張り直すのは**要求を無視して蘇ること**なので行わない。
     ///
     /// **どちらも無制限には扱わない。** 原因不明の連続無効化に対して張り直し続けると、
-    /// 無効化と `.cancelled` の応酬が止まらなくなる（`events` は無制限バッファである）。
+    /// 無効化と `.interrupted` の応酬が止まらなくなる（`events` は無制限バッファである）。
     /// `maxReEnableAttempts` 回で諦め、`isActive` が false になる。
     ///
     /// 無効化されていた間に PTT キーの解放を取りこぼしている可能性があるため、
-    /// 録音中だったなら `.cancelled` を出す。**出さないと録音が終わらない状態で固まる。**
+    /// 録音中だったなら `.interrupted` を出す。**出さないと録音が終わらない状態で固まる。**
+    ///
+    /// **`.cancelled` ではない。** 利用者は喋っていたのであって中断を要求していないので、
+    /// セッション側はこれを確定として扱う（基本設計書 §7 の縮退表。最大録音時間の満了と
+    /// 同じ裁定）。ここを `.cancelled` にしていたために、**誰も決めないまま
+    /// 「取りこぼした発話は捨てる」になっていた**（フェーズ 1 の最終レビュー I-2）。
     ///
     /// - Important: 諦めた場合、**ホットキーは以後反応しない。** 監視器を作り直す以外に
     ///   復帰の手立ては無い。Task 10 / 11 は `isActive` を見てユーザーへ知らせること。
@@ -383,7 +400,7 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
             reEnables.add(1, ordering: .relaxed)
             if let currentTap { tapController.setEnabled(currentTap, true) }
         }
-        if wasRecording { continuation.yield(.cancelled) }
+        if wasRecording { continuation.yield(.interrupted) }
         return Unmanaged.passUnretained(event)
     }
 }

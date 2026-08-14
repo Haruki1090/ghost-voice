@@ -91,7 +91,13 @@ public enum PermissionGuidance {
     }
 
     /// `--check` の出力。
-    public static func report(_ status: PermissionStatus, storageRoot: URL) -> String {
+    ///
+    /// - Parameter unreadable: 読み込みに失敗したファイル名（`settings.json` など）。
+    ///   **フェーズ 1 の設定手段は手編集だけなので、ここを黙ると原因に辿り着けない**
+    ///   （フェーズ 1 の最終レビュー I-4）。
+    public static func report(
+        _ status: PermissionStatus, storageRoot: URL, unreadable: [String] = []
+    ) -> String {
         let ready = status.microphoneAuthorized && status.listenEventAccess
 
         var lines = [
@@ -128,6 +134,15 @@ public enum PermissionGuidance {
             // 今この瞬間の値である。パスワード欄から離れれば戻る。
             lines.append("  - いま secure input が有効です。この間はテキストを挿入しません")
             lines.append("    （整形も履歴もクリップボードへの残置も行いません）。")
+        }
+
+        if !unreadable.isEmpty {
+            lines.append("")
+            for name in unreadable {
+                lines.append("  ✗ \(name) を読めませんでした。**既定値で動作しています。**")
+            }
+            lines.append("    JSON の書式（カンマ・引用符・括弧）を確認してください。")
+            lines.append("    書き換えた設定は 1 つも効いていません（ホットキー・言語・整形・履歴件数）。")
         }
 
         lines.append(contentsOf: [

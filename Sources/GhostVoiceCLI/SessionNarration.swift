@@ -91,6 +91,23 @@ public enum SessionNarration {
                 """
         case .noSpeechRecognized:
             return "認識できませんでした。"
+        case .historyUnavailable(let insertedElsewhere):
+            // **挿入まで行ったかで、利用者にとっての意味がまったく違う。**
+            // 同じ文言にすると、発話が消えた場合に「履歴が欠けただけ」と読まれる。
+            if insertedElsewhere {
+                return """
+                    履歴に保存できませんでした（テキストの挿入は完了しています）。
+                    失われるのは履歴と Undo だけです。ディスクの空き容量と \
+                    `~/Library/Application Support/GhostVoice/` の書き込み権限を確認してください。
+                    """
+            }
+            return """
+                履歴に保存できませんでした。**中断したこの発話は失われました。**
+                挿入もしていないため、どこにも残っていません。もう一度話してください。
+                ディスクの空き容量と `~/Library/Application Support/GhostVoice/` の\
+                書き込み権限を確認してください（`history.json` が壊れている場合、\
+                退避に失敗する限り以後も書けません）。
+                """
         case .refusedSecureInput:
             // **「失敗」ではなく意図した拒否である。** ここで「もう一度試してください」と
             // 書くと、パスワード欄へ挿入させようとする案内になる。

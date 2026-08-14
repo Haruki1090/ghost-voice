@@ -24,6 +24,17 @@ public enum SessionFailure: Sendable, Equatable {
     case noSpeechRecognized
     /// secure input が有効だったので、整形も挿入も履歴もクリップボードも行わなかった。
     case refusedSecureInput
+    /// 履歴へ書けなかった。
+    ///
+    /// **中断された発話にとって、履歴は唯一の写しである**（挿入していないので、
+    /// アプリにもクリップボードにも無い）。基本設計書 §4 の「中断でも録音済み内容は
+    /// 破棄せず履歴へ残す」は、書き込みが成功して初めて成り立つ。
+    ///
+    /// - Parameter insertedElsewhere: その発話が挿入まで到達していたか。
+    ///   **true なら失うのは履歴と Undo だけ**（テキストは利用者の手元にある）。
+    ///   **false なら発話そのものが失われた。** 利用者にとって意味がまったく違うので、
+    ///   同じ文言にしてはならない。
+    case historyUnavailable(insertedElsewhere: Bool)
 }
 
 /// PTT 1 回ぶんの流れを統括する状態機械。
@@ -240,6 +251,10 @@ public actor DictationSession {
             case .pressed: await startRecording()
             case .released: stopRecording(cancelled: false)
             case .cancelled: requestCancel()
+            // **取りこぼしは中断ではない**（基本設計書 §7 の縮退表）。監視が死んで
+            // キー解放を受け取れなくなっただけなので、最大録音時間の満了と同じく
+            // **確定として扱い、そこまでの発話を届ける。** 利用者は喋っていたのだから。
+            case .interrupted: stopRecording(cancelled: false)
             }
         }
         await completionTask?.value
@@ -422,6 +437,10 @@ public actor DictationSession {
         // 解放を 2 回受け取る経路（最大録音時間の満了とキー解放の競合）がある。
         guard phase == .recording else { return }
         phase = .processing
+        // **キーを離した後の ESC を中断として受け取るために要る**（`HotkeyMonitor`
+        // の `setSessionBusy` の注記。フェーズ 1 の最終レビュー I-1）。
+        // これが無いと、下の `isCancelRequested` を立てる経路が実機で到達不能になる。
+        hotkey.setSessionBusy(true)
         let releasedAt = ContinuousClock.now
 
         maxDurationTask?.cancel()
@@ -519,6 +538,18 @@ public actor DictationSession {
         let outcome = await inserter.insert(refined ?? raw)
         let insert = ContinuousClock.now - insertStart
 
+        // **挿入の直前に secure input が有効化された場合**（整形中にパスワード欄へ
+        // 移った）。挿入器が拒否している以上、この発話はどこへも入っていない。
+        //
+        // ここを素通りさせると `.failed` が出ないまま `.idle` へ落ち、
+        // **挿入されていないのに `[metrics]` だけが出て成功に見える**
+        // （フェーズ 1 の最終レビュー M-2）。計測値も残さない——測ったのは
+        // 「拒否に掛かった時間」であって挿入ではない。
+        guard outcome != .refusedSecureInput else {
+            fail(.refusedSecureInput)
+            return
+        }
+
         latestMetrics = Metrics.Sample(
             finalize: finalize, refine: refine, insert: insert,
             droppedBuffers: audio.droppedBufferCount - droppedAtStart
@@ -529,8 +560,13 @@ public actor DictationSession {
         // **`.refusedSecureInput` は履歴に記録してはならない**（Task 8 の裁定）。
         // `recordableMethod` が nil を返すのがその一手間で、ここを素通りさせると
         // パスワードが `history.json` へ平文で入る。
-        if let method = outcome.recordableMethod {
-            record(raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
+        if let method = outcome.recordableMethod,
+            !record(raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
+        {
+            // **テキストは利用者の手元にある。** 失ったのは履歴と Undo だけなので、
+            // 中断経路とは別の文言で伝える（`SessionFailure` の注記）。
+            fail(.historyUnavailable(insertedElsewhere: true))
+            return
         }
 
         finishIdle()
@@ -543,19 +579,40 @@ public actor DictationSession {
     /// `undoCandidate` の条件（`refinedText != nil`）を満たしてしまい、
     /// **一度も挿入していない文字列を「戻せる」ことになる。**
     private func finishCancelled(raw: String, locale: String) {
-        if !raw.isEmpty {
-            record(raw: raw, refined: nil, locale: locale, method: .notInserted)
+        if !raw.isEmpty,
+            !record(raw: raw, refined: nil, locale: locale, method: .notInserted)
+        {
+            // **この発話はどこにも残っていない。** 挿入していないので手元にも無い。
+            fail(.historyUnavailable(insertedElsewhere: false))
+            return
         }
         finishIdle()
     }
 
-    private func record(raw: String, refined: String?, locale: String, method: InsertionMethod) {
-        try? history.append(
-            HistoryEntry(
-                rawText: raw, refinedText: refined,
-                localeIdentifier: locale, insertionMethod: method
+    /// - Returns: 書けたか。**握り潰してはならない。**
+    ///
+    /// `try?` で捨てていた頃は、書き込みが失敗しても `.failed` も出ず標準エラーにも
+    /// 出ず、メモリにも残らなかった。**中断された発話ではそれが唯一の写しなので、
+    /// 発話が無言のまま消える**（フェーズ 1 の最終レビュー C-1）。しかも破損ファイルの
+    /// 退避に失敗する経路では、以後の `append` が投げ続ける（`AtomicJSONFile`）ので、
+    /// 一度きりではなく恒久的に消え続ける。
+    ///
+    /// **在庫は持たない。** 溜めても書ける保証は無いうえ、書けない理由（容量・権限・
+    /// 破損）は時間で解決しない。**失敗したことを利用者へ告げる**方が確実に効く。
+    private func record(
+        raw: String, refined: String?, locale: String, method: InsertionMethod
+    ) -> Bool {
+        do {
+            try history.append(
+                HistoryEntry(
+                    rawText: raw, refinedText: refined,
+                    localeIdentifier: locale, insertionMethod: method
+                )
             )
-        )
+            return true
+        } catch {
+            return false
+        }
     }
 
     // MARK: - 待ち合わせ
@@ -634,6 +691,8 @@ public actor DictationSession {
 
     /// 発話 1 回ぶんの後始末をして待機へ戻す。
     private func finishIdle() {
+        // 処理は終わった。以後の ESC は下流アプリのものである。
+        hotkey.setSessionBusy(false)
         maxDurationTask?.cancel()
         maxDurationTask = nil
         finalDeadlineTask?.cancel()

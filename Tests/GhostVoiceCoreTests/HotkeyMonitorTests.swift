@@ -337,6 +337,48 @@ struct HotkeyDecisionTests {
         #expect(!suppress)
     }
 
+    /// **I-1: キーを離した後の ESC も中断として届く。**
+    ///
+    /// `DictationSession` は確定待ち・整形中の中断を受け付ける（基本設計書 §4）が、
+    /// 監視器が `.cancelled` を出さなければ**その分岐は実機で到達不能**である。
+    /// この検査が無いと、正本の約束の半分だけが実装された状態に戻る。
+    @Test("処理中（キー解放後）の ESC も cancelled になる")
+    func escapeCancelsWhileSessionBusy() {
+        let (event, suppress) = HotkeyDecision.decide(
+            type: .keyDown, keyCode: 0x35, flags: [], binding: ptt,
+            isRecording: false, isSessionBusy: true
+        )
+        #expect(event == .cancelled)
+        // **ここでは抑止しない。** 利用者はもう挿入先のアプリを操作している。
+        #expect(!suppress, "処理中の ESC を奪うと下流アプリが壊れる（V-4 の #6）")
+    }
+
+    /// 録音中と処理中で**抑止の扱いが違う**こと自体が要件である。
+    @Test("録音中の ESC は抑止し、処理中の ESC は抑止しない")
+    func suppressionDiffersBetweenRecordingAndBusy() {
+        let recording = HotkeyDecision.decide(
+            type: .keyDown, keyCode: 0x35, flags: [], binding: ptt,
+            isRecording: true, isSessionBusy: true
+        )
+        let busyOnly = HotkeyDecision.decide(
+            type: .keyDown, keyCode: 0x35, flags: [], binding: ptt,
+            isRecording: false, isSessionBusy: true
+        )
+        #expect(recording.event == .cancelled && recording.suppress)
+        #expect(busyOnly.event == .cancelled && !busyOnly.suppress)
+    }
+
+    /// 処理中でも、ESC の `keyUp` は中断として二重に出さない。
+    @Test("処理中の ESC の keyUp は何も起こさない")
+    func escapeKeyUpWhileBusyDoesNothing() {
+        let (event, suppress) = HotkeyDecision.decide(
+            type: .keyUp, keyCode: 0x35, flags: [], binding: ptt,
+            isRecording: false, isSessionBusy: true
+        )
+        #expect(event == nil)
+        #expect(!suppress)
+    }
+
     @Test("録音中に同じ押下が重複して届いても pressed を二度出さない")
     func noDuplicatePressed() {
         let (event, _) = HotkeyDecision.decide(
@@ -1096,6 +1138,44 @@ struct CGEventTapHotkeyMonitorHandleTests {
         #expect(events == [.pressed, .cancelled])
     }
 
+    /// **I-1 を本体で固定する。** `setSessionBusy(true)` の間の ESC は
+    /// `.cancelled` を流し、**かつ下流へ通す。**
+    @Test("処理中の ESC は cancelled を流し、下流へも通す")
+    func escapeWhileBusyIsDeliveredAndPassedThrough() async {
+        let monitor = makeMonitor()
+        // 押して離す（＝ここから処理中）
+        _ = monitor.handle(
+            type: .flagsChanged,
+            event: makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption))
+        )
+        _ = monitor.handle(type: .flagsChanged, event: makeEvent(keyCode: 0x3D, flags: []))
+        monitor.setSessionBusy(true)
+
+        let escape = makeEvent(keyCode: 0x35, flags: [])
+        #expect(
+            monitor.handle(type: .keyDown, event: escape) != nil,
+            "処理中の ESC を抑止している（下流アプリが ESC を失う）")
+
+        let events = await collect(monitor.events, count: 3)
+        #expect(events == [.pressed, .released, .cancelled])
+    }
+
+    /// 処理が終われば、ESC はふたたび下流だけのものになる。
+    @Test("処理が終わった後の ESC は何も起こさない")
+    func escapeAfterBusyClearedDoesNothing() async {
+        let monitor = makeMonitor()
+        monitor.setSessionBusy(true)
+        monitor.setSessionBusy(false)
+
+        let escape = makeEvent(keyCode: 0x35, flags: [])
+        #expect(monitor.handle(type: .keyDown, event: escape) != nil)
+
+        monitor.stop()
+        var received: [HotkeyEvent] = []
+        for await event in monitor.events { received.append(event) }
+        #expect(received.isEmpty, "誰も待っていない中断を流している")
+    }
+
     @Test("録音していないときの ESC は素通しする")
     func escapePassesThroughWhenIdle() async {
         let monitor = makeMonitor()
@@ -1126,7 +1206,10 @@ struct CGEventTapHotkeyMonitorHandleTests {
     /// **タップは重い処理をすると OS に無効化される。** 無効化されたまま放置すると
     /// ホットキーが二度と反応しない（アプリは生きているので気付きにくい）。
     /// 再有効化を試み、取りこぼした解放の代わりに中断を出す。
-    @Test("tapDisabledByTimeout で再有効化を試み、録音中なら cancelled を出す")
+    /// **I-2: これは `.cancelled` ではなく `.interrupted` である。**
+    /// 利用者は喋っていたのであって中断を要求していない。同じ列挙子で運ぶと、
+    /// セッション側が「挿入するな」と読んで**取りこぼした発話を捨てる**。
+    @Test("tapDisabledByTimeout で再有効化を試み、録音中なら interrupted を出す")
     func reEnablesAfterTimeout() async {
         let monitor = makeMonitor()
         _ = monitor.handle(
@@ -1138,13 +1221,13 @@ struct CGEventTapHotkeyMonitorHandleTests {
 
         #expect(monitor.reEnableAttempts == 1)
         let events = await collect(monitor.events, count: 2)
-        #expect(events == [.pressed, .cancelled])
+        #expect(events == [.pressed, .interrupted], "中断（利用者の意図）と混同している")
     }
 
     /// **中断のあとは録音していない状態に戻っていること。**
     /// 印を落とし忘れると、次に PTT を押しても `pressed` が出ず、
     /// ユーザーからは「ホットキーが効かなくなった」に見える。
-    @Test("tapDisabledByTimeout の中断後にもう一度押すと pressed が出る")
+    @Test("tapDisabledByTimeout の取りこぼし後にもう一度押すと pressed が出る")
     func recordingResetsAfterTapDisabled() async {
         let monitor = makeMonitor()
         let down = makeEvent(keyCode: 0x3D, flags: optionFlags(DeviceBit.rightOption))
@@ -1153,12 +1236,12 @@ struct CGEventTapHotkeyMonitorHandleTests {
         _ = monitor.handle(type: .flagsChanged, event: down)
 
         let events = await collect(monitor.events, count: 3)
-        #expect(events == [.pressed, .cancelled, .pressed])
+        #expect(events == [.pressed, .interrupted, .pressed])
     }
 
-    /// 録音していないときに無効化されたら、再有効化だけ行い中断は出さない。
-    /// 誰も録音していないのに cancelled を出すと、状態機械が余計な後始末を走らせる。
-    @Test("録音していないときの tapDisabledByTimeout では cancelled を出さない")
+    /// 録音していないときに無効化されたら、再有効化だけ行い取りこぼしは出さない。
+    /// 誰も録音していないのに `.interrupted` を出すと、状態機械が余計な後始末を走らせる。
+    @Test("録音していないときの tapDisabledByTimeout では interrupted を出さない")
     func reEnableWithoutCancelWhenIdle() async {
         let monitor = makeMonitor()
         _ = monitor.handle(type: .tapDisabledByTimeout, event: makeEvent(keyCode: 0, flags: []))
@@ -1183,12 +1266,12 @@ struct CGEventTapHotkeyMonitorHandleTests {
         _ = monitor.handle(type: .tapDisabledByUserInput, event: makeEvent(keyCode: 0, flags: []))
 
         #expect(monitor.reEnableAttempts == 0, "要求を無視してタップを蘇らせている")
-        // 取りこぼした解放の代わりに中断は出す。出さないと録音が終わらない。
+        // 取りこぼした解放の代わりに `.interrupted` は出す。出さないと録音が終わらない。
         let events = await collect(monitor.events, count: 2)
-        #expect(events == [.pressed, .cancelled])
+        #expect(events == [.pressed, .interrupted])
     }
 
-    /// **無制限に張り直すと、無効化と `.cancelled` の応酬が止まらなくなる。**
+    /// **無制限に張り直すと、無効化と `.interrupted` の応酬が止まらなくなる。**
     /// `events` は無制限バッファなので、際限なく積み上がる。
     @Test("再有効化には上限があり、超えたら諦める")
     func reEnableIsBounded() {

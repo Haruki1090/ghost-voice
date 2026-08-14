@@ -33,7 +33,17 @@ public actor SpeechAnalyzerTranscriber: Transcribing {
         priority: .userInitiated, modelRetention: .processLifetime
     )
 
-    public init() {}
+    /// モデルの導入（ダウンロード）が始まるときに呼ばれる。
+    ///
+    /// **導入は数分掛かることがあり、その間 `prepare` は戻らない。** 口が無いと、
+    /// 利用者には「押しても何も起きない」としか見えない（詳細設計書 §4.3 は
+    /// `request.progress` を HUD に出す想定だが、HUD はフェーズ 2）。
+    /// フェーズ 1 は「始まったこと」だけを CLI が伝える。
+    private let onAssetInstallationStart: (@Sendable () -> Void)?
+
+    public init(onAssetInstallationStart: (@Sendable () -> Void)? = nil) {
+        self.onAssetInstallationStart = onAssetInstallationStart
+    }
 
     // MARK: - 準備
 
@@ -46,7 +56,8 @@ public actor SpeechAnalyzerTranscriber: Transcribing {
         try await Self.reserve(normalized)
 
         let module = TranscriptionModule.make(locale: normalized, kind: kind)
-        didRequestAssetInstallation = try await Self.installAssetsIfNeeded(for: module)
+        didRequestAssetInstallation = try await Self.installAssetsIfNeeded(
+            for: module, notify: onAssetInstallationStart)
 
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module.speechModule])
         else { throw TranscriptionError.modelUnavailable }
@@ -76,10 +87,14 @@ public actor SpeechAnalyzerTranscriber: Transcribing {
     }
 
     /// 戻り値はダウンロードを要求したか。導入済みなら false。
-    private static func installAssetsIfNeeded(for module: TranscriptionModule) async throws -> Bool {
+    private static func installAssetsIfNeeded(
+        for module: TranscriptionModule, notify: (@Sendable () -> Void)? = nil
+    ) async throws -> Bool {
         guard await AssetInventory.status(forModules: [module.speechModule]) != .installed else { return false }
         guard let request = try await AssetInventory.assetInstallationRequest(supporting: [module.speechModule])
         else { throw TranscriptionError.modelUnavailable }
+        // **待ちに入る前に知らせる。** 戻ってから言っても意味が無い。
+        notify?()
         try await request.downloadAndInstall()
         return true
     }

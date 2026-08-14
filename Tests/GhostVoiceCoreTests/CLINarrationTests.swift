@@ -82,8 +82,25 @@ struct CLINarrationTests {
             SessionNarration.message(for: .transcriptionUnavailable),
             SessionNarration.message(for: .noSpeechRecognized),
             SessionNarration.message(for: .refusedSecureInput),
+            SessionNarration.message(for: .historyUnavailable(insertedElsewhere: true)),
+            SessionNarration.message(for: .historyUnavailable(insertedElsewhere: false)),
         ]
-        #expect(Set(messages).count == 4)
+        #expect(Set(messages).count == 6)
+    }
+
+    /// **中断された発話にとって、履歴は唯一の写しである。**
+    /// 挿入済みかどうかで利用者にとっての意味がまったく違うので、同じ文言にしてはならない。
+    @Test("履歴に書けなかったとき、発話が失われたかどうかを言い分ける")
+    func historyFailureDistinguishesLoss() {
+        let lost = SessionNarration.message(for: .historyUnavailable(insertedElsewhere: false))
+        let kept = SessionNarration.message(for: .historyUnavailable(insertedElsewhere: true))
+
+        #expect(lost.contains("失われました"))
+        #expect(lost.contains("もう一度"))
+        #expect(kept.contains("挿入は完了しています"))
+        #expect(!kept.contains("失われました"), "挿入済みなのに発話が消えたと読める")
+        // どちらも「どこを直せばよいか」を言う
+        #expect(lost.contains("書き込み権限") && kept.contains("書き込み権限"))
     }
 
     /// FR-10。**権限が無いことは、押しても何も起きない現象ではなく文章で伝える。**

@@ -10,6 +10,14 @@ public final class HistoryStore: @unchecked Sendable {
     private let lock = NSLock()
     private var cached: [HistoryEntry]
 
+    /// **読み込みに失敗したか。** ファイルが無い（正常な初回起動）とは区別する。
+    ///
+    /// 手で編集する JSON がフェーズ 1 の唯一の設定手段なので、カンマ 1 つの打ち間違いで
+    /// **全設定が無言で既定へ戻る**（フェーズ 1 の最終レビュー I-4）。利用者から見えるのは
+    /// 「`en-US` にしたのに日本語で認識される」で、原因に辿り着く手掛かりが無い。
+    /// **保持だけして、表に出すのは CLI の仕事**（`--check` と起動時の 1 行）。
+    public let loadFailure: (any Error)?
+
     public init(rootURL: URL = StorageRoot.default, limit: Int) {
         // 復元できなかったファイルの退避は `file` 側が覚えていて `save` が行う。
         // ただし読み込みが前提なので、ここでの `load()` を遅延させないこと。
@@ -28,7 +36,18 @@ public final class HistoryStore: @unchecked Sendable {
         // 動かす。0 は明示的な指示として尊重する（要素数ぴったりの `removeLast` は
         // 落ちないので、クランプも要らない）。
         self.limit = limit < 0 ? Settings.default.historyLimit : limit
-        self.cached = file.load()
+        // **`load()` ではなく `loadOutcome()`。** 「無い」と「読めなかった」を潰さない。
+        switch file.loadOutcome() {
+        case .loaded(let value):
+            self.cached = value
+            self.loadFailure = nil
+        case .absent:
+            self.cached = []
+            self.loadFailure = nil
+        case .unreadable(let error):
+            self.cached = []
+            self.loadFailure = error
+        }
     }
 
     /// 新しい順。

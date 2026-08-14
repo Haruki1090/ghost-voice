@@ -40,6 +40,7 @@ struct DictationSessionTests {
 
     private func makeRig(
         root: URL,
+        historyRoot: URL? = nil,
         transcriber: StubTranscriber = StubTranscriber(),
         refiner: SpyRefiner = SpyRefiner(result: "整形後テキストです"),
         inserter: RecordingInserter = RecordingInserter(),
@@ -49,7 +50,8 @@ struct DictationSessionTests {
         finalizeDeadline: Duration = .seconds(5)
     ) -> Rig {
         let hotkey = StubHotkeyMonitor()
-        let history = HistoryStore(rootURL: root, limit: 50)
+        // 履歴だけ別のルートへ向けられるようにしてある（書けない状況を作るため）。
+        let history = HistoryStore(rootURL: historyRoot ?? root, limit: 50)
         let settings = SettingsStore(rootURL: root)
         let session = DictationSession(
             settings: settings,
@@ -341,6 +343,29 @@ struct DictationSessionTests {
         }
     }
 
+    /// **M-2: 拒否されたのに成功したように見えてはならない。**
+    ///
+    /// 整形中にパスワード欄へ移った場合、セッション手前の判定は通過し、挿入器が拒否する。
+    /// そこを素通りさせると `.failed` が出ないまま `.idle` へ落ち、
+    /// **CLI は `[挿入中]` の次に `[metrics]` だけを出す**——入っていないのに成功に見える。
+    @Test("挿入器が secure input で拒否したら、拒否として表に出す")
+    func refusedInsertionIsReported() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root, inserter: RecordingInserter(outcome: .refusedSecureInput))
+            let log = StateLog()
+            let collector = await log.collect(from: rig.session.stateUpdates)
+            defer { collector.cancel() }
+
+            try await speak(rig)
+            try await waitUntil("拒否が記録される") {
+                await log.states.contains(.failed(.refusedSecureInput))
+            }
+            // **計測値も残さない。** 測ったのは拒否に掛かった時間であって挿入ではない。
+            #expect(await rig.session.latestMetrics == nil, "挿入していないのに計測値が出る")
+        }
+    }
+
     // MARK: - 中断
 
     /// 基本設計書 §4: 中断時、録音済み内容は破棄せず履歴に残す（発話を失わないため）。
@@ -416,6 +441,173 @@ struct DictationSessionTests {
     }
 
     // MARK: - 中断（処理中）
+
+    /// **I-1: 中断の窓を、監視器へ知らせているか。**
+    ///
+    /// `DictationSession` が確定待ち・整形中の ESC を受け付けても、監視器が
+    /// `.cancelled` を出さなければ**実機では 1 度も到達しない**。上の 2 件は
+    /// 代役から直接 `.cancelled` を流しているので、**この検査が無いと
+    /// 「代役が正本どおりに振る舞うこと」しか確かめていない**ことになる。
+    @Test("処理中は監視器へ「処理中」を知らせ、待機へ戻ったら降ろす")
+    func tellsMonitorWhenBusy() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                refiner: SpyRefiner(result: "整形後テキストです", delay: .milliseconds(300)))
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            // 録音中はまだ「処理中」ではない（ESC は録音中の判定で抑止される側）。
+            #expect(!rig.hotkey.isSessionBusy)
+
+            rig.hotkey.emit(.released)
+            try await waitUntil("整形へ入る") { await rig.session.state == .refining }
+            #expect(rig.hotkey.isSessionBusy, "処理中を知らせていない（実機で ESC が届かない）")
+
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+            #expect(!rig.hotkey.isSessionBusy, "処理が終わったのに ESC を奪い続けている")
+        }
+    }
+
+    /// 失敗で終わった発話でも降ろすこと。降ろし忘れると、以後 ESC が
+    /// **挿入先アプリへ届かないまま**中断として消費され続ける。
+    @Test("失敗で終わっても処理中の印は降りる")
+    func clearsBusyOnFailure() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root, transcriber: StubTranscriber(finalText: ""))
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(!rig.hotkey.isSessionBusy)
+        }
+    }
+
+    // MARK: - 履歴へ書けなかった場合（C-1）
+
+    /// 書けない履歴の置き場所。
+    ///
+    /// **`/dev/null` の下にはディレクトリを作れない**（ENOTDIR）ので、`save` の
+    /// `createDirectory` が必ず失敗する。権限をいじらず、後始末も要らない。
+    ///
+    /// > `history.json` と同じ名前のディレクトリを置く手もあるが、**それでは失敗しない。**
+    /// > 読み込みが `.unreadable` になり、`save` の退避がそのディレクトリを
+    /// > `.corrupt` へ動かして、その後の書き込みが成功する（実際に踏んだ）。
+    private func unwritableHistoryRoot() -> URL {
+        URL(fileURLWithPath: "/dev/null/gv-unwritable-\(UUID().uuidString)")
+    }
+
+    /// **中断された発話にとって、履歴は唯一の写しである。**
+    /// 書けなかったことを握り潰すと、発話が無言のまま消える（最終レビュー C-1）。
+    @Test("中断した発話を履歴へ書けなかったら、失われたことを知らせる")
+    func reportsHistoryFailureForCancelledUtterance() async throws {
+        try await withTempRoot { root in
+            let historyRoot = unwritableHistoryRoot()
+
+            let rig = makeRig(root: root, historyRoot: historyRoot)
+            let log = StateLog()
+            let collector = await log.collect(from: rig.session.stateUpdates)
+            defer { collector.cancel() }
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.cancelled)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            let states = await log.states
+            #expect(
+                states.contains(.failed(.historyUnavailable(insertedElsewhere: false))),
+                "履歴へ書けなかったことを黙って飲み込んでいる（発話が消えた）")
+            // **失敗の後は必ず待機へ戻る**（`SessionState` の契約）。
+            #expect(states.last == .idle)
+        }
+    }
+
+    /// 挿入まで行った発話なら、失うのは履歴と Undo だけである。
+    /// **同じ文言にしてはならない**ので、型のうえでも区別する。
+    @Test("挿入済みの発話を履歴へ書けなかったときは、挿入済みだと伝える")
+    func reportsHistoryFailureAfterInsertion() async throws {
+        try await withTempRoot { root in
+            let historyRoot = unwritableHistoryRoot()
+
+            let rig = makeRig(root: root, historyRoot: historyRoot)
+            let log = StateLog()
+            let collector = await log.collect(from: rig.session.stateUpdates)
+            defer { collector.cancel() }
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(rig.inserter.inserted == ["整形後テキストです"], "挿入自体は成功しているはず")
+            let states = await log.states
+            #expect(states.contains(.failed(.historyUnavailable(insertedElsewhere: true))))
+            #expect(!states.contains(.failed(.historyUnavailable(insertedElsewhere: false))),
+                    "挿入済みなのに「失われた」と伝えている")
+        }
+    }
+
+    /// 書けている限り、余計な失敗を出さないこと（この検査が無いと、上の 2 件は
+    /// 「常に失敗を出す」実装でも通る）。
+    @Test("履歴へ書けたときは失敗を出さない")
+    func doesNotReportHistoryFailureWhenWritable() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root)
+            let log = StateLog()
+            let collector = await log.collect(from: rig.session.stateUpdates)
+            defer { collector.cancel() }
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            let states = await log.states
+            #expect(!states.contains { if case .failed = $0 { return true } else { return false } })
+        }
+    }
+
+    // MARK: - 取りこぼし（監視が死んだ場合）
+
+    /// **I-2: 取りこぼしは中断ではない。**
+    ///
+    /// タップが無効化されて解放を受け取れなくなっただけで、利用者は喋っていた。
+    /// 最大録音時間の満了と同じ状況なので、**確定として扱いそこまでの発話を届ける**
+    /// （基本設計書 §7 の縮退表）。`.cancelled` と同一視していた頃は、
+    /// **誰も決めないまま「捨てる」になっていた。**
+    @Test("監視が死んで取りこぼしたら、そこまでの発話を挿入する")
+    func interruptedFinalizesInsteadOfCancelling() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root)
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+
+            rig.hotkey.emit(.interrupted)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(
+                rig.inserter.inserted == ["整形後テキストです"],
+                "取りこぼした発話を捨てている（中断と混同している）")
+            let entry = try #require(rig.history.entries.first)
+            #expect(entry.insertionMethod == .ax, "中断として記録している")
+        }
+    }
 
     /// **整形中の ESC は間に合う。** 処理窓は実測 400〜800 ms あり、人が押すのに十分な長さ。
     /// 押した意味は 1 つ——「これを挿入するな」——なので、挿入も履歴の整形結果も残さない。

@@ -137,6 +137,52 @@ struct CLIPermissionGuidanceTests {
         #expect(!granted.contains("V-3"))
     }
 
+    /// **I-4: フェーズ 1 の設定手段は手編集だけ。** 読めなかったことを黙ると、
+    /// 「設定を書き換えたのに効かない」という症状だけが残り、原因に辿り着けない。
+    @Test("読めなかったファイルがあれば、既定値で動いていることを述べる")
+    func reportNamesUnreadableFiles() {
+        let broken = PermissionGuidance.report(
+            status(), storageRoot: URL(filePath: "/tmp/gv"), unreadable: ["settings.json"])
+        let fine = PermissionGuidance.report(status(), storageRoot: URL(filePath: "/tmp/gv"))
+
+        #expect(broken.contains("settings.json を読めませんでした"))
+        #expect(broken.contains("既定値で動作しています"))
+        // 「何が効いていないか」まで言う
+        #expect(broken.contains("ホットキー"))
+        #expect(!fine.contains("読めませんでした"), "読めているのに警告を出している")
+    }
+
+    /// **結線まで確かめる。** 文言（`report`）とストア（`loadFailure`）を別々に
+    /// 検査しても、**両者を繋ぐ 3 行が間違っていれば利用者には何も出ない。**
+    @Test("壊れたファイルを実際に置くと、その名前が挙がる")
+    func detectsUnreadableFilesOnDisk() throws {
+        try withTempRoot { root in
+            try Data("{ broken".utf8).write(to: root.appendingPathComponent("settings.json"))
+            try Data("[oops".utf8).write(to: root.appendingPathComponent("vocabulary.json"))
+
+            let names = GhostVoiceRuntime.unreadableStorageFiles(root: root)
+            #expect(names.contains("settings.json"))
+            #expect(names.contains("vocabulary.json"))
+            #expect(!names.contains("history.json"), "無いだけのファイルを失敗として数えている")
+        }
+    }
+
+    @Test("すべて読めるなら何も挙がらない")
+    func reportsNoUnreadableFilesWhenHealthy() throws {
+        try withTempRoot { root in
+            #expect(GhostVoiceRuntime.unreadableStorageFiles(root: root).isEmpty)
+        }
+    }
+
+    @Test("読めなかったファイルは名前ごとに出る")
+    func reportListsEachUnreadableFile() {
+        let report = PermissionGuidance.report(
+            status(), storageRoot: URL(filePath: "/tmp/gv"),
+            unreadable: ["settings.json", "vocabulary.json"])
+        #expect(report.contains("settings.json を読めませんでした"))
+        #expect(report.contains("vocabulary.json を読めませんでした"))
+    }
+
     @Test("報告には設定ファイルの置き場所が載っている")
     func reportShowsStorageRoot() {
         let report = PermissionGuidance.report(

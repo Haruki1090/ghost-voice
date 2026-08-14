@@ -4,14 +4,38 @@ import Foundation
 public enum HotkeyEvent: Sendable, Equatable {
     case pressed
     case released
-    /// ESC による中断、またはタップが無効化されて解放を取りこぼした場合。
+    /// **利用者が中断を要求した**（ESC）。「これを挿入するな」という意図である。
     case cancelled
+    /// **取りこぼし。** 監視が死んで PTT キーの解放を受け取れなくなった。
+    ///
+    /// **`.cancelled` と同じ扱いにしてはならない**（基本設計書 §7 の縮退表）。
+    /// 利用者は喋っていたのであって、中断を要求していない。最大録音時間の満了と
+    /// まったく同じ状況なので、**中断ではなく確定として扱う**（そこまでの発話を届ける）。
+    ///
+    /// > 以前はこれも `.cancelled` で運んでいた。**意図と事故が同じ列挙子に相乗りし、
+    /// > 「決めないまま捨てる」になっていた**（フェーズ 1 の最終レビュー I-2）。
+    case interrupted
 }
 
 public protocol HotkeyMonitor: AnyObject, Sendable {
     var events: AsyncStream<HotkeyEvent> { get }
     func start() throws
     func stop()
+
+    /// セッションが**確定〜整形の処理中**かを知らせる。
+    ///
+    /// **これが無いと、キーを離した後の ESC が中断として届かない。**
+    /// 監視器は「PTT キーを握っている間」しか ESC を中断として扱えず、
+    /// 一方で `DictationSession` は確定待ち・整形中の中断を受け付ける
+    /// （基本設計書 §4「中断が効くのは recording / finalizing / refining の 3 状態」）。
+    /// **2 つが別の量を見ていたため、正本の約束の半分が実装されていなかった**
+    /// （フェーズ 1 の最終レビュー I-1）。
+    ///
+    /// - Important: **この窓では ESC を抑止しない。** キーを離した後の利用者は
+    ///   挿入先のアプリを操作しているので、そこで ESC を奪うと下流のアプリが壊れる
+    ///   （V-4 の #6「録音していないときの ESC は下流へ届く」の趣旨）。
+    ///   中断は届き、かつ ESC も通す。
+    func setSessionBusy(_ busy: Bool)
 }
 
 /// タップを開けなかった瞬間の権限照会の答え。
@@ -61,12 +85,15 @@ public enum HotkeyDecision {
     /// - Parameter type: `CGEventTap` のコールバックが受け取るイベント種別。
     ///   **修飾キー以外のバインドでは、これが無いと押下と解放を区別できない。**
     /// - Returns: 発火するイベントと、そのキーイベントを抑止するか。
+    /// - Parameter isSessionBusy: セッションが確定〜整形の処理中か（`setSessionBusy`）。
+    ///   **録音中でなくても、この間の ESC は中断として扱う。**
     public static func decide(
         type: CGEventType,
         keyCode: Int64,
         flags: CGEventFlags,
         binding: HotkeyBinding,
-        isRecording: Bool
+        isRecording: Bool,
+        isSessionBusy: Bool = false
     ) -> (event: HotkeyEvent?, suppress: Bool) {
 
         // **バインドを先に見る。** ESC を PTT に割り当てたユーザーから
@@ -79,8 +106,15 @@ public enum HotkeyDecision {
             // **抑止するのは keyDown だけ。** keyUp まで抑止しても中断は漏れず、
             // 下流アプリのキー状態だけが狂う。
             guard type == .keyDown else { return (nil, false) }
-            // 録音中の ESC だけを中断として消費する
-            return isRecording ? (.cancelled, true) : (nil, false)
+
+            // 録音中の ESC は中断として消費する（下流へ渡さない）。
+            if isRecording { return (.cancelled, true) }
+
+            // **処理中（キーを離した後）の ESC も中断として届ける。ただし抑止しない。**
+            // 利用者はもう挿入先のアプリを触っているので、ESC を奪うと下流が壊れる。
+            if isSessionBusy { return (.cancelled, false) }
+
+            return (nil, false)
         }
 
         return (nil, false)
@@ -243,6 +277,8 @@ extension HotkeyBinding.Modifiers {
 public final class StubHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     public let events: AsyncStream<HotkeyEvent>
     private let continuation: AsyncStream<HotkeyEvent>.Continuation
+    private let lock = NSLock()
+    private var busyCalls: [Bool] = []
 
     public init() {
         (events, continuation) = AsyncStream<HotkeyEvent>.makeStream()
@@ -251,4 +287,12 @@ public final class StubHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     public func start() throws {}
     public func stop() { continuation.finish() }
     public func emit(_ event: HotkeyEvent) { continuation.yield(event) }
+
+    /// `setSessionBusy` の呼ばれ方。**セッションが処理中を知らせているか**を見る。
+    public var sessionBusyCalls: [Bool] { lock.withLock { busyCalls } }
+    public var isSessionBusy: Bool { lock.withLock { busyCalls.last ?? false } }
+
+    public func setSessionBusy(_ busy: Bool) {
+        lock.withLock { busyCalls.append(busy) }
+    }
 }

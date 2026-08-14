@@ -92,6 +92,23 @@ struct VocabularyStoreTests {
 
     /// `VocabularyStore` は退避のコードを 1 行も持っていない（`grep quarantine` が当たらない）。
     /// それでも保護が効くこと ＝ 保護が利用者側の書き忘れに依存していないことの証拠。
+    /// I-4。3 つのストアで同じ契約であることを固定する（`SettingsStore` の注記）。
+    @Test("復元できなかったときは読み込み失敗を保持する")
+    func keepsLoadFailureWhenUnreadable() throws {
+        try withTempRoot { root in
+            try Data("{ broken".utf8).write(to: root.appendingPathComponent("vocabulary.json"))
+            #expect(VocabularyStore(rootURL: root).loadFailure != nil)
+            #expect(VocabularyStore(rootURL: root).terms.isEmpty)
+        }
+    }
+
+    @Test("ファイルが無いだけなら読み込み失敗にしない")
+    func absentFileIsNotAFailure() throws {
+        try withTempRoot { root in
+            #expect(VocabularyStore(rootURL: root).loadFailure == nil)
+        }
+    }
+
     @Test("復元できなかった辞書は上書きの前に .corrupt へ退避される")
     func quarantinesUnreadableFileWithoutStoreSideCode() throws {
         try withTempRoot { root in

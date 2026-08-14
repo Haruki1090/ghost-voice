@@ -40,7 +40,10 @@ swift build -c release
 [metrics] finalize 70ms / refine 400ms / insert 5ms / total 475ms OK
 ```
 
-- 録音中の **ESC** で中断する（中断しても録音済みの内容は履歴へ残り、挿入だけを行わない）
+- **ESC** で中断する。効くのは**録音中と、キーを離した後の確定・整形中**まで
+  （挿入が始まった後は手遅れとして完走させる。止めると ⌘V の送出後にテキストが消えるため）。
+  中断しても録音済みの内容は履歴へ残り、挿入だけを行わない。
+  **録音中の ESC は挿入先アプリへ渡さないが、キーを離した後の ESC は通す**（アプリの操作を奪わない）
 - **Ctrl-C** で終了する。**進行中の発話は最後まで見届けてから終了する**（挿入の途中でプロセスを
   落とすと、⌘V の送出後・クリップボードの復元前で消えてテキストがどこにも残らないため）
 
@@ -89,6 +92,25 @@ swift build -c release
 
 notch HUD（FR-2 / FR-3）、Undo の実行（FR-7）、設定 UI（FR-11）、履歴 UI。
 表示は上記の標準エラー出力で代替し、設定は JSON の直接編集で行う。
+
+> **Undo が無い状態で整形が既定で有効である。**
+> 要件定義書 L-5 / R-3 は「LLM が意味を削った場合の実効的な安全網は Undo である」と書いている。
+> フェーズ 1 にはそれが無いので、**整形が意味を削ったときに戻す手段は無い**——
+> `history.json` の `rawText`（整形前の生テキスト）を手で取り出すしかない。
+> 整形をやめるなら `settings.json` の `refinementEnabled` を `false` にする。
+
+## テスト
+
+```bash
+swift test
+```
+
+> **既定の `swift test` は、一瞬だけ OS 全体の secure input を有効にする。**
+> `SystemPasteShortcutSender` が本当に `IsSecureEventInputEnabled()` を見ているかを
+> 実際に有効化して確かめるテストが 3 件あるため（`defer` で必ず戻し、窓は実測 17 ms）。
+> **その間、他アプリの入力補助（テキスト展開・IME 補助など）が一瞬効かなくなりうる。**
+> 実マイクを開くテストと性能計測は既定では走らない（`GHOST_VOICE_MIC_TESTS` /
+> `GHOST_VOICE_MEASURE` / `GHOST_VOICE_V12_SECONDS` を付けたときだけ）。
 
 ## ドキュメント
 

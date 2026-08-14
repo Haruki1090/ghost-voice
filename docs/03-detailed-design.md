@@ -16,9 +16,8 @@ ghost-voice/
 ├── Package.swift                      GhostVoiceCore の定義
 ├── Sources/GhostVoiceCore/
 │   ├── Hotkey/
-│   │   ├── HotkeyMonitor.swift        プロトコル
-│   │   ├── CGEventTapHotkeyMonitor.swift
-│   │   └── HotkeyBinding.swift        キー定義とシリアライズ
+│   │   ├── HotkeyMonitor.swift        プロトコル・HotkeyEvent・HotkeyDecision（判定）
+│   │   └── CGEventTapHotkeyMonitor.swift
 │   ├── Audio/
 │   │   ├── AudioCapturing.swift       プロトコル
 │   │   └── EngineAudioCapture.swift   AVAudioEngine 実装
@@ -35,15 +34,24 @@ ghost-voice/
 │   │   ├── AccessibilityInserter.swift
 │   │   ├── PasteboardInserter.swift
 │   │   └── CompositeInserter.swift    二段構えの調停
+│   ├── Models/
+│   │   ├── HotkeyBinding.swift        キー定義とシリアライズ
+│   │   ├── Settings.swift             設定（既定値の出所）
+│   │   ├── HistoryEntry.swift
+│   │   ├── InsertionMethod.swift      履歴に残す挿入経路（4 ケース）
+│   │   ├── TranscriberKind.swift
+│   │   └── VocabularyTerm.swift
 │   ├── Storage/
+│   │   ├── AtomicJSONFile.swift       原子的な読み書き・退避・LoadOutcome
 │   │   ├── HistoryStore.swift
 │   │   ├── SettingsStore.swift
 │   │   └── VocabularyStore.swift
 │   ├── Session/
 │   │   └── DictationSession.swift     状態機械（基本設計書 §4）
 │   └── Support/
-│       ├── Permissions.swift
 │       └── Metrics.swift              性能計測点
+│                                      （権限の保持は Insertion/PasteboardInserter.swift の
+│                                       PostEventAuthorization。独立した Permissions.swift は無い）
 ├── Sources/GhostVoiceCLI/             CLI の中身（**検査対象**）
 │   ├── CommandLineOptions.swift       引数の解釈
 │   ├── SessionNarration.swift         状態 → 表示行。stateUpdates の唯一の消費者
@@ -83,13 +91,17 @@ ghost-voice/
 public enum HotkeyEvent: Sendable {
     case pressed
     case released
-    case cancelled          // ESC 押下による中断、またはタップ無効化で解放を取りこぼした場合
+    case cancelled          // **利用者の意図**: ESC による中断（「これを挿入するな」）
+    case interrupted        // **事故**: タップが無効化され、解放を取りこぼした
 }
 
 public protocol HotkeyMonitor: AnyObject, Sendable {
     var events: AsyncStream<HotkeyEvent> { get }
     func start() throws
     func stop()
+    /// セッションが確定〜整形の処理中かを知らせる。**この間の ESC も中断として届ける**
+    /// （ただし抑止しない。§2.4）。
+    func setSessionBusy(_ busy: Bool)
 }
 
 public enum HotkeyError: Error, Equatable, Sendable {
@@ -105,6 +117,19 @@ public enum HotkeyError: Error, Equatable, Sendable {
 **ホットキー設定（`Settings.hotkey`）が変わったときも作り直すこと。** `binding` は不変で、監視するイベント種別は `start()` 時に一度だけ決まる（§2.3 の `keyUp` の要否がバインドによって変わる）。既存の監視器に新しいバインドを反映する手段は無い。
 
 `CGEventTapHotkeyMonitor` は `isActive` を持つ。**`start()` が成功しても、あとでタップが無効化されて false になりうる**（下記）。ホットキーが黙って効かなくなる唯一の経路なので、Task 10 / 11 はここを見てユーザーへ知らせること。
+
+#### 中断（意図）と取りこぼし（事故）を同じ列挙子で運ばない
+
+**利用者が ESC を押した**のと、**OS がタップを切った**のは、起きたことも望ましい結末も違う。
+
+| 事象 | 利用者の意図 | セッション側の扱い |
+|---|---|---|
+| 録音中・処理中の ESC（`.cancelled`） | 「これを挿入するな」 | 挿入しない。履歴へ `.notInserted` で残す |
+| タップ無効化（`.interrupted`） | **無い。喋っている最中に監視が死んだだけ** | **中断ではなく確定**。そこまでの発話を挿入する（基本設計書 §7） |
+
+後者を `.cancelled` に相乗りさせていた頃は、**この場合に発話をどうするかを誰も決めておらず、
+結果として「捨てる」になっていた**（フェーズ 1 の最終レビュー I-2）。最大録音時間の満了
+（§2.4 の注記）とまったく同じ状況なので、扱いも同じにする。
 
 ### 2.2 CGEventTap 実装
 
@@ -158,9 +183,9 @@ let tap = CGEvent.tapCreate(
 - timeout を放置すると**ホットキーが二度と反応しない**（アプリは生きているのでユーザーからは原因が判らない）。だから張り直す。
 - UserInput を張り直すのは**要求を無視して蘇ること**なので行わない。
 
-**どちらも無制限には扱わない。** 原因不明の連続無効化に対して張り直し続けると、無効化と `.cancelled` の応酬が止まらなくなる（`events` は無制限バッファである）。`maxReEnableAttempts`（10 回）で諦める。
+**どちらも無制限には扱わない。** 原因不明の連続無効化に対して張り直し続けると、無効化と `.interrupted` の応酬が止まらなくなる（`events` は無制限バッファである）。`maxReEnableAttempts`（10 回）で諦める。
 
-いずれの場合も、無効化されていた間に PTT キーの解放を取りこぼしている可能性があるため、**録音中だったなら `.cancelled` を出す**（出さないと録音が終わらない状態で固まる）。
+いずれの場合も、無効化されていた間に PTT キーの解放を取りこぼしている可能性があるため、**録音中だったなら `.interrupted` を出す**（出さないと録音が終わらない状態で固まる）。**`.cancelled` ではない**——利用者は中断を要求していないので、セッション側はこれを確定として扱う（§2.1 の表 / 基本設計書 §7）。
 
 **諦めた場合、ホットキーは以後反応しない。** 監視器を作り直す以外に復帰の手立ては無い。`isActive` が false になるので、Task 10 / 11 はそれを見てユーザーへ知らせること。
 
@@ -211,7 +236,7 @@ let tap = CGEvent.tapCreate(
 
 `Settings.hotkey` は任意の `HotkeyBinding` を取れる。**修飾キー以外を PTT に割り当てた場合、`flagsChanged` は飛んで来ない。** `keyDown` だけを監視していると解放を検出できず、**録音が永遠に終わらない。** そのため `binding.isModifierOnly` が偽のときはマスクに `keyUp` を加え、`keyDown` / `keyUp` で押下・解放を判定する（修飾キーのバインドでは `keyUp` を含めない。全打鍵の keyUp をタップに通す分だけ無駄になる）。
 
-判定は `HotkeyDecision.decide(type:keyCode:flags:binding:isRecording:)` という純粋関数に閉じてあり、`CGEventTap` 無しでテストできる。
+判定は `HotkeyDecision.decide(type:keyCode:flags:binding:isRecording:isSessionBusy:)` という純粋関数に閉じてあり、`CGEventTap` 無しでテストできる。**`isRecording`（監視器が見るキーの状態）と `isSessionBusy`（セッションの処理中）は別の量である。** 前者だけで ESC を判定していたため、正本が約束する「処理中の中断」が実機で 1 度も届いていなかった（最終レビュー I-1）。
 
 ### 2.4 イベント抑止の設計（R-1 対策）
 
@@ -225,6 +250,7 @@ let tap = CGEvent.tapCreate(
 |---|---|---|
 | 右 Option の `flagsChanged` | しない | 上記のとおり |
 | 録音中の ESC `keyDown` | **する** | 中断操作を挿入先アプリに漏らさない |
+| **処理中（キー解放後）の ESC `keyDown`** | **しない** | **中断としては届けるが、抑止はしない。** 利用者はもう挿入先のアプリを操作しているので、ここで ESC を奪うと下流が壊れる（V-4 の #6）。中断が効く窓は基本設計書 §4 の 3 状態（`recording` / `finalizing` / `refining`）で、**監視器は `setSessionBusy` でその窓を知る** |
 | 録音中の ESC `keyUp` | しない | 抑止しても中断は漏れず、下流アプリのキー状態だけが狂う |
 | PTT でも ESC でもないキー | **しない** | タップは全アプリの手前に居る。1 つでも抑止するとユーザーは文字を打てなくなる |
 | **修飾キー以外の PTT の `keyDown` / `keyUp`** | **する** | 下記 |
@@ -526,7 +552,9 @@ if await AssetInventory.status(forModules: [module.speechModule]) != .installed 
     guard let request = try await AssetInventory
         .assetInstallationRequest(supporting: [module.speechModule])
     else { throw TranscriptionError.modelUnavailable }
-    // request.progress を HUD に表示（FR-10）
+    // request.progress を HUD に表示（FR-10。**HUD はフェーズ 2**）
+    // フェーズ 1 の CLI は `onAssetInstallationStart` で「導入が始まった」1 行だけを出す。
+    // 進捗（%）は出さない——出す先が無いため（§12-11）
     try await request.downloadAndInstall()
 }
 
@@ -811,6 +839,9 @@ return await results.next() ?? nil
 ```swift
 public enum InsertionMethod: String, Sendable, Codable {
     case ax, pasteboard, clipboardOnly
+    /// 挿入していない。**ESC で中断された発話**（§4）。挿入経路を 1 つも通っていないので、
+    /// 上の 3 つと並べて「どの経路で入ったか」として読んではならない。
+    case notInserted
 }
 
 /// 挿入を試みた結果。
@@ -1141,11 +1172,22 @@ public struct Settings: Codable, Sendable {
 }
 ```
 
+#### 読めなかったことは保持して、表に出す
+
+3 つのストアは init で `loadOutcome()` を使い、**「ファイルが無い（正常な初回起動）」と
+「あるのに復元できなかった」を区別して** `loadFailure` に持つ。表に出すのは CLI の仕事で、
+`--check` の報告と常駐起動時の 1 行が「既定値で動作しています」と告げる。
+
+**フェーズ 1 の設定手段は `settings.json` の手編集だけ**なので、ここを黙ると、
+カンマ 1 つの打ち間違いが「書き換えたのに効かない」という症状だけを残す
+（原因に辿り着く手掛かりがどこにも無い。フェーズ 1 の最終レビュー I-4）。
+
 ### 8.2 書き込み方針
 
 - JSON、原子的書き込み（一時ファイル → `replaceItemAt`）。
 - 履歴は**挿入完了後に**追記し、挿入のクリティカルパスに入れない（NFR-P6）。
 - `historyLimit` 超過分は追記時に切り詰める。
+- **書き込みの失敗は握り潰さない。** `DictationSession` は結果を見て `.failed(.historyUnavailable(insertedElsewhere:))` を出す。**中断された発話は履歴が唯一の写しなので、黙って落とすと発話ごと消える**（基本設計書 §7 の縮退表。フェーズ 1 の最終レビュー C-1）。挿入済みかどうかで文言を変えるのは、利用者にとって失うものが違うため（履歴と Undo だけ / 発話そのもの）。
 
 **書き込みは同期である（実装の事実。当初「非同期で追記」と書いていたのを実測で置き換えた）。**
 `DictationSession` は挿入を終えた後、actor を掴んだまま `HistoryStore.append` を呼ぶ。
@@ -1657,9 +1699,9 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 6 | `HotkeyMonitor` | 判定と `CGEventTap` は完了。**V-4 はキーイベント監視の権限が要るため §12-11 へ繰り延べ。手順は README にある** |
 | 7 | `DictationSession`（状態機械） | **状態機械と計測は完了（Task 10）。M5 を 2 条件で実測し、整形の既定タイムアウトを 750 ms へ引き上げた（§10）。** CLI での一気通貫は §12-11 で完了 |
 | 8 | `NotchHUD` | **V-5 / V-6 を実施する** |
-| 9 | 設定 UI・権限フロー・履歴 UI | FR-7〜FR-11 が満たされる |
+| 9 | 設定 UI・権限フロー・履歴 UI | FR-7〜FR-11 が満たされる。**受け入れ条件に「ホットキーの妥当性は `HotkeyBinding` 自身の不変条件として一括で検証する」を含めること**——現状の衝突検査は `SettingsStore.update` の経路にしか無く、手編集した `settings.json` は検査を通らない（フェーズ 1 では undo ホットキーを使わないので実害が無く、意図的に繰り延べた。最終レビュー M-7） |
 | 10 | 性能計測と調整 | **M5 は実測済み（現行の打ち切り 750 ms で 中央値 398 / 411 ms、p90 419 / 819 ms。§10）。ただし `.clipboardOnly` 経路に固定した計測であり、⌘V の往復と復元待ちを含む確定は V-3 待ち。V-7（メモリ）は未確認** |
-| 11 | **CLI と一気通貫**（`ghost-voice`） | **完了（Task 11）。** 起動・権限案内・表示・終了の待ち合わせが動く。`--check` / `--request-permissions` / `--mic-check` を用意した。**権限の要らない V-12 / V-13 / V-14 はここで実施した。V-3 / V-4 は権限の付与が要るため利用者が実施する**（README の手順） |
+| 11 | **CLI と一気通貫**（`ghost-voice`） | **完了（Task 11）。** 起動・権限案内・表示・終了の待ち合わせが動く。**FR-10 は部分達成**——権限の案内は達成、**モデル導入の案内は「導入が始まったことを 1 行出す」までで、進捗（`request.progress`）は出さない**（§4.3。進捗表示は HUD と一緒に §12-8 で行う）。`--check` / `--request-permissions` / `--mic-check` を用意した。**権限の要らない V-12 / V-13 / V-14 はここで実施した。V-3 / V-4 は権限の付与が要るため利用者が実施する**（README の手順） |
 
 **手順 2 と 3 の間に V-1（肉声での精度比較）を必ず実施する。** ここで `SpeechTranscriber` が優位と判明した場合、`SettingsStore.transcriberKind` の既定値を変更するだけで済む構造にしてある。
 
@@ -1681,5 +1723,6 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-11 | **タップ設置時点と最初のバッファ内容の先頭時刻のずれ**（既知信号を鳴らしながらタップを張り、最初のバッファの位相を見る） | 実装 §12-3（Task 10 の計測実装のついで） | **未実施。** 原理的に最大 1 I/O サイクル（512 フレーム ≒ 10.7 ms）の頭欠けが残りうる。実害は NFR-P1 の予算内 |
 | V-10 | デバイス切断（`AVAudioEngineConfigurationChange`）の実挙動 | 実機での確認時 | **未実施。** 合成通知での再構成は検証済みだが、実際のデバイス抜き差しでは通知の到達スレッド・`isRunning` の状態・タップの残存が異なりうる |
 | V-12 | **キー解放後に届く確定（`.final`）が 1 回とは限らないこと** | 実装 §12-11 | **完了（Task 11）。ただし危険な条件は再現しておらず、リスクは残っている。** **解放後に 2 件目の確定が届けば、その分の文字は今も落ちる**（`completeUtterance` は解放後の最初の確定で待ちを解き、そこで `latestFinal` を**同期的に**読む。以後に積まれた確定は二度と読まれない）。**録音中に届く確定は落ちない**——`latestFinal` へ積まれるだけで先へ進まないため、今回観測した 2 件目はこの安全な側である。 フィクスチャ音声を**実時間で**流して `DictationSession` を通した実測（`Tests/GhostVoiceCoreTests/FinalAfterReleaseTests.swift`。権限は一切不要）: **103 秒**の読み上げで確定は計 **2 件（録音中 1 件・解放後 1 件）**、挿入 548 字 = 確定の総和 548 字。**30 秒**では確定 1 件（167 字）。録音中に届いた確定は `latestFinal` へ積まれ、解放後の 1 件で確定待ちが解ける。**「解放後に 2 件目」という危険な条件そのものは、この音声では再現しなかった**（＝否定されたのではなく、起きなかった）。**肉声・別のロケール・別の認識種別では起こりうる。** **この検査は既定の `swift test` では走らない**（**`GHOST_VOICE_V12_SECONDS=103` で実行する**。実時間の実認識が機体を飽和させ、時間閾値を持つ既存の検査 2 件が落ちたため既定には入れていない。`GHOST_VOICE_MEASURE` と同じ扱い）。**30 秒では確定が 1 件しか出ず、取りこぼしの経路を 1 度も通らない**（積み忘れの変異が生き残る）。**再実行は必ず 103 で行うこと。** いつ回すかは README の「V-3 / V-4 の実施手順」に書いた |
+| V-15 | **アイドル時の CPU（NFR-P7 の 1 % 未満）** | **V-3 の実施時**（常駐起動が要る） | **未実施。** `AVAudioEngine` を起動したまま常駐する設計（§3.2）なので、**測るまで判らない**。`ghost-voice` を起動して `top -pid <pid>` を 1 分見る。要件定義書 §4.2 に目標値だけがあり、検証項目が無かった（開発サイクル §3 の適用漏れ。フェーズ 1 の最終レビュー M-3） |
 | V-13 | **素の実行ファイル（`.app` バンドル無し）でマイクを開けるか** | 実装 §12-11 | **完了（Task 11）。** 開ける。`--mic-check` で 1 秒に 10 バッファ / 48000 フレーム（48000 Hz / 1 ch、取りこぼし 0）。バンドル ID は nil、署名も `Info.plist` も無い。**許可は責任プロセス（起動元のターミナルアプリ）に紐づく**（§3.3）。**要求（ダイアログ）だけは素のバイナリから出せないという §3.3 の実測はそのまま有効である** |
 | V-14 | **音声認識の TCC（`kTCCServiceSpeechRecognition`）が要るか** | 実装 §12-11 | **完了（Task 11）。要らない。** `SFSpeechRecognizer.authorizationStatus()` が `.notDetermined` のまま `SpeechAnalyzer` の認識が通り、認識の前後で状態も変わらない（`recognizesWithoutSpeechRecognitionAuthorization`）。要件定義書 FR-10 / 必要権限、基本設計書 §10（権限とビルド構成。`NSSpeechRecognitionUsageDescription` も不要）、本書 §9 の照会表からも外した。**`--check` が音声認識を持たないのは実装漏れではない** |

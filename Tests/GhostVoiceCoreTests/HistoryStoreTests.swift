@@ -167,6 +167,23 @@ struct HistoryStoreTests {
 
     /// 音声は再現できないので、発話を失わないことが最優先（要件定義書 NFR-V2）。
     /// `HistoryStore` は退避のコードを 1 行も持たないが、init で読むことが前提。
+    /// I-4。3 つのストアで同じ契約であることを固定する。
+    @Test("復元できなかったときは読み込み失敗を保持する")
+    func keepsLoadFailureWhenUnreadable() throws {
+        try withTempRoot { root in
+            try Data("{ broken".utf8).write(to: root.appendingPathComponent("history.json"))
+            #expect(HistoryStore(rootURL: root, limit: 50).loadFailure != nil)
+            #expect(HistoryStore(rootURL: root, limit: 50).entries.isEmpty)
+        }
+    }
+
+    @Test("ファイルが無いだけなら読み込み失敗にしない")
+    func absentFileIsNotAFailure() throws {
+        try withTempRoot { root in
+            #expect(HistoryStore(rootURL: root, limit: 50).loadFailure == nil)
+        }
+    }
+
     @Test("復元できなかった履歴は上書きの前に .corrupt へ退避される")
     func quarantinesUnreadableFile() throws {
         try withTempRoot { root in

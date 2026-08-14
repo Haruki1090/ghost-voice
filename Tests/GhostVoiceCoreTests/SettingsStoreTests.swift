@@ -65,6 +65,49 @@ struct SettingsStoreTests {
         }
     }
 
+    /// **I-4: 読めなかったことを保持する。**
+    ///
+    /// フェーズ 1 の設定手段は `settings.json` の手編集だけである。カンマ 1 つの
+    /// 打ち間違いで**全設定が無言で既定へ戻る**と、利用者に見える症状は
+    /// 「`en-US` にしたのに日本語で認識される」だけになり、原因に辿り着けない。
+    /// **「無い（正常な初回起動）」と「読めなかった」を潰さない**のがこの型の役目で、
+    /// `LoadOutcome` はそのために作られた（Task 2）。
+    @Test("復元できなかったときは読み込み失敗を保持する")
+    func keepsLoadFailureWhenUnreadable() throws {
+        try withTempRoot { root in
+            try Data("{ this is not json".utf8)
+                .write(to: root.appendingPathComponent("settings.json"))
+
+            let store = SettingsStore(rootURL: root)
+            #expect(store.loadFailure != nil, "読めなかったことを握り潰している")
+            // 既定値では動く（起動しなくなるより良い）
+            #expect(store.settings == Settings.default)
+        }
+    }
+
+    /// **無いことは失敗ではない。** ここを区別しないと、初回起動のたびに
+    /// 「設定を読めませんでした」と出て、本当の失敗が埋もれる。
+    @Test("ファイルが無いだけなら読み込み失敗にしない")
+    func absentFileIsNotAFailure() throws {
+        try withTempRoot { root in
+            let store = SettingsStore(rootURL: root)
+            #expect(store.loadFailure == nil)
+            #expect(store.settings == Settings.default)
+        }
+    }
+
+    @Test("読めたときは読み込み失敗にしない")
+    func loadedFileIsNotAFailure() throws {
+        try withTempRoot { root in
+            let first = SettingsStore(rootURL: root)
+            try first.update { $0.historyLimit = 7 }
+
+            let second = SettingsStore(rootURL: root)
+            #expect(second.loadFailure == nil)
+            #expect(second.settings.historyLimit == 7)
+        }
+    }
+
     /// 復元できなかったファイルを退避せずに保存すると、`.atomic` write が
     /// 元の内容を復旧不能に消す。ユーザーが手編集した設定を失わせないための保護。
     @Test("復元できなかったファイルは上書きの前に .corrupt へ退避する")
