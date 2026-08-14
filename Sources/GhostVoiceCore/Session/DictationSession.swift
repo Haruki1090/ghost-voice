@@ -43,7 +43,12 @@ public enum SessionNotice: Sendable, Equatable {
     ///   **どの理由でも欄の内容は変えていない。**
     case refinementNotApplied(ReplacementDecline?)
     /// **差し替えの途中で欄の内容が判らなくなった**（R-9）。
-    /// 差し替えようとした文字列はクリップボードにある。**これだけは重い。**
+    ///
+    /// 差し替えようとした文字列は**クリップボードへ退避を試みてある**
+    /// （`TextReplacer.verify`。`NSPasteboard.setString` が失敗した場合は載らない）。
+    /// **履歴には必ず raw と refined の両方がある**——差し替えは
+    /// 「履歴へ書けてから始める」を門にしているためで、そこが 1 番目の受けである
+    /// （詳細設計書 §8.3）。**これだけは重い。**
     case textMayHaveBeenLost
     /// Undo で整形前の生テキストへ戻した（FR-7）。
     case undone
@@ -1472,7 +1477,14 @@ public actor DictationSession {
             notify(.undoUnavailable)
             return
         }
-        clipboard.leave(latest.rawText)
+        // **戻り値を見る。**「クリップボードへ取り出しました」は主張であって、
+        // 置けていないのにそう告げると、利用者は ⌘V を押して何も貼れない
+        // （`CompositeInserter` の最後の砦と同じ形。最終レビュー A-2）。
+        // 置けなくても発話は履歴にある——だから「戻せません」で済ませてよい。
+        guard clipboard.leave(latest.rawText) else {
+            notify(.undoUnavailable)
+            return
+        }
         notify(.undoCopiedRawTextToClipboard)
     }
 

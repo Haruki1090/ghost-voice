@@ -323,3 +323,37 @@ struct UndoHotkeyDecisionTests {
         #expect(decide(isRecording: true).event == .undoRequested)
     }
 }
+
+/// **クリップボードへ置けなかったときに「取り出しました」と言わないこと。**
+@Suite("FR-7: 縮退の告知")
+struct UndoFallbackHonestyTests {
+
+    @Test("クリップボードへ置けなかったら「取り出しました」と言わない")
+    func doesNotClaimTheClipboardWhenTheOffloadFails() async throws {
+        try await withTempRoot { root in
+            let rig = RevisionRig.make(
+                root: root, focusedProcess: RevisionRig.ownProcess, clipboardSucceeds: false)
+            let collector = rig.notices.follow(rig.session)
+            defer { collector.cancel() }
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") {
+                if case .recording = await rig.session.state { return true }
+                return false
+            }
+            rig.audio.emit(frames: 1_600)
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            rig.hotkey.emit(.undoRequested)
+            try await waitUntil("顛末が出る") { !rig.notices.notices.isEmpty }
+
+            #expect(
+                rig.notices.notices == [.undoUnavailable],
+                "クリップボードへ置けていないのに『取り出しました』と告げている")
+            #expect(rig.clipboard.left.isEmpty)
+        }
+    }
+}

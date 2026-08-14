@@ -220,7 +220,8 @@ final class RevisionRig: Sendable {
         historyLimit: Int = 50,
         caret: FakeTextField.CaretAfterWrite = .endOfWrittenText,
         secureInputAtInsertion: Bool = false,
-        refiner: SpyRefiner? = nil
+        refiner: SpyRefiner? = nil,
+        clipboardSucceeds: Bool = true
     ) -> RevisionRig {
         let identity = UUID()
         let field = FakeTextField(
@@ -245,7 +246,7 @@ final class RevisionRig: Sendable {
         let isSecureInputEnabled: @Sendable () -> Bool = { secure.isEnabled }
 
         let epoch = InsertionEpoch()
-        let clipboard = StubClipboard()
+        let clipboard = StubClipboard(succeeds: clipboardSucceeds)
         let inserter = CompositeInserter(
             primary: AccessibilityInserter(
                 accessibility: accessibility, ownProcessIdentifier: ownProcess, epoch: epoch),
