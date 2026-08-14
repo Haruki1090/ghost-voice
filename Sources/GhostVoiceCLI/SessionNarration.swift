@@ -133,49 +133,42 @@ public enum SessionNarration {
 
     /// 縮退の理由を、**次に何をすればよいかまで含めて**日本語にする（FR-10）。
     ///
+    /// **判断は Core が持つ**（`SessionFailureNotice`）。ここがやるのは端末向けの
+    /// 組み立てだけである。以前は文言そのものがここにあり、`ghost-voice
+    /// --request-permissions` のような**端末固有の案内が本文へ埋まっていた**ので、
+    /// HUD は同じ文言を別に持つしかなかった（フェーズ 2 の欠落 12）。
+    ///
     /// `SessionFailure` は型であって文言ではない（`DictationSession` の注記）。
     /// 起動時のウォームアップの失敗もこの経路で表に出る（Task 10 申し送り【3】）。
     public static func message(for failure: SessionFailure) -> String {
-        switch failure {
-        case .audioUnavailable:
-            return """
-                マイクを開けませんでした。
-                システム設定 > プライバシーとセキュリティ > マイク で、ghost-voice を起動している\
-                ターミナルアプリを許可してください。一覧に無い場合は \
-                `ghost-voice --request-permissions` を実行すると許可を求めます。
-                """
-        case .transcriptionUnavailable:
-            return """
-                音声認識を開始できませんでした。
-                設定の localeIdentifier（既定 ja-JP）のモデルが利用できるかを確認してください。\
-                システム設定 > 一般 > 言語と地域 に当該言語を追加すると導入されます。
-                """
-        case .noSpeechRecognized:
-            return "認識できませんでした。"
-        case .historyUnavailable(let insertedElsewhere):
-            // **挿入まで行ったかで、利用者にとっての意味がまったく違う。**
-            // 同じ文言にすると、発話が消えた場合に「履歴が欠けただけ」と読まれる。
-            if insertedElsewhere {
-                return """
-                    履歴に保存できませんでした（テキストの挿入は完了しています）。
-                    失われるのは履歴と Undo だけです。ディスクの空き容量と \
-                    `~/Library/Application Support/GhostVoice/` の書き込み権限を確認してください。
-                    """
-            }
-            return """
-                履歴に保存できませんでした。**中断したこの発話は失われました。**
-                挿入もしていないため、どこにも残っていません。もう一度話してください。
-                ディスクの空き容量と `~/Library/Application Support/GhostVoice/` の\
-                書き込み権限を確認してください（`history.json` が壊れている場合、\
-                退避に失敗する限り以後も書けません）。
-                """
-        case .refusedSecureInput:
-            // **「失敗」ではなく意図した拒否である。** ここで「もう一度試してください」と
-            // 書くと、パスワード欄へ挿入させようとする案内になる。
-            return """
-                パスワード入力欄（secure input）が有効だったため、整形・挿入・履歴・\
-                クリップボードのいずれも行いませんでした。
-                """
+        let notice = SessionFailureNotice(failure)
+        // **発話が失われた回だけ強調する。** 毎回強調すると、本当に失った回が埋もれる。
+        // 端末では `**` で書く（HUD は同じ判断を太字や色で表す）。この分岐ができるのは、
+        // 「失われたか」を文言ではなく `speechWasLost` で持っているからである。
+        let headline = notice.speechWasLost ? "**\(notice.summary)**" : notice.summary
+        var body = [notice.detail].filter { !$0.isEmpty }
+        body.append(contentsOf: notice.remedies.map(guidance(for:)))
+        guard !body.isEmpty else { return headline }
+        return headline + "\n" + body.joined()
+    }
+
+    /// 次にできることを**端末の利用者向けに**言い直す。
+    ///
+    /// ここが媒体固有の部分である。素の実行ファイルの権限は起動元のターミナルアプリに
+    /// 紐づき（`PermissionGuidance` の注記）、設定は `settings.json` の手編集で行う——
+    /// **どちらも `.app` では別の言い方になる。**
+    static func guidance(for remedy: SessionRemedy) -> String {
+        switch remedy {
+        case .grantAccess(let pane):
+            return "\(pane.localizedPath) で、ghost-voice を起動しているターミナルアプリを許可してください。"
+        case .requestAuthorizationFromApp:
+            return "一覧に無い場合は `ghost-voice --request-permissions` を実行すると許可を求めます。"
+        case .installLanguageModel(let pane):
+            return "認識言語は `settings.json` の `localeIdentifier` で決まります。"
+                + "\(pane.localizedPath) に当該言語を追加すると導入されます。"
+        case .checkStorage(let path):
+            return "ディスクの空き容量と `\(path)` の書き込み権限を確認してください"
+                + "（`history.json` が壊れている場合、退避に失敗する限り以後も書けません）。"
         }
     }
 }

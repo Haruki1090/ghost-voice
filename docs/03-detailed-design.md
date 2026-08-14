@@ -38,8 +38,9 @@ ghost-voice/
 │   │                                  **1 ファイル・1 関数にする。向きが違うだけの操作を
 │   │                                   2 か所に書くと、片方だけ直る事故が起きる**
 │   ├── Models/
-│   │   ├── HotkeyBinding.swift        キー定義とシリアライズ
-│   │   ├── Settings.swift             設定（既定値の出所）
+│   │   ├── HotkeyBinding.swift        キー定義とシリアライズ。**不正な組は作れない**（§2.3）
+│   │   ├── Settings.swift             設定（既定値の出所）と SettingsError
+│   │   ├── SessionFailureNotice.swift 縮退の理由 → 媒体に依らない表示材料（§8.5）
 │   │   ├── HistoryEntry.swift
 │   │   ├── InsertionMethod.swift      履歴に残す挿入経路（4 ケース）
 │   │   ├── TranscriberKind.swift
@@ -126,7 +127,19 @@ public enum HotkeyError: Error, Equatable, Sendable {
 
 `stop()` は `AsyncStream` を終端する。**終端は取り消せないので、停止した監視器は再起動できない**（`start()` は `.stopped` を投げる）。再開したい場合は作り直す。
 
-**ホットキー設定（`Settings.hotkey`）が変わったときも作り直すこと。** `binding` は不変で、監視するイベント種別は `start()` 時に一度だけ決まる（§2.3 の `keyUp` の要否がバインドによって変わる）。既存の監視器に新しいバインドを反映する手段は無い。
+**ホットキー設定（`Settings.hotkey`）が変わったときは `rebind(to:)` を呼ぶ**（フェーズ 2 で追加。欠落 9 / 持ち越し項目 10）。監視するイベント種別は `start()` 時に決まる（§2.3 の `keyUp` の要否がバインドによって変わる）ので、`rebind` は**タップを張り替える。**
+
+```swift
+public protocol HotkeyMonitor {
+    var currentBinding: HotkeyBinding { get }   // いま監視しているバインド
+    func rebind(to binding: HotkeyBinding) throws
+}
+```
+
+**作り直しではなく張り替えにしたのは、`stop()` がストリームを終端するから**である。作り直す設計では、`DictationSession` が `let` で握っている監視器を差し替える手段（＝公開 API か組み立て方の変更）が要る。同じインスタンスの中でタップだけを替えれば、その波及は起きない。
+
+- **録音中に呼ぶと `.interrupted` が流れる。** 新しいバインドでは古いキーの解放が届かないので、出さないと録音が終わらない状態で固まる（§2.3 の「退避経路が残す穴」と同じ形）。**`.cancelled` ではない**ので、そこまでの発話は確定して挿入される（基本設計書 §7 の縮退表）。設定画面は録音していないときに呼ぶこと。上の縮退は保険である。
+- 張り替えに失敗したときは `.idle` へ戻す。権限を直した利用者が `start()` でやり直せる。
 
 `CGEventTapHotkeyMonitor` は `isActive` を持つ。**`start()` が成功しても、あとでタップが無効化されて false になりうる**（下記）。ホットキーが黙って効かなくなる唯一の経路なので、Task 10 / 11 はここを見てユーザーへ知らせること。
 
@@ -242,7 +255,11 @@ let tap = CGEvent.tapCreate(
 
 #### 修飾キー単独のバインドでは追加の修飾キーを見ない
 
-`isModifierDown` はデバイスビットが引ければ `binding.modifiers` を参照しない。したがって `HotkeyBinding(keyCode: 0x3D, modifiers: [.option, .shift])`（⇧ + 右 Option）を設定しても、**右 Option 単独で発火する。** モデル側にこれを禁じる仕組みは無いので、**設定 UI（フェーズ 2 / §12-9）は修飾キー単独のバインドに追加の修飾キーを付けさせないこと。**
+`isModifierDown` はデバイスビットが引ければ `binding.modifiers` を参照しない。したがって「⇧ + 右 Option」を設定できてしまうと、**右 Option 単独で発火する。**
+
+**フェーズ 2 でモデル側が禁じるようにした（持ち越し項目 4）。** `HotkeyBinding` の初期化子は `throws` で、修飾キー単独のバインドには**そのキー自身の修飾キーちょうど**しか許さない（`HotkeyBinding(keyCode: 0x3D, modifiers: [.option, .shift])` は `HotkeyBindingError.modifierOnlyKeyRequiresItsOwnModifier` を投げる）。`Codable` の復元も同じ初期化子を通るので、**手編集した `settings.json` にも効く**（§12-9 / 持ち越し項目 12）。
+
+修飾キーを空にすることも許さない。`conflicts(with:)` は修飾キー単独のバインドについて「修飾キーが重なるか」で判定するので、**空だとどの Undo キーとも衝突しなくなり、§8.3 の「Undo に ⌥ を含めない」保護が手編集 1 箇所で消える。**
 
 #### 修飾キー以外のバインド
 
@@ -1332,8 +1349,14 @@ public struct Settings: Codable, Sendable {
     public var refinementEnabled: Bool          // 既定 true
     public var refinementTimeoutMs: Int         // 既定 750（§10）
     public var historyLimit: Int                // 既定 50
+
+    // ホットキーの妥当性を一括で検証する（§12-9）。復元経路（init(from:)）と
+    // 保存経路（SettingsStore.update）の両方が呼ぶ。
+    public func validateHotkeys() throws       // SettingsError.hotkeyConflict
 }
 ```
+
+**不正なホットキーを持つ `settings.json` は復元できない。** `SettingsStore` はそれを「読めなかった」として扱い、既定値で起動して `loadFailure` に理由を持つ（下記）。元のファイルは `.corrupt` へ退避されるので、利用者は手で直せる。**一部だけ既定へ倒す縮退は採らない**——「PTT だけ既定に戻っている」状態は壊れ方が読めない（I-4 と同じ形の事故になる）。
 
 #### 読めなかったことは保持して、表に出す
 
@@ -1352,7 +1375,7 @@ public struct Settings: Codable, Sendable {
 
 - JSON、原子的書き込み（一時ファイル → `replaceItemAt`）。
 - 履歴は**挿入完了後に**追記し、挿入のクリティカルパスに入れない（NFR-P6a）。**差し替えが成功したら同じ `id` の項目を更新する**（§8.3。追記だけでは 2 件に増える）。
-- `historyLimit` 超過分は追記時に切り詰める。
+- `historyLimit` 超過分は追記時に切り詰める。**上限は `setLimit(_:)` で実行時に変えられる**（フェーズ 2。欠落 10）。下げたときはその場で切り詰めて保存する——次の発話まで待つと、設定画面を閉じた時点の表示と実体が食い違う。負数を既定値へ丸める規則は `init` と共有する。
 - **書き込みの失敗は握り潰さない。** `DictationSession` は結果を見て `.failed(.historyUnavailable(insertedElsewhere:))` を出す。**中断された発話は履歴が唯一の写しなので、黙って落とすと発話ごと消える**（基本設計書 §7 の縮退表。フェーズ 1 の最終レビュー C-1）。挿入済みかどうかで文言を変えるのは、利用者にとって失うものが違うため（履歴と Undo だけ / 発話そのもの）。
 
 **書き込みは同期である（実装の事実。当初「非同期で追記」と書いていたのを実測で置き換えた）。**
@@ -1474,7 +1497,44 @@ Undo のホットキーは既定で **⌃⌘Z**（Control + Command + Z）とす
 **`HistoryStore.undoCandidate` は Undo の門ではない。** 門は**メモリ上に生きている差し替えハンドル**である。
 `undoCandidate` は履歴 UI（FR-9）が「直近の整形済み発話」を拾うための述語として残る。
 
-> **Option キーを含めてはならない。** PTT キーの既定が右 Option であるため、⌥ を含むショートカットを押すと録音が始まってしまう。設定画面では、PTT キーと重複する修飾キーを含む組み合わせを Undo ホットキーとして登録できないようバリデーションする。
+> **Option キーを含めてはならない。** PTT キーの既定が右 Option であるため、⌥ を含むショートカットを押すと録音が始まってしまう。**この検査はフェーズ 2 で `Settings.validateHotkeys()` に集約した**（§12-9）。設定画面の実装に頼らないので、手編集した `settings.json` にも効く。
+
+### 8.4 履歴を UI から読み書きする口（フェーズ 2 / FR-9）
+
+フェーズ 1 の `HistoryStore` は `append` / `entries` / `undoCandidate` しか持たず、
+**履歴一覧の画面が作れなかった**（欠落 6 / 7 / 10）。次の 3 つを足した。
+
+| 口 | 何のために | 呼んでよい場所 |
+|---|---|---|
+| `observe(_:) -> Subscription` / `changes() -> AsyncStream` | 変更通知。**単一消費者ではない**（HUD・履歴一覧・設定画面が同時に見る） | どこからでも。**ハンドラは MainActor で呼ばれない** |
+| `remove(id:)` / `remove(ids:)` / `removeAll()` | 履歴の削除（FR-9） | **MainActor から `await` してよい** |
+| `setLimit(_:)` | 保持件数の実行時変更 | **MainActor から `await` してよい** |
+
+**通知はロックの外で配る。** 購読者が通知の中で `entries` を読み直すのは自然な使い方で、
+ロックを保持したまま呼ぶと `NSLock` は非再帰なので自己デッドロックする。代わりに
+スナップショットへ版番号を付け、**各購読者が受け取る列は必ず単調に新しい**ことを保つ
+（書き込みが別スレッドから重なったとき、古いスナップショットが後から届くのを落とす）。
+
+**削除系は Core が背景へ逃がす**（`@concurrent` の `async`）。`append` と違って
+呼ぶのは MainActor に居る画面だけであり、「同期 I/O だから MainActor から呼ぶな」という
+**覚えておくべき規則を作らない**ためである（`append` は `DictationSession` の中から
+同期で呼ばれる。そちらは意図した同期であって §8.2 のとおり十分に速い）。
+
+### 8.5 失敗の表示文言（フェーズ 2 / 欠落 12）
+
+`SessionFailure` は型であって文言ではない。しかし文言を CLI と HUD の 2 箇所で
+保守すると必ず食い違う。**媒体で変わるところと変わらないところを分ける。**
+
+| 持ち主 | 中身 |
+|---|---|
+| Core（`Models/SessionFailureNotice.swift`） | 1 行の要約 / 補足 / 次にできること（`SessionRemedy`）/ 意図した拒否か（`isRefusal`）/ 発話を失ったか（`speechWasLost`） |
+| 媒体（CLI の `SessionNarration` / HUD） | `SessionRemedy` の言い直しだけ |
+
+同じ「権限を許可する」でも、素の実行ファイルは「**起動しているターミナルアプリ**を許可」、
+`.app` は「Ghost Voice を許可」になる（§9 / `PermissionGuidance` の注記）。
+**この差は文字列ではなく媒体の側にある**ので、Core は「どのペインか」までしか言わない。
+`SystemSettingsPane` は URL（`x-apple.systempreferences:`）を持たない——開けることを
+実測していないため（`docs/00-development-cycle.md` §3）。開くボタンを作る画面が実測のうえで足すこと。
 
 > **実装に着手する前に V-23 / V-24 / V-25 を実測すること**（§13）。
 > V-23 が全滅なら差し替えは一度も成立せず（挙動は現状と同じになる）、
@@ -2147,7 +2207,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 6 | `HotkeyMonitor` | 判定と `CGEventTap` は完了。**V-4 はキーイベント監視の権限が要るため §12-11 へ繰り延べ。手順は README にある** |
 | 7 | `DictationSession`（状態機械） | **状態機械と計測は完了（Task 10）。M5（現 M5a）を 2 条件で実測し、整形の既定タイムアウトを 750 ms へ引き上げた（§10）。** CLI での一気通貫は §12-11 で完了 |
 | 8 | **`.app` バンドル化・署名**と `NotchHUD` | `Scripts/make-app.sh` で `.app` が組み上がり、Apple Development 証明書で署名され、`open` から起動する（基本設計書 §10）。**バンドルが先で、HUD はその上に載せる。** **V-19（`NSApp.run()` の下で `CGEventTap` が届くか）を真っ先に潰す。** 続いて V-16 / V-17 / V-18、V-6 の残り（実バンドル・本番構成での確認）、V-20 / V-21 / V-22 を実施する。**V-5 は閉じた**（DynamicNotchKit を採用しないため。§7.3） |
-| 9 | 設定 UI・権限フロー・履歴 UI | FR-7〜FR-11 が満たされる。**受け入れ条件に「ホットキーの妥当性は `HotkeyBinding` 自身の不変条件として一括で検証する」を含めること**——現状の衝突検査は `SettingsStore.update` の経路にしか無く、手編集した `settings.json` は検査を通らない（フェーズ 1 では undo ホットキーを使わないので実害が無く、意図的に繰り延べた。最終レビュー M-7） |
+| 9 | 設定 UI・権限フロー・履歴 UI | FR-7〜FR-11 が満たされる。**受け入れ条件「ホットキーの妥当性は `HotkeyBinding` 自身の不変条件として一括で検証する」はフェーズ 2 で満たした**——単体の不変条件は `HotkeyBinding` の初期化子（`Codable` の復元も通る）、PTT と Undo の関係は `Settings.validateHotkeys()` が持ち、**保存経路（`SettingsStore.update`）と復元経路（`Settings.init(from:)`）の両方から呼ぶ。** 手編集した `settings.json` も検査を通る（フェーズ 1 では `update` の経路にしか無かった。最終レビュー M-7） |
 | 10 | 性能計測と調整 | **M5（現 M5a）は実測済み（現行の打ち切り 750 ms で 中央値 398 / 411 ms、p90 419 / 819 ms。§10）。ただし `.clipboardOnly` 経路に固定した計測であり、⌘V の往復と復元待ちを含む確定は V-3 待ち。V-7（メモリ）は未確認** |
 | 11 | **CLI と一気通貫**（`ghost-voice`） | **完了（Task 11）。** 起動・権限案内・表示・終了の待ち合わせが動く。**FR-10 は部分達成**——権限の案内は達成、**モデル導入の案内は「導入が始まったことを 1 行出す」までで、進捗（`request.progress`）は出さない**（§4.3。進捗表示は HUD と一緒に §12-8 で行う）。`--check` / `--request-permissions` / `--mic-check` を用意した。**権限の要らない V-12 / V-13 / V-14 はここで実施した。V-3 / V-4 は権限の付与が要るため利用者が実施する**（README の手順） |
 

@@ -40,11 +40,72 @@ struct SettingsStoreTests {
     func rejectsConflictingUndoHotkey() throws {
         try withTempRoot { root in
             let store = SettingsStore(rootURL: root)
+            let optionCommandZ = try HotkeyBinding(keyCode: 0x06, modifiers: [.option, .command])
             #expect(throws: SettingsError.hotkeyConflict) {
-                try store.update { $0.undoHotkey = HotkeyBinding(keyCode: 0x06, modifiers: [.option, .command]) }
+                try store.update { $0.undoHotkey = optionCommandZ }
             }
             // 拒否されたので既定値のまま
             #expect(store.settings.undoHotkey == .controlCommandZ)
+        }
+    }
+
+    // MARK: - 手編集した settings.json も検査を通ること（持ち越し項目 4 / 12）
+
+    /// 手で `⇧ + 右 Option` を書いた設定ファイル。判定側は追加の修飾キーを見ないので、
+    /// **右 Option 単独で録音が始まる**（詳細設計書 §2.3）。読み込めてしまうと
+    /// 「Shift を押していないのに録音が始まる」状態が既定になる。
+    @Test("手編集の settings.json の自己矛盾したホットキーは読み込み失敗として扱う")
+    func rejectsSelfContradictoryHotkeyFromHandEditedFile() throws {
+        try withTempRoot { root in
+            let json = """
+                {"hotkey":{"keyCode":61,"modifiers":["option","shift"]},
+                 "undoHotkey":{"keyCode":6,"modifiers":["control","command"]},
+                 "localeIdentifier":"en-US","transcriberKind":"dictation",
+                 "refinementEnabled":true,"refinementTimeoutMs":750,"historyLimit":50}
+                """
+            try Data(json.utf8).write(to: root.appendingPathComponent("settings.json"))
+
+            let store = SettingsStore(rootURL: root)
+            #expect(store.loadFailure != nil, "自己矛盾したホットキーを黙って受け入れている")
+            #expect(store.settings == Settings.default)
+        }
+    }
+
+    /// PTT（右 Option）と衝突する Undo キーを手で書いた場合。Undo を押すたびに
+    /// 録音が始まる（詳細設計書 §8.3）。
+    @Test("手編集の settings.json の衝突したホットキーは読み込み失敗として扱う")
+    func rejectsConflictingHotkeysFromHandEditedFile() throws {
+        try withTempRoot { root in
+            let json = """
+                {"hotkey":{"keyCode":61,"modifiers":["option"]},
+                 "undoHotkey":{"keyCode":6,"modifiers":["option","command"]},
+                 "localeIdentifier":"en-US","transcriberKind":"dictation",
+                 "refinementEnabled":true,"refinementTimeoutMs":750,"historyLimit":50}
+                """
+            try Data(json.utf8).write(to: root.appendingPathComponent("settings.json"))
+
+            let store = SettingsStore(rootURL: root)
+            #expect(store.loadFailure != nil, "衝突したホットキーを黙って受け入れている")
+            #expect(store.settings == Settings.default)
+        }
+    }
+
+    /// 拒否しすぎていないこと。妥当な手編集はそのまま効く。
+    @Test("妥当な手編集の settings.json はそのまま読める")
+    func acceptsValidHandEditedFile() throws {
+        try withTempRoot { root in
+            let json = """
+                {"hotkey":{"keyCode":61,"modifiers":["option"]},
+                 "undoHotkey":{"keyCode":6,"modifiers":["control","command"]},
+                 "localeIdentifier":"en-US","transcriberKind":"speech",
+                 "refinementEnabled":false,"refinementTimeoutMs":900,"historyLimit":12}
+                """
+            try Data(json.utf8).write(to: root.appendingPathComponent("settings.json"))
+
+            let store = SettingsStore(rootURL: root)
+            #expect(store.loadFailure == nil)
+            #expect(store.settings.localeIdentifier == "en-US")
+            #expect(store.settings.historyLimit == 12)
         }
     }
 
@@ -55,7 +116,8 @@ struct SettingsStoreTests {
     func writesHumanReadableSettingsJSON() throws {
         try withTempRoot { root in
             let store = SettingsStore(rootURL: root)
-            try store.update { $0.undoHotkey = HotkeyBinding(keyCode: 0x06, modifiers: [.control, .command]) }
+            let controlCommandZ = try HotkeyBinding(keyCode: 0x06, modifiers: [.control, .command])
+            try store.update { $0.undoHotkey = controlCommandZ }
 
             let text = try String(contentsOf: root.appendingPathComponent("settings.json"), encoding: .utf8)
             #expect(text.contains("\"undoHotkey\""))
