@@ -304,8 +304,9 @@ struct CLIShutdownTests {
     /// なので、`state` を見て終了を判断すると「待機だ」と読み違えてホットキーを止め、
     /// **キー解放が二度と届かず発話が丸ごと消える。**
     ///
-    /// 窓の長さは `begin()` の費用そのもので、**起動後の最初の 1 発話は実測 44〜540 ms**
-    /// （詳細設計書 §10）。ここでは代役の `beginDelay` でその窓を作る。
+    /// 窓の長さは `begin()` の費用そのものである（起動後の最初の 1 発話が実測 44〜540 ms
+    /// 掛かっていた件は、起動時の捨て往復で吸収した。詳細設計書 §10）。
+    /// ここでは代役の `beginDelay` でその窓を作る。
     @Test("押下の直後（最初の状態が出る前）に終了要求が来ても、発話を捨てない")
     func shutdownWaitsDuringTheGapBeforeFirstEmit() async throws {
         try await withTempRoot { root in

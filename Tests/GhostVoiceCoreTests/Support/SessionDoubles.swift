@@ -17,10 +17,10 @@ final class CallOrder: Sendable {
 
 /// 認識器のテスト代役。
 ///
-/// **`.final` の配信と `finish()` の復帰を引き離せるようにしてある。** 実測では
-/// `.final` が `finish()` の復帰より 5〜48 ms 早く届く（詳細設計書 §10 / V-2）ので、
-/// 後段が `finish()` を待つ実装になっていないことを検査するには、この 2 つを
-/// 別々の時刻に置ける代役が要る。`finishDelay` がその隙間を作る。
+/// **`.final` の配信・結果ストリームの終端・`finish()` の復帰を、それぞれ別の時刻に
+/// 置けるようにしてある。** 後段が待つのは**終端**であり（V-12 の修正）、
+/// 復帰ではないことを検査するには 3 つを引き離せる代役が要る。
+/// `finishDelay` と `endsStreamBeforeReturning` がその隙間を作る。
 final class StubTranscriber: Transcribing, @unchecked Sendable {
 
     struct Script: Sendable {
@@ -43,8 +43,8 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
         ///
         /// **`phase = .recording` は立っているのに、まだ `emit` していない窓**を
         /// テストから作るために要る（`startRecording` は `begin()` を待ってから
-        /// `emit(.recording(...))` する）。実機では `begin()` の費用がこの窓で、
-        /// 起動後の最初の 1 発話は実測 44〜540 ms かかる（詳細設計書 §10）。
+        /// `emit(.recording(...))` する）。実機では `begin()` の費用がこの窓である
+        /// （起動時の捨て往復を入れた後は 中央値 1.0〜3.0 ms。詳細設計書 §10）。
         var beginDelay: Duration = .zero
         /// **キー解放後に届く 2 件目の確定**（V-12）。nil なら 1 件だけ。
         ///
