@@ -211,13 +211,26 @@ public enum GhostVoiceRuntime {
         let settingsStore = SettingsStore()
         let settings = settingsStore.settings
 
-        // **設定を読めなかったことは、起動時に必ず言う。**
-        // 黙ると「設定を書き換えたのに効かない」だけが症状として残る（最終レビュー I-4）。
-        if settingsStore.loadFailure != nil {
+        // **読めなかったファイルは、起動時に必ず言う。**
+        // 黙ると「書き換えたのに効かない」だけが症状として残る（最終レビュー I-4）。
+        //
+        // **3 つとも見る。** `settings.json` だけを見ていた頃は、`vocabulary.json` が
+        // 壊れていると**無言でユーザー辞書が空になり**（FR-6 が効かなくなる）、
+        // 症状は「固有名詞が直らない」だけだった。
+        let vocabulary = VocabularyStore()
+        let history = HistoryStore(limit: settings.historyLimit)
+        let unreadable =
+            [
+                settingsStore.loadFailure.map { _ in "settings.json" },
+                vocabulary.loadFailure.map { _ in "vocabulary.json" },
+                history.loadFailure.map { _ in "history.json" },
+            ].compactMap { $0 }
+        if !unreadable.isEmpty {
             err.write(
                 """
-                [警告] settings.json を読めませんでした。**既定値で動作しています。**
-                JSON の書式を確認してください。書き換えた設定は 1 つも効いていません。
+                [警告] \(unreadable.joined(separator: " / ")) を読めませんでした。\
+                **既定値で動作しています。**
+                JSON の書式を確認してください。書き換えた内容は 1 つも効いていません。
 
                 """)
         }
@@ -249,8 +262,8 @@ public enum GhostVoiceRuntime {
             refiner: FoundationModelRefiner(),
             inserter: CompositeInserter.system(
                 restoreDelay: options.pasteRestoreDelay ?? PasteboardInserter.defaultRestoreDelay),
-            history: HistoryStore(limit: settings.historyLimit),
-            vocabulary: VocabularyStore()
+            history: history,
+            vocabulary: vocabulary
         )
 
         let gate = ShutdownGate()
@@ -304,7 +317,8 @@ public enum GhostVoiceRuntime {
                     gate: gate,
                     stopHotkey: { monitor.stop() },
                     awaitRun: { await run.value },
-                    finalState: { await session.state },
+                    // **`state` ではなく `isBusy`**（押下から最初の emit までの窓を含めるため）
+                    isBusy: { await session.isBusy },
                     writer: err)
                 await narration.value
                 exit(0)
@@ -315,7 +329,7 @@ public enum GhostVoiceRuntime {
             """
             Ghost Voice を起動しました。
             右 Option を押している間だけ録音し、離すと整形して挿入します。
-            録音中の ESC で中断、Ctrl-C で終了します。
+            ESC で中断します（録音中と、離した後の確定・整形中まで）。Ctrl-C で終了します。
             起動直後は準備（モデルの読み込み）に数秒かかることがあります。
 
             """)

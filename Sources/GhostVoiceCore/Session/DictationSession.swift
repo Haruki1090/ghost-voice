@@ -96,6 +96,20 @@ public actor DictationSession {
     public private(set) var state: SessionState = .idle
     public private(set) var latestMetrics: Metrics.Sample?
 
+    /// 発話を抱えているか（録音中または確定〜挿入の処理中）。
+    ///
+    /// **終了処理は `state` ではなくこちらを見ること。**
+    /// `state` は `emit` でしか変わらないので、**`phase` が立ってから最初の `emit` までに
+    /// 窓がある**——`startRecording()` は `phase = .recording` を立ててから
+    /// `transcriber.begin()` と `audio.startTap` を待ち、その後で
+    /// `emit(.recording(volatileText: ""))` する。窓の長さは `begin()` の費用そのもので、
+    /// **定常時 1.2〜1.4 ms、起動後の最初の 1 発話だけは 44〜540 ms**（詳細設計書 §10）。
+    ///
+    /// この窓で `state` を見て「待機だ」と判断してホットキーを止めると、
+    /// **キー解放が二度と届かず、その発話が丸ごと消える**（フェーズ 1 最終レビューの
+    /// 再レビュー指摘 1。`phase` を見れば窓は消える）。
+    public var isBusy: Bool { phase != .idle }
+
     /// 状態機械が受け付ける遷移を決める。`SessionState` と分けてあるのは、
     /// `.failed` の表示中も内部的には待機であり、次の押下を受け付けねばならないため。
     private enum Phase { case idle, recording, processing }

@@ -98,7 +98,7 @@ struct CLIShutdownTests {
     // MARK: - 単一の消費者
 
     @Test("状態の列を読みながら、書き出しと待ち合わせの両方へ配る")
-    func narrationFeedsWriterAndGate() async {
+    func narrationFeedsWriterAndGate() async throws {
         let (stream, continuation) = AsyncStream<SessionState>.makeStream()
         let writer = CollectingWriter()
         let gate = ShutdownGate()
@@ -111,10 +111,13 @@ struct CLIShutdownTests {
 
         // **門へ配っていることを、終わらせる前に確かめる。** ここを見ないと
         // 「状態を門へ流さない」実装でも通る（列の終端だけで門が開くため）。
-        try? await Task.sleep(for: .milliseconds(30))
-        #expect(
-            await gate.waitUntilIdle(within: .milliseconds(50)) == .timedOut,
-            "処理中の状態が門へ届いていない")
+        //
+        // **固定時間で待たない。** 負荷下で `consume` が間に合わないと偽陽性で落ちる
+        // （このプロジェクトが繰り返し踏んできた形）。成立するまで待って、
+        // 成立しなければ落ちる形にする。
+        try await waitUntil("処理中の状態が門へ届く") {
+            await gate.waitUntilIdle(within: .milliseconds(20)) == .timedOut
+        }
 
         continuation.finish()
         await loop.value
@@ -180,14 +183,14 @@ struct CLIShutdownTests {
                 try? await Task.sleep(for: .milliseconds(100))
                 order.record("awaitRun.end")
             },
-            finalState: {
-                order.record("finalState")
-                return .idle
+            isBusy: {
+                order.record("isBusy")
+                return false
             },
             writer: writer)
 
         // **完全一致では固定できない。** 待ちの間に状態機械へ確認する
-        // （門は 1 手遅れるため。`Shutdown` の注記）ので `finalState` は複数回呼ばれる。
+        // （門は 1 手遅れるため。`Shutdown` の注記）ので `isBusy` は複数回呼ばれる。
         // 固定したいのは**順序の不変条件**である。
         let calls = order.calls
         let idle = try #require(calls.firstIndex(of: "idle"), "待機を観測していない")
@@ -198,7 +201,7 @@ struct CLIShutdownTests {
         #expect(idle < stop, "待機へ戻る前に監視を止めている（押しっぱなしの解放が届かない）")
         #expect(stop < runStart, "監視を止める前に run() を待っている")
         #expect(runStart < runEnd)
-        #expect(calls.last == "finalState", "見届けた後に最終状態を見ていない")
+        #expect(calls.last == "isBusy", "見届けた後に最終状態を見ていない")
     }
 
     /// **門は状態機械より 1 手遅れる。**
@@ -229,7 +232,7 @@ struct CLIShutdownTests {
                 stopped.value = true
             },
             awaitRun: {},
-            finalState: { busy.value ? .recording(volatileText: "") : .idle },
+            isBusy: { busy.value },
             writer: writer)
 
         #expect(stopped.value)
@@ -286,9 +289,59 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .seconds(10),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                finalState: { await session.state }, writer: writer)
+                isBusy: { await session.isBusy }, writer: writer)
 
             #expect(inserter.inserted == ["整形後テキストです"])
+            await narration.value
+        }
+    }
+
+    /// **押下を受けてから最初の `emit` までの窓。**
+    ///
+    /// `startRecording()` は `phase = .recording` を立ててから `begin()` と `startTap` を
+    /// 待ち、その後で `emit(.recording(...))` する。**その間、`state` は `.idle` のまま**
+    /// なので、`state` を見て終了を判断すると「待機だ」と読み違えてホットキーを止め、
+    /// **キー解放が二度と届かず発話が丸ごと消える。**
+    ///
+    /// 窓の長さは `begin()` の費用そのもので、**起動後の最初の 1 発話は実測 44〜540 ms**
+    /// （詳細設計書 §10）。ここでは代役の `beginDelay` でその窓を作る。
+    @Test("押下の直後（最初の状態が出る前）に終了要求が来ても、発話を捨てない")
+    func shutdownWaitsDuringTheGapBeforeFirstEmit() async throws {
+        try await withTempRoot { root in
+            let hotkey = StubHotkeyMonitor()
+            let inserter = RecordingInserter()
+            let transcriber = StubTranscriber(
+                StubTranscriber.Script(beginDelay: .milliseconds(300)))
+            let session = makeSession(
+                root: root, hotkey: hotkey, inserter: inserter, transcriber: transcriber)
+            let gate = ShutdownGate()
+            let writer = CollectingWriter()
+            let narration = Task {
+                await SessionNarration.consume(
+                    session.stateUpdates, metrics: { await session.latestMetrics },
+                    writer: writer, gate: gate)
+            }
+            let run = Task { await session.run() }
+
+            hotkey.emit(.pressed)
+            // **`begin()` に入った時点で終了要求を出す。** ここは phase だけが立っていて、
+            // `state` はまだ `.idle`、門も何も観測していない。
+            try await waitUntil("begin() に入る") { transcriber.beginEntered == 1 }
+            #expect(await session.state == .idle, "この検査が窓を通っていない（前提が崩れた）")
+
+            let release = Task {
+                try? await Task.sleep(for: .milliseconds(400))
+                hotkey.emit(.released)
+            }
+            await Shutdown.perform(
+                gate: gate, grace: .seconds(10),
+                stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
+                isBusy: { await session.isBusy }, writer: writer)
+            await release.value
+
+            #expect(
+                inserter.inserted == ["整形後テキストです"],
+                "押下直後の窓で監視を止めて、発話を捨てている")
             await narration.value
         }
     }
@@ -325,7 +378,7 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .seconds(10),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                finalState: { await session.state }, writer: writer)
+                isBusy: { await session.isBusy }, writer: writer)
             await release.value
 
             #expect(inserter.inserted == ["整形後テキストです"])
@@ -359,7 +412,7 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .milliseconds(150),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                finalState: { await session.state }, writer: writer)
+                isBusy: { await session.isBusy }, writer: writer)
 
             #expect(inserter.inserted.isEmpty)
             // **黙って捨ててはならない。** 発話が失われたことを言う。

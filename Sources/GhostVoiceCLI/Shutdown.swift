@@ -86,14 +86,14 @@ public enum Shutdown {
         grace: Duration = Shutdown.defaultGrace,
         stopHotkey: @Sendable () -> Void,
         awaitRun: @Sendable () async -> Void,
-        finalState: @Sendable () async -> SessionState,
+        isBusy: @Sendable () async -> Bool,
         writer: any ConsoleWriting
     ) async {
         writer.write("\n[終了] 進行中の発話を待っています…\n")
 
         // **門は状態機械より 1 手遅れる。**
         //
-        // 門が拾うのは `stateUpdates` の列で、状態機械の `state` はそれより先に変わる。
+        // 門が拾うのは `stateUpdates` の列で、状態機械の内部状態はそれより先に変わる。
         // **押下の直後に終了要求が来ると、門はまだ「待機」に見える**——そこで
         // `stopHotkey()` へ進むと、キー解放が二度と届かず**その発話が丸ごと消える。**
         // （実測: 負荷を掛けて `swift test` を回すと `shutdownWaitsForKeyRelease` が
@@ -101,11 +101,15 @@ public enum Shutdown {
         //
         // したがって**権威は状態機械に置く。** 門は「速く起きるための道具」として使い、
         // 起きたあとに状態機械へ確認する。どちらも猶予の中で打ち切る。
+        //
+        // **確認するのは `state`（最後に emit した状態）ではなく `phase` 由来の
+        // `isBusy` である。** `state` は emit でしか変わらないので、押下を受けてから
+        // 最初の emit までの窓（起動直後の 1 発話で 44〜540 ms）を「待機」と読み違える。
         let deadline = ContinuousClock.now + grace
         var settled = false
         while ContinuousClock.now < deadline {
             if await gate.waitUntilIdle(within: .milliseconds(100)) == .idle,
-                await finalState() == .idle
+                await !isBusy()
             {
                 settled = true
                 break
@@ -121,7 +125,7 @@ public enum Shutdown {
         stopHotkey()
         await awaitRun()
 
-        if await finalState() != .idle {
+        if await isBusy() {
             writer.write("[終了] 発話の途中で終了したため、この発話は挿入されませんでした。\n")
         }
         writer.write("[終了] Ghost Voice を終了しました。\n")

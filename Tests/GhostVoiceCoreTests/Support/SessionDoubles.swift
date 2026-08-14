@@ -39,6 +39,13 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
         /// 検査が機体の速さ次第になる（実際にミューテーションが生き残った）。
         var feedDelay: Duration = .zero
         var beginError: (any Error)?
+        /// `begin()` が返るまでの遅延。
+        ///
+        /// **`phase = .recording` は立っているのに、まだ `emit` していない窓**を
+        /// テストから作るために要る（`startRecording` は `begin()` を待ってから
+        /// `emit(.recording(...))` する）。実機では `begin()` の費用がこの窓で、
+        /// 起動後の最初の 1 発話は実測 44〜540 ms かかる（詳細設計書 §10）。
+        var beginDelay: Duration = .zero
     }
 
     private let script: Script
@@ -54,6 +61,8 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
         /// `feed` で受け取ったフレーム数の合計。末尾が届いたかの検査に使う。
         var fedFrames = 0
         var beginCount = 0
+        /// `begin()` に**入った**回数（`beginCount` は返った回数）。
+        var beginEntered = 0
         var finishCount = 0
         /// `finish()` に入った時点で `feed` 済みだったフレーム数。
         /// **供給を待たずに確定させていないか**を見るための刻み。
@@ -69,6 +78,7 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
     var fedFrames: Int { state.withLock(\.fedFrames) }
     var fedFramesAtFinish: Int { state.withLock(\.fedFramesAtFinish) }
     var beginCount: Int { state.withLock(\.beginCount) }
+    var beginEntered: Int { state.withLock(\.beginEntered) }
     var finishCount: Int { state.withLock(\.finishCount) }
 
     func prepare(locale: Locale, kind: TranscriberKind) async throws {}
@@ -98,6 +108,8 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
 
     func begin() async throws -> AsyncThrowingStream<TranscriptionUpdate, Error> {
         order?.record("transcriber.begin")
+        state.withLock { $0.beginEntered += 1 }
+        if script.beginDelay > .zero { try? await Task.sleep(for: script.beginDelay) }
         if let beginError = script.beginError {
             state.withLock { $0.beginCount += 1 }
             throw beginError
