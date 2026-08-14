@@ -70,11 +70,14 @@ public actor DictationSession {
     /// そこまでの発話は届けるべきである。
     public static let defaultMaxRecordingDuration: Duration = .seconds(120)
 
-    /// キー解放から「確定テキストが手に入る」までの締め切り。
+    /// キー解放から「確定テキストが出そろう」までの締め切り。
     ///
-    /// 実測は 40〜177 ms（V-2）なので通常はまったく効かない。**認識器が黙り込んだ
-    /// ときに録音が終わらなくなるのを防ぐためだけにある。** 締め切りに達した場合は
-    /// 暫定テキストへ縮退する（空で捨てるよりは残す）。
+    /// 待つ相手は**結果ストリームの終端**である（V-12。最初の確定では待ちを解かない）。
+    /// 実測は 45.1〜155.1 ms（詳細設計書 §10 の M2）なので通常はまったく効かない。
+    /// **認識器が黙り込んだり、
+    /// 確定を出したままストリームを閉じ忘れたりしたときに録音が終わらなくなるのを
+    /// 防ぐためだけにある。** 締め切りに達した場合は、そこまでに積んだ確定
+    /// （1 件も無ければ暫定テキスト）で先へ進む。空で捨てるよりは残す。
     public static let defaultFinalizeDeadline: Duration = .seconds(2)
 
     private let settings: SettingsStore
@@ -103,7 +106,8 @@ public actor DictationSession {
     /// 窓がある**——`startRecording()` は `phase = .recording` を立ててから
     /// `transcriber.begin()` と `audio.startTap` を待ち、その後で
     /// `emit(.recording(volatileText: ""))` する。窓の長さは `begin()` の費用そのもので、
-    /// **定常時 1.2〜1.4 ms、起動後の最初の 1 発話だけは 44〜540 ms**（詳細設計書 §10）。
+    /// **定常時 1.2〜1.4 ms**（起動後の最初の 1 発話が 44〜540 ms 掛かっていた件は、
+    /// `warmUpTranscriber()` の捨て往復で吸収した。詳細設計書 §10）。
     ///
     /// この窓で `state` を見て「待機だ」と判断してホットキーを止めると、
     /// **キー解放が二度と届かず、その発話が丸ごと消える**（フェーズ 1 最終レビューの
@@ -144,15 +148,21 @@ public actor DictationSession {
     /// 処理中に ESC が届いたか（基本設計書 §4「中断は挿入が始まる前のどの状態からでも」）。
     private var isCancelRequested = false
 
-    /// キー解放以降に確定を待っているか。**録音中の `.final` で先へ進んではならない**
-    /// （長い発話では途中で確定が出る。V-2 のテストが実測で確認している）。
+    /// 確定テキストが出そろったか。**「最初の確定が届いたか」ではない。**
     ///
+    /// キー解放後に届く確定は **1 件とは限らない**（V-12。実機の肉声で再現した）。
+    /// 最初の確定で先へ進む定義だと、その後に届いた確定は `latestFinal` へ積まれても
+    /// 二度と読まれず、**発話の末尾が失われる**（要件定義書 §2.8.4: 121 字で 約 38 字）。
+    ///
+    /// そこで**これ以上テキストが来ないと判る時点**——結果ストリームの終端——まで待つ。
+    /// 認識器が黙り込んだ場合の安全弁は締め切り（`defaultFinalizeDeadline`）が担う。
+    ///
+    /// 録音中の `.final` でも先へ進まない（長い発話では途中で確定が出る。V-2 の実測）。
     /// V-12 の実測（103 秒の読み上げを実時間で供給）では、確定は**録音中に 1 件・
     /// 解放後に 1 件**届いた。前者を `latestFinal` へ積まずに捨てる変異を当てると、
     /// **548 字のうち前半が丸ごと落ちて後半だけが挿入される**
     /// （`FinalAfterReleaseTests` がこの変異を殺す。ただし既定の 30 秒では確定が
     /// 1 件しか出ないので、`GHOST_VOICE_V12_SECONDS=103` で回したときだけ殺せる）。
-    private var isAwaitingFinal = false
     private var isFinalSettled = false
     private var finalWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -200,6 +210,9 @@ public actor DictationSession {
     /// **整形器の捨て推論は投げっぱなしにする。** `prewarm()` はコールド時に数秒掛かる
     /// ので、これを待ってからホットキーを読み始めると**起動直後の数秒間、押しても
     /// 何も起きない**（基本設計書 §6）。
+    ///
+    /// **認識器の捨て往復も同じく投げっぱなしにする**（詳細設計書 §10）。
+    /// 詳細は `warmUpTranscriber()`。
     public func warmUp() async {
         // 【Task 8 申し送り】初回コスト（実測 16.7 ms / 23.8 ms）を最初の挿入から外す。
         refreshPermissions()
@@ -218,6 +231,7 @@ public actor DictationSession {
         let current = settings.settings
         do {
             try await transcriber.prepare(locale: current.locale, kind: current.transcriberKind)
+            warmUpTranscriber()
         } catch {
             emit(.failed(.transcriptionUnavailable))
             emit(.idle)
@@ -225,6 +239,44 @@ public actor DictationSession {
 
         let refiner = self.refiner
         Task.detached(priority: .utility) { await refiner.prewarm() }
+    }
+
+    /// 解析器を 1 つ作って畳む捨て往復。**起動後の最初の発話の頭を落とさないために要る。**
+    ///
+    /// `prepare()` までしか行わない実装では、`SpeechAnalyzer` の初回生成費用を
+    /// **起動後の最初の発話が払う**——実測で 低負荷 中央値 44.2 ms / 最大 540.4、
+    /// **負荷下 中央値 64.5 ms** で、**負荷下では中央値で NFR-P1 の予算 50 ms を超えた**
+    /// （詳細設計書 §10）。2 回目以降は 1.6〜2.2 ms と 3 桁小さい。
+    /// **その差は発話の頭の取りこぼしとして出る**（`begin()` 復帰前のバッファは黙って捨てられる）。
+    ///
+    /// ## 起動は待たない
+    ///
+    /// 待つと**起動直後、押しても何も起きない時間**ができる（基本設計書 §4.1 の 9）。
+    /// 整形器の捨て推論と同じく投げっぱなしにする。
+    ///
+    /// ## ただし本番の `begin()` と同時に生きてはならない
+    ///
+    /// **`SpeechModule` のインスタンスは 1 つの `SpeechAnalyzer` にしか装着できない**
+    /// （詳細設計書 §4.3.1）。捨て往復と次の発話が重なると解析器が 2 つ生きる窓ができる。
+    ///
+    /// そこで**`finalizeTask` の枠をそのまま使う。** `startRecording()` の頭は必ず
+    /// `drainFinalizeTask()` を通るので、**捨て往復が畳まれるまで次の `begin()` は始まらない。**
+    /// 新しい待ち合わせを足していないので、既にある直列性の保証をそのまま借りている。
+    ///
+    /// - Note: 起動直後に押された場合だけ、その押下は捨て往復の残りを待つ。
+    ///   **待つ量は「どのみち払う初回費用」なので増えていない**（増えるのは捨て往復の
+    ///   `finish()` ぶん。実測は本書のタスク報告と詳細設計書 §10）。
+    ///   起動から最初の押下までに往復が終わっていれば 0 ms である。
+    private func warmUpTranscriber() {
+        let transcriber = self.transcriber
+        finalizeTask = Task {
+            guard let stream = try? await transcriber.begin() else { return }
+            try? await transcriber.finish()
+            // **結果ストリームは読み捨てる。** `finish()` を跨いで生かしておくのは、
+            // 解放が先に走ると `onTermination` が結果の消費を畳んでしまうため。
+            // ここを抜けた時点で解放され、消費タスクも畳まれる。
+            withExtendedLifetime(stream) {}
+        }
     }
 
     /// ロケールや認識種別を変えたときに呼ぶ。
@@ -335,7 +387,6 @@ public actor DictationSession {
         phase = .recording
         latestVolatile = ""
         latestFinal = ""
-        isAwaitingFinal = false
         isFinalSettled = false
         isCancelRequested = false
         // **前の発話の計測値を残さない。** 中断や失敗で終わった発話の後に読むと、
@@ -413,13 +464,17 @@ public actor DictationSession {
             latestVolatile = text
             if phase == .recording { emit(.recording(volatileText: text)) }
         case .final(let text):
+            // **積むだけで先へ進めない。** 確定は解放の前にも後にも複数届きうる
+            // （V-12）。ここで待ちを解くと、**その後に届いた確定は二度と読まれず
+            // 発話の末尾が失われる。** 先へ進めるのは `updatesEnded` と締め切りだけ。
             latestFinal += text
-            // キー解放より前の確定は当該発話の途中経過。**ここで先へ進めてはならない。**
-            if isAwaitingFinal { settleFinal() }
         }
     }
 
     /// 結果ストリームが終わった。これ以上テキストは来ない。
+    ///
+    /// **確定待ちを解くのはここである**（V-12 の修正。それまでは「解放後の最初の確定」で
+    /// 解いていたため、後から届いた確定が読まれなかった）。
     ///
     /// **前の発話ぶんの終了で、今の発話の確定待ちを解いてはならない。**
     private func updatesEnded(for utterance: Int) {
@@ -480,28 +535,29 @@ public actor DictationSession {
         //    解析器の入力が閉じたあとに末尾が届いて、発話の末尾がそのぶん落ちる。
         await drainFeed(before: textDeadline)
 
-        // 3. 確定を撃つ。**復帰は待たない。** `.final` は `finish()` の復帰より
-        //    5〜48 ms 早く届く（V-2 実測）。復帰を待つと毎発話でそのぶんを捨てる。
-        isAwaitingFinal = true
+        // 3. 確定を撃つ。**復帰は待たない。** `finish()`
+        //    （`finalizeAndFinishThroughEndOfInput()`）の復帰より、結果ストリームの
+        //    終端の方が先か同時に来る。**待つのはストリームであって復帰ではない。**
         let transcriber = self.transcriber
         finalizeTask = Task { try? await transcriber.finish() }
 
-        // 4. `.final` の到着・結果ストリームの終端・締め切りのいずれかを待つ。
+        // 4. **結果ストリームの終端**か締め切りを待つ（V-12 の修正）。
+        //
+        //    旧定義は「解放以降の**最初の**確定」で先へ進み、`latestFinal` を
+        //    `await` を挟まず同期的に読んでいた。**その後に届いた確定は積まれても
+        //    二度と読まれず、発話の末尾が失われた**——実機の肉声で再現している
+        //    （2026-08-14。121 字の発話で末尾 約 38 字。要件定義書 §2.8.4）。
+        //    合成音声 103 秒で解放後の確定が 1 件だったのは、
+        //    **危険な条件が起きなかっただけ**である。
+        //
+        //    終端まで待てば「これ以上テキストは来ない」が保証される。**代償は
+        //    最初の確定から終端までの待ちで、そのぶん M2 が伸びる**（詳細設計書 §10）。
+        //    認識器がストリームを閉じ忘れた場合の安全弁は締め切りが担う。
         scheduleFinalDeadline(at: textDeadline)
         await awaitFinalSettled()
 
         let finalize = ContinuousClock.now - releasedAt
         // 確定が来なかった場合だけ暫定テキストへ縮退する。空で捨てるよりは残す。
-        //
-        // **ここが V-12 の欠陥の場所である**（詳細設計書 §13 / §10 の M2）。
-        // 上の待ちは「解放以降の**最初の**確定」で解け、`latestFinal` はここで
-        // `await` を挟まず同期的に読む。**その後に届いた確定は積まれても二度と読まれない。**
-        //
-        // **これは実機の肉声で再現した（2026-08-14）。** 121 字・区切りの多い発話で
-        // **末尾 約 38 字が失われた**（要件定義書 §2.8.4）。合成音声 103 秒で
-        // 解放後の確定が 1 件だったのは、**危険な条件が起きなかっただけ**である。
-        // **発話を失う欠陥として、フェーズ 2 で塞ぐ。**
-        // 録音中に届く確定は落ちない（`apply` が積むだけで先へ進まない）。
         let raw = (latestFinal.isEmpty ? latestVolatile : latestFinal)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -687,13 +743,17 @@ public actor DictationSession {
         }
     }
 
-    /// 前の発話の `finish()` が終わるのを待つ。
+    /// 前の発話の `finish()`（または起動時の捨て往復）が終わるのを待つ。
     ///
     /// - Important: **実際の呼び出し位置は次の押下の直後**（`startRecording()` の頭）であり、
     ///   そこは M1a（キー押下 → タップ武装、NFR-P1 の 50 ms）の計測区間の中である。
     ///   通常は前の発話の挿入が終わるまでに `finish()` も終わっているので 0 ms だが、
     ///   **Task 7 が実測した M1a にはこの待ちが入っていない。**
     ///   ここを動かすときは M1a を測り直すこと。
+    ///
+    ///   **起動直後の最初の押下だけは、ここで捨て往復（`warmUpTranscriber()`）を待つ。**
+    ///   往復が終わっていれば 0 ms。終わっていなければ残りを待つが、その待ちは
+    ///   「捨て往復を入れなければ直後の `begin()` が払っていた初回費用」と同じものである。
     private func drainFinalizeTask() async {
         guard let finalizeTask else { return }
         self.finalizeTask = nil
@@ -716,7 +776,6 @@ public actor DictationSession {
         finalDeadlineTask?.cancel()
         finalDeadlineTask = nil
         collectTask = nil
-        isAwaitingFinal = false
         isCancelRequested = false
         phase = .idle
         emit(.idle)
