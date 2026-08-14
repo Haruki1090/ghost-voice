@@ -1094,9 +1094,15 @@ public enum InsertionOutcome: Sendable, Equatable {
     /// secure input が有効だったため、どの経路も試さず拒否した。
     /// クリップボードにも残していない。**履歴に記録してはならない。**
     case refusedSecureInput
+    /// **どの経路でも挿入できず、最後の砦（クリップボードへの残置）も失敗した。**
+    /// `.inserted(.clipboardOnly)` と混ぜてはならない——あちらは「⌘V で貼れます」
+    /// という主張である。**履歴が最後の写しなので `recordableMethod` は nil ではない。**
+    case failedEverywhere
 
-    /// 履歴に記録してよい経路。拒否のときは nil。
+    /// 履歴に記録してよい経路。**secure input の拒否のときだけ nil。**
     var recordableMethod: InsertionMethod? { ... }
+    /// テキストが利用者の手元（欄かクリップボード）にあるか。
+    var leftTextWithUser: Bool { ... }
 }
 
 public protocol TextInserting: Sendable {
@@ -1334,8 +1340,10 @@ PasteboardInserter が適用可能か判定
 public enum InsertionOutcome: Sendable, Equatable {
     case inserted(InsertionMethod)   // 履歴に記録してよい
     case refusedSecureInput          // 履歴に記録してはならない
+    case failedEverywhere            // 挿入もクリップボードも失敗。**履歴が最後の写し**
 
     public var recordableMethod: InsertionMethod? { ... }
+    public var leftTextWithUser: Bool { ... }
 }
 ```
 
@@ -1350,6 +1358,10 @@ guard let method = outcome.recordableMethod else { return }  // 拒否は記録�
 **フェーズ 2 への申し送り:** 拒否したことをユーザーへ伝える手段（HUD 表示）が要る。無言で消えると「動かない」と受け取られる。
 
 **残置は合成器の責務であり、Pasteboard 経路の副作用ではない。** 両段が「適用外」を返した場合、`tryInsert` は一度も走らないので Pasteboard 経路がクリップボードへ書く機会が無い。合成器が `.clipboardOnly` を返す前に自分で `ClipboardLeaving.leave(_:)` を呼ぶ。**`.clipboardOnly` を返すときは、テキストが実際にクリップボードへ残っていること。**
+
+> **`leave` の戻り値を必ず見る。** フェーズ 2 の最終レビューまで捨てており、**クリップボードへ置けなくても `.inserted(.clipboardOnly)` を返して「⌘V で貼れます」と告げていた**（A-2）。利用者はそこへ取りに行き、何も無い。さらに履歴書き込みも失敗すると、**「テキストは利用者の手元にある」と嘘を言ったうえで発話が完全に消える。** 置けなかった場合は `.failedEverywhere` を返し、`SessionFailure.insertionFailed`（案内先は履歴画面）で告げる。**履歴には `.notInserted` として必ず記録する**——そこが最後の写しだからである。
+>
+> **同じ形が 2 箇所あった。** `DictationSession.offerRawTextToClipboard`（FR-7 の縮退）も戻り値を捨てて「クリップボードへ取り出しました」と告げていた。置けなければ `.undoUnavailable` へ倒す。
 
 最後の砦は Pasteboard 経路と**同じ `NSPasteboard`** を見ていなければならない。別のものを掴ませると、残したテキストがユーザーには見えない場所へ行く。組み立て（`CompositeInserter.system`）は同一インスタンスを二役で渡す。
 
