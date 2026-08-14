@@ -873,10 +873,17 @@ public protocol TextInserting: Sendable {
     func insert(_ text: String) async -> InsertionOutcome
 }
 
+/// 差し替えの錨まで返せる挿入の口。`insert(_:)` はここから導出する（§6.5）。
+public protocol AnchoringTextInserting: TextInserting {
+    func insertCapturingAnchor(_ text: String) async -> AnchoredInsertion
+}
+
 /// 二段構えの各段。
 public protocol PrimaryInserting: Sendable {
     func canInsert() -> Bool
-    func tryInsert(_ text: String) async -> Bool
+    /// **`Bool` ではない。** 差し替え（§6.5）には pid・範囲・要素参照が要る。
+    /// 錨を返せない段は `.inserted(anchor: nil)` を返す（挿入は成功している）。
+    func tryInsert(_ text: String) async -> InsertionAttempt
 }
 
 /// 最後の砦。挿入が全滅したときに発話をクリップボードへ残す。
@@ -885,7 +892,8 @@ public protocol ClipboardLeaving: Sendable {
 }
 ```
 
-実装はいずれも値型なので `AnyObject` は要求しない。
+実装はいずれも値型なので `AnyObject` は要求しない（**`TextReplacer` だけは C-7 の
+締め出しを保持するため参照型である**。§6.5）。
 
 戻り値のうち **`.inserted(method)` の `method` だけ**を履歴に記録し、どのアプリでどの経路が使われたかの実地データとする（V-3）。
 
@@ -1108,6 +1116,136 @@ guard let method = outcome.recordableMethod else { return }  // 拒否は記録�
 **PTT キー解放から挿入までの間、フォーカスが移動しないことが前提である。** HUD は `.nonactivatingPanel` とし、フォーカスを奪ってはならない（V-6）。
 **`.nonactivatingPanel` だけでは足りない。** `NSApp.run()` の前に window を出すとアプリが活性化し、最前面 pid が Ghost Voice 自身になる（実測。§7.2）。
 **HUD の window level を 0 にしてもならない**——`frontmostProcessIdentifier()` が拾ってしまう（同）。
+
+### 6.5 TextReplacer（挿入済みテキストの差し替え。FR-5(a) / FR-7）
+
+**挿入済みのテキストを、後から別の文字列へ差し替える。** この 1 つの原始操作の上に必須要件が 2 つ載る。
+
+| 要件 | 使い方 |
+|---|---|
+| **FR-5(a)** | 生テキストを先に挿入して NFR-P6a（1 秒）を守り、整形が返ったら整形結果へ差し替える |
+| **FR-7** | 直近の挿入を整形前の生テキストへ戻す。**同じ操作を逆向きに使うだけ**（`TextReplacer.undo(_:)` は `replace(_:with: anchor.previousText)` の薄い包み） |
+
+**二重に作らないこと。** Undo のために別の機構を建てると、危険な書き込み経路が 2 本になる。
+
+#### 使える原始操作は 1 つしかない
+
+**`kAXSelectedTextRange` で範囲を選び直し、`kAXSelectedText` を 1 回上書きする形だけである。**
+
+| 案 | 失敗の形 | 判定 |
+|---|---|---|
+| ⌫ を n 回送る → 新テキストを挿入 | 送出は `Void`（§6.3）。⌫ が届いて挿入が届かない状態を**検出できない** | **不採用** |
+| ⌘Z を送る | アンドゥ単位が判らない。戻し過ぎると利用者自身の編集を壊す | **不採用** |
+| **AX で範囲を選び直して上書き** | 範囲設定も書き込みも `AXError` を返す。失敗すれば**何も起きない** | **採用** |
+
+**⌫ と ⌘Z を落とす理由は同一である。「届いたか判らない操作で、先に消す」から。** 差し替えを「消してから書く」2 手に分けた瞬間に、その間の窓で発話が消える。**AX の範囲上書きだけが、消すことと書くことを 1 回の呼び出しに閉じ込められる。**
+
+> **§8.3 が書いている「挿入済み文字数ぶんの Delete キーを送出」は、この理由で採らない。** §8.3 は `CGEvent.post` が `Void` を返すと判明する前に書かれている（統括の裁定 / 2026-08-14）。
+
+#### 成立条件（C-1〜C-7。**安い順に判定する**）
+
+`AccessibilityInserter.canInsert()` と同じ規律で、**AX の往復を伴わない判定を先に置く。**
+
+| # | 条件 | 何を防ぐか | 判定の手段 |
+|---|---|---|---|
+| C-7 | そのプロセスで、本セッション中に喪失の疑いを出していない | 危険な相手への再試行。**アプリ名の一覧を持たずに締め出せる** | プロセス内の集合（AX を叩かない） |
+| — | 錨が失効していない（次の発話の挿入が始まっていない） | 前の発話の差し替えが次の発話へ当たること | `InsertionEpoch`（同上） |
+| C-2 | 錨がプロセス内メモリに生きている | 別プロセス・別セッションからの Undo | **`ReplacementAnchor` を `Codable` にしない** |
+| — | 空文字への差し替えでない | **「消すだけ」になること** | 文字列（同上） |
+| — | secure input が無効 | パスワード欄での書き換え | `IsSecureEventInputEnabled()`（実測 0.000 ms） |
+| C-3 | 現在の最前面 pid が挿入時の pid と一致 | 別アプリへ移ってから撃つこと | `processIdentifier(of:)` |
+| C-4 | 現在のフォーカス要素が挿入時の要素と一致 | 同じアプリの別の入力欄 | `CFEqual`（**未実測。V-26**） |
+| C-5 | `kAXSelectedTextRange` と `kAXSelectedText` が両方 settable | 範囲を選べない相手に書きにいくこと | `AXUIElementIsAttributeSettable`（**アプリごとの実際は未実測。V-23**） |
+| C-6 | **記録した範囲を読み戻した文字列が、自分が書いた文字列と一致する** | 利用者の編集・カーソル移動・範囲の単位ずれ・アプリによる変換を**まとめて弾く** | `AXStringForRange`（**未実測。V-24**） |
+| C-1 | その発話が **`.ax` 経路で挿入された** | Pasteboard / clipboardOnly には範囲が無い | 錨の有無（型で保証） |
+
+**C-6 が要である。** 位置の算術（「n 文字ぶん戻る」）を信じず、**読み戻して一致したときだけ書く。** 一致しなければ理由を問わず中止する。**AX の範囲の単位が UTF-16 かグラフェムクラスタかという未決事項は、C-6 があれば「間違えたら中止する」に変わる。**
+
+さらに**長さを自分で数えない。** 錨の範囲は「書き込みの前後で読んだキャレット位置の差」から作る。**相手が数えた値をそのまま使う**ので、単位が何であっても成立する。
+
+#### 手順（5 手 + 後始末）と、各中止点で発話がどこにあるか
+
+```
+1. 事前読み : 利用者の現在の選択範囲（整数 2 つ。後で戻すため）
+2. 事前検査 : AXStringForRange(記録した範囲) == 自分が書いた文字列 か
+               └ 違う / 読めない → 中止（何も書き換えていない）
+3. 範囲設定 : kAXSelectedTextRange ← 記録した範囲
+               └ AXError → 中止（何も書き換えていない）
+4. 上書き   : kAXSelectedText ← 新しい文字列   ← **内容を変えるのはこの 1 回だけ**
+               └ AXError → 中止（範囲を選んだだけ。手順 6 で選択を戻す）
+5. 事後検査 : AXStringForRange(新しい範囲) == 新しい文字列 か
+               ├ 一致          → 成功
+               ├ 元の文字列    → 無言失敗（R-4）。**何も起きていないので害は無い**
+               └ どちらでもない → 喪失の疑い（下記）
+6. 後始末   : 手順 1 で読んだ選択範囲を、長さの差だけ補正して書き戻す
+```
+
+| 中止点 | 結果 | 欄にあるもの | クリップボード | 履歴 |
+|---|---|---|---|---|
+| C-1〜C-7 のどれかが欠ける | `.declined` | **挿入済みの生テキスト** | 触らない | raw + refined |
+| 手順 2 の検査が不一致・読めない | `.declined` | **同上** | 触らない | 同上 |
+| 手順 3 / 4 が `AXError` | `.declined` | **同上**（選択だけ戻す） | 触らない | 同上 |
+| 手順 5 が「元の文字列」（R-4） | `.silentlyIgnored` | **同上。成功として扱わない** | 触らない | 同上 |
+| **手順 5 がどちらでもない** | **`.lost`** | **不明** | **新しい文字列を残す** | 同上 |
+| 差し替えが成功 | `.replaced` | 新しい文字列 | 触らない | 同上 |
+
+**表の 1 行を除いて、失敗の結末はすべて「生テキストが欄にある」である。** これは**現行実装の正常系と同じ状態**であり、この機構は「うまくいけば良くなる／失敗すれば現状のまま」という形をしている。**差し替えを丸ごと外しても製品は今と同じに動く。**
+
+**唯一の重い行（`.lost`）は 4 重で受ける。**
+
+1. **履歴**（呼び出し側が挿入直後に書いてある。実測 0.44 ms / §8.2）
+2. **クリップボードへ残す**（`ClipboardLeaving`。挿入器と同じ `NSPasteboard`）
+3. **利用者へ告げる**（`ReplacementAnnouncing`。HUD の実装は別）
+4. **以後そのアプリでは試さない**（C-7）
+
+**2 度目の書き込みはしない。** 二重挿入は入らないことより悪い（§6.2 と同じ裁定）。
+
+#### NFR-V3 の最小例外（**利用者が明示的に承認 / 2026-08-14**）
+
+**「そこにまだ自分の文字列があるか」を確かめずに書き換えるのは、利用者が手で編集した内容の上に書くことを許すのと同じである。** そこで例外を 1 つだけ置く。
+
+| 読むもの | 何が返るか | 扱い |
+|---|---|---|
+| `kAXSelectedTextRange` | 整数 2 つ（位置・長さ） | **例外に当たらない**（文字を含まない） |
+| `AXStringForRange(自分が書いた範囲)` | 自分が直前に書いた文字列 | **これだけが例外** |
+| `kAXValue` / `kAXNumberOfCharacters` / `kAXVisibleCharacterRange` | 欄の全文・全長・可視範囲 | **読まない。継ぎ目にも置かない** |
+
+承認された 4 条件と、それを固定している検査。
+
+| 条件 | 実装での守り方 | 固定している検査 |
+|---|---|---|
+| 1. 範囲は自分が書いた場所に限る。前後 1 文字も広げない | 読む範囲は (a) 錨の範囲 と (b) いま書いた範囲 の 2 つだけ | `readsOnlyItsOwnRanges` / `readsOnlyItsOwnRangesWhenLost` |
+| 2. 用途は比較のみ。真偽値 1 つに落とす | **`AccessibilityRangeProbing.matches(_:in:of:)` は `String` を返せない**（`RangeMatch` の 3 値） | `rangeProbeCannotReturnText` |
+| 3. 保持しない（履歴・計測・整形・ログのどこへも渡さない） | 読んだ値は `SystemAccessibility.matches` の 1 行を出ない | `readBackNeverEscapes` |
+| 4. 不一致だった文字列の内容を一切見ない | 不一致は `.sourceMismatch` の 1 ケースへ落ちる | `mismatchDecisionDoesNotDependOnContent` |
+
+**例外は `AccessibilityRangeProbing` の中にしか存在しない。** 主たる挿入経路（§6.2）は読み戻しを行わないという裁定をそのまま維持する。
+
+#### 型（`Bool` では表せなかったもの）
+
+`PrimaryInserting.tryInsert` は `Bool` を返していたため、**pid も範囲も要素参照も表せなかった。** 契約を変えてある。
+
+```swift
+public enum InsertionAttempt: Sendable {
+    case failed
+    case inserted(anchor: ReplacementAnchor?)   // 錨が nil でも挿入は成功
+}
+
+public protocol AnchoringTextInserting: TextInserting {
+    func insertCapturingAnchor(_ text: String) async -> AnchoredInsertion
+}
+// TextInserting.insert(_:) はこの既定実装から導出する（経路を 2 本にしない）
+```
+
+`ReplacementAnchor` は **`Codable` にしない**（C-2）。`HistoryEntry` に持たせてもならない——履歴は `history.json` へ落ちる。
+
+**挿入器と差し替え器は必ず一緒に作る**（`CompositeInserter.systemStack`）。世代（`InsertionEpoch`）を共有しないと差し替えが常に失効し、クリップボードを共有しないと喪失時の退避先が誰にも見えない場所になる。**どちらも黙って壊れる形の間違いである。**
+
+#### 自動 Undo の門
+
+**門はメモリ上に生きている `ReplacementAnchor` であり、履歴ではない。** 錨は `.ax` 経路でしか作られないので、**挿入していない発話（`.clipboardOnly`）へ Undo を撃つ経路が構造的に消える。**
+
+履歴側にも 2 番目の門を置く（`HistoryEntry.isAutomaticUndoCandidate`）。`refinedText != nil` と 10 秒窓だけでは `.clipboardOnly` が素通りし、**挿入していないテキストを消そうとして別の何かを消す。**
 
 ---
 
@@ -1904,3 +2042,8 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-20 | **notch の切り欠きそのものに描いた内容が見えるか** | 実装 §12-8 | **未実施。** 座標（内蔵で x 791..1012 / y 1131..1169）は実測で取れているが、そこはカメラハウジングであり**描いても見えない可能性が高い（推測）**。実機で目視 1 分。見えなければ「切り欠きの直下へ張り出す」形に確定する（§7.1） |
 | V-21 | **`.canJoinAllSpaces` / `.fullScreenAuxiliary` が効くこと** | 実装 §12-8 | **未実施。** Space を切り替え、他アプリをフルスクリーンにして目視する。Mission Control / Stage Manager 下も併せて見る |
 | V-22 | **クラムシェル（内蔵が `NSScreen.screens` に無い）ときの表示先** | 実装 §12-8 | **未実施。** 蓋を閉じたときの `NSScreen.screens` の中身を確かめ、基本設計書 §8.1.1 の候補 (a)(b) のどちらを採るか決める。**あわせて外部ディスプレイを主にしたときの内蔵の `auxiliaryTop*Area` も見る**（§7.1 の未実測） |
+| V-23 | **主要アプリで `kAXSelectedTextRange` が settable か。範囲の単位は何か**（メモ / メール / Chrome アドレスバー / Slack / Notion / Xcode / ターミナル） | **差し替えを実運用へ入れる前** | **未実施。** §6.5 の C-5 / C-6 の前提。**ここが全滅なら差し替えは常に空振りし、挙動は現状と同じになる**（全発話が「整形を待つ」分岐へ落ちる）。実装は `AXStringForRange` の一致で自衛しているので、**外れても誤った位置には書かない。** 権限が要るため利用者が実施する（README「V-3 / V-4 の実施手順」の 5） |
+| V-24 | **同じアプリで `AXStringForRange`（`kAXStringForRangeParameterizedAttribute`）が読めるか** | 同上 | **未実施。** §6.5 の C-6 の前提。読めない相手では `.unreadable` が返り、**差し替えは中止される**（＝生テキストが残る）。SDK に定数が存在することだけは確認済み（2026-08-14）で、**アプリごとの対応状況は未実測** |
+| V-25 | **差し替えの事後検査で「消えただけ」が起きるか。挿入直後にキャレットが挿入文字列の直後に来るか。IME の変換中に撃った場合** | **差し替えの実装直後** | **未実施。** §6.5 の表で**唯一の重い行**（`.lost`）が実在するかどうか。**実在するなら差し替えを既定オフにし、FR-5 は「整形を待つ」分岐だけで運用する。** キャレット位置は錨の作り方の前提でもある（外れると錨が作られないだけ）。**代役では 4 通り（正常 / 無言失敗 / 別内容 / 消えるだけ）を再現済みで、実機での発生の有無だけが未確認である** |
+| V-26 | **`CFEqual` による AX 要素の同一性が、時間を跨いで期待どおりか** | 同上 | **未実施。** §6.5 の C-4。外れると「別の欄だ」と判定して中止に倒れるので、**誤った欄へは書かない。** 症状は「差し替えが一度も効かない」 |
+| V-27 | **差し替えの実所要（読み 3〜4 往復 + 書き 2）と、錨の取得が挿入に上乗せする時間** | 差し替えの実装後 | **未実施。** 1 往復あたり 0.1〜5.5 ms という §6.2 の実測からの外挿は**推測にすぎない。** 錨の取得は NFR-P6a のクリティカルパスに乗るので、上乗せが大きければ `AccessibilityInserter(capturesReplacementAnchor:)` を false にして切れる |
