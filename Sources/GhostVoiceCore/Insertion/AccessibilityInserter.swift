@@ -199,13 +199,15 @@ public struct AccessibilityInserter: PrimaryInserting {
         guard capturesReplacementAnchor, let before else { return nil }
         // 書いた直後はキャレットが挿入文字列の直後にあるはず。**そうでない相手は諦める**
         // （V-26。前提が外れても「錨を作らない」に倒れるだけ）。
+        // **上限は `AXTextRange.written` が型の側で掛ける**（NFR-V3 の条件 1）。
+        // キャレットが「書いた文字列の直後」より遥か後ろ（欄の末尾など）へ飛ぶ相手では
+        // 範囲が伸び、**利用者が元から書いていたテキストを読み戻すことになる。**
+        // そういう相手では錨を作らない——差し替えないだけで、生テキストは欄にある。
         guard let after = accessibility.selectedRange(of: element),
               after.length == 0,
-              after.location > before.location
+              let range = AXTextRange.written(text, from: before.location, to: after.location)
         else { return nil }
 
-        let range = AXTextRange(
-            location: before.location, length: after.location - before.location)
         guard accessibility.matches(text, in: range, of: element) == .matched else { return nil }
 
         return ReplacementAnchor(
@@ -485,6 +487,13 @@ extension SystemAccessibility: AccessibilityRangeProbing {
     public func matches(
         _ expected: String, in range: AXTextRange, of element: any FocusedElement
     ) -> RangeMatch {
+        // **条件 1 をここでも掛ける（二重の守り）。**
+        //
+        // 範囲を作る側（`AXTextRange.written`）で上限は掛かっているが、
+        // **`AXStringForRange` を実際に撃つのはプロセス全体でこの 1 箇所だけ**なので、
+        // 規則をここにも置いておく。比較対象より長い範囲を読む理由は原理的に無い
+        // （長ければ一致しようがない）ので、**読まずに「違った」で降りる。**
+        guard Self.isReadable(range: range, comparedTo: expected) else { return .differed }
         guard let element = element as? Element, let parameter = Self.axValue(for: range) else {
             return .unreadable
         }
@@ -495,6 +504,17 @@ extension SystemAccessibility: AccessibilityRangeProbing {
         guard status == .success, let string = value as? String else { return .unreadable }
         // ここで真偽値 1 つへ落とす。**`string` はこの行より先へ出ない。**
         return string == expected ? .matched : .differed
+    }
+
+    /// **読みにいってよい範囲か**（NFR-V3 の条件 1）。
+    ///
+    /// 比較対象より長い範囲を読む理由は無い。単位は未実測（V-23）だが、
+    /// `count` / `unicodeScalars` / `utf16` のどれであっても長さは
+    /// `expected.utf16.count` を超えないので、**これが安全な上限である。**
+    ///
+    /// 関数として切り出してあるのは検査のため（実要素は AX 権限が無いと何も返さない）。
+    static func isReadable(range: AXTextRange, comparedTo expected: String) -> Bool {
+        range.location >= 0 && range.length >= 0 && range.length <= expected.utf16.count
     }
 
     public func isSameElement(_ lhs: any FocusedElement, _ rhs: any FocusedElement) -> Bool {
@@ -539,6 +559,12 @@ public final class FakeTextField: Sendable {
         case unchanged
         /// 選択範囲が読めなくなる。
         case unreadable
+        /// **書いた場所より遥か後ろ——欄の末尾——へ飛ぶ。**
+        ///
+        /// 書き込みを受けて欄全体を再整形する相手や、書式付きの欄で正規化が走る相手を模す。
+        /// **この挙動が代役に無かったために、NFR-V3 の条件 1 の破れ（読み戻す範囲に
+        /// 上限が無い）が検査から永久に到達できなかった**（最終レビュー 視点5 の P-1）。
+        case endOfContent
     }
 
     private struct State {
@@ -621,6 +647,8 @@ public final class FakeTextField: Sendable {
             case .endOfWrittenText, .unreadable:
                 state.selection = AXTextRange(
                     location: range.location + written.count, length: 0)
+            case .endOfContent:
+                state.selection = AXTextRange(location: state.content.count, length: 0)
             case .startOfRange:
                 state.selection = AXTextRange(location: range.location, length: 0)
             case .unchanged:

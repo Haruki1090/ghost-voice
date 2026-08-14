@@ -523,6 +523,85 @@ struct ReplacementPrivacyTests {
         }
     }
 
+    /// **条件 1 の上限。**
+    ///
+    /// 読み戻す範囲は「書き込みの前後のキャレット位置の差」から作る。**その差に
+    /// 上限が無いと、相手のアプリがキャレットを欄の末尾へ送った瞬間に、
+    /// 利用者が元から書いていたテキストを `AXStringForRange` で読むことになる。**
+    /// 承認された輪郭は「範囲は自分が書いた場所に限る。前後 1 文字も広げない」で、
+    /// 1 文字どころではない（最終レビュー 視点5 の P-1）。
+    ///
+    /// 単位は未実測（V-23）だが、**上限だけなら安全に置ける**——
+    /// `count` / `unicodeScalars` / `utf16` のどれであっても長さは
+    /// `text.utf16.count` を超えないためである。**下限は縛らない**
+    /// （縛ると相手の正規化で偽陰性が出る。上限は倒れる向きが安全側だけ）。
+    @Test("書き込み後にキャレットが欄の末尾へ飛んでも、自分が書いた長さを超えて読まない")
+    func neverReadsBeyondWhatItWrote() {
+        // 書き込みの後、キャレットが**欄の末尾**へ行く相手。
+        let world = ReplacementWorld(caret: .endOfContent)
+
+        _ = world.replacer.replace(world.anchor, with: ReplacementWorld.refined)
+
+        let start = ReplacementWorld.anchorRange.location
+        #expect(!world.accessibility.calls.readRanges.isEmpty, "1 度も読んでいない（検査が空回り）")
+        for range in world.accessibility.calls.readRanges {
+            #expect(range.location == start, "範囲の開始を自分の場所からずらして読んでいる")
+            #expect(
+                range.length <= max(
+                    ReplacementWorld.raw.utf16.count, ReplacementWorld.refined.utf16.count),
+                "自分が書いた長さを超えた範囲 \(range) を読んでいる（利用者のテキストを読んだ）")
+        }
+    }
+
+    /// 挿入側（錨を作るとき）も同じ形をしている。
+    ///
+    /// `AccessibilityInserter.anchor` は `after.location > before.location` しか見ておらず、
+    /// **範囲の長さに上限が無かった。** 上限を超える相手では**錨を作らない**
+    /// （縮退先は「差し替えない」＝生テキストが欄に残る、で安全側）。
+    @Test("挿入の錨も、自分が書いた長さを超える範囲では作らない")
+    func doesNotAnchorBeyondWhatItWrote() async {
+        let field = FakeTextField(
+            content: "利用者が元から書いていた長い長い文章がここにあります。",
+            selection: AXTextRange(location: 0, length: 0),
+            caret: .endOfContent
+        )
+        let element = FakeAccessibility.Element(
+            role: kAXTextAreaRole as String, isSelectedTextSettable: true,
+            processIdentifier: 4_242, acceptsWrite: true)
+        let accessibility = FakeAccessibility(focused: element, field: field)
+        let inserter = AccessibilityInserter(
+            accessibility: accessibility, ownProcessIdentifier: 1)
+
+        let attempt = await inserter.tryInsert("短い発話")
+
+        #expect(attempt.didInsert, "挿入そのものは成功している")
+        #expect(attempt.anchor == nil, "自分が書いた長さを超える錨を作っている")
+        for range in accessibility.calls.readRanges {
+            #expect(
+                range.length <= "短い発話".utf16.count,
+                "自分が書いた長さを超えた範囲 \(range) を読んでいる")
+        }
+    }
+
+    /// **上限は読み取りの継ぎ目そのものにも置いてある**（二重の守り）。
+    ///
+    /// 呼び出し側の算術を直しても、**実際に `AXStringForRange` を撃つ唯一の場所**
+    /// （`SystemAccessibility.matches`）が長すぎる範囲を撃たないこと。
+    /// ここは代役では駆動できないので、規則だけを直接見る。
+    @Test("読み取りの継ぎ目は、比較対象より長い範囲を読みにいかない")
+    func theProbeRefusesRangesLongerThanWhatItCompares() {
+        #expect(!SystemAccessibility.isReadable(range: AXTextRange(location: 0, length: 5),
+                                                comparedTo: "abcd"))
+        #expect(SystemAccessibility.isReadable(range: AXTextRange(location: 0, length: 4),
+                                               comparedTo: "abcd"))
+        // 単位が割れうる文字でも、上限は utf16 の長さである（`AXTextRange` の注記）。
+        let emoji = "👨‍👩‍👧‍👦"
+        #expect(SystemAccessibility.isReadable(
+            range: AXTextRange(location: 0, length: emoji.utf16.count), comparedTo: emoji))
+        #expect(!SystemAccessibility.isReadable(
+            range: AXTextRange(location: 0, length: emoji.utf16.count + 1), comparedTo: emoji))
+    }
+
     /// **条件 2 は型で固定する。** 読み取りの継ぎ目は `String` を返せない。
     /// `RangeMatch` は 3 値で、**一致しなかった内容を知る手段がそもそも無い。**
     @Test("読み戻しの継ぎ目は文字列を返せない（真偽値 1 つに落ちる）")

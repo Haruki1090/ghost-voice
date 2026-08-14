@@ -340,10 +340,15 @@ public final class TextReplacer: Sendable {
     ) -> ReplacementResult {
         // 新しい長さも自分で数えない。相手が返したキャレット位置の差を使う
         // （範囲の単位が未実測のため。`AXTextRange` の注記）。
+        //
+        // **上限は `AXTextRange.written` が型の側で掛ける**（NFR-V3 の条件 1）。
+        // 上限が無いと、相手がキャレットを欄の末尾へ送った場合に
+        // 「自分が書き始めた位置 〜 欄の末尾」を読むことになり、
+        // **利用者が元から書いていたテキストを読み出す。**
         let newRange = accessibility.selectedRange(of: element).flatMap { after -> AXTextRange? in
-            guard after.length == 0, after.location >= anchor.range.location else { return nil }
-            return AXTextRange(
-                location: anchor.range.location, length: after.location - anchor.range.location)
+            guard after.length == 0 else { return nil }
+            return AXTextRange.written(
+                replacement, from: anchor.range.location, to: after.location)
         }
 
         if let newRange,

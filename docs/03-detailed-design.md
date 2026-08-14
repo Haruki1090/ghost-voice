@@ -1454,10 +1454,22 @@ guard let method = outcome.recordableMethod else { return }  // 拒否は記録�
 
 | 条件 | 実装での守り方 | 固定している検査 |
 |---|---|---|
-| 1. 範囲は自分が書いた場所に限る。前後 1 文字も広げない | 読む範囲は (a) 錨の範囲 と (b) いま書いた範囲 の 2 つだけ | `readsOnlyItsOwnRanges` / `readsOnlyItsOwnRangesWhenLost` |
+| 1. 範囲は自分が書いた場所に限る。前後 1 文字も広げない | 読む範囲は (a) 錨の範囲 と (b) いま書いた範囲 の 2 つだけ。**長さの上限を型が掛ける**——`AXTextRange.written(_:from:to:)` は、キャレット位置の差が自分が書いた文字列の `utf16.count` を超えると **nil を返す**（＝錨を作らない／読み戻さない）。**読み取りの継ぎ目にも同じ規則を置いてある**（`SystemAccessibility.isReadable(range:comparedTo:)`。`AXStringForRange` を撃つ唯一の場所） | `readsOnlyItsOwnRanges` / `readsOnlyItsOwnRangesWhenLost` / `neverReadsBeyondWhatItWrote` / `doesNotAnchorBeyondWhatItWrote` / `theProbeRefusesRangesLongerThanWhatItCompares` |
 | 2. 用途は比較のみ。真偽値 1 つに落とす | **`AccessibilityRangeProbing.matches(_:in:of:)` は `String` を返せない**（`RangeMatch` の 3 値） | `rangeProbeCannotReturnText` |
 | 3. 保持しない（履歴・計測・整形・ログのどこへも渡さない） | 読んだ値は `SystemAccessibility.matches` の 1 行を出ない | `readBackNeverEscapes` |
 | 4. 不一致だった文字列の内容を一切見ない | 不一致は `.sourceMismatch` の 1 ケースへ落ちる | `mismatchDecisionDoesNotDependOnContent` |
+
+> **条件 1 は 2026-08-15 まで「呼び出し規約とコメント」でしか守られていなかった。**
+> 読み戻す範囲の長さに上限が無く、相手アプリのキャレットの落ち先次第で
+> **自分が書いた長さを超えた範囲を読みうる**状態だった（最終レビュー 視点5 の P-1）。
+> 条件 2・3・4 は型と分岐で守られていたのに、**条件 1 だけが規律だった。**
+> 上限を型（`AXTextRange.written`）と継ぎ目（`SystemAccessibility.isReadable`）の
+> 両方へ置き、**同じ強度にした。**
+> **単位が未実測（V-23）でも上限は置ける**——`count` / `unicodeScalars` / `utf16` の
+> どれであっても長さは `utf16.count` を超えない。**下限は縛らない**（相手の正規化で
+> 偽陰性が出る。上限は倒れる向きが安全側だけである）。
+> 代役に「書いた場所より遥か後ろへキャレットが飛ぶ相手」（`FakeTextField.CaretAfterWrite.endOfContent`）が
+> 無かったため、**この破れは検査から永久に到達できなかった。**
 
 **例外は `AccessibilityRangeProbing` の中にしか存在しない。** 主たる挿入経路（§6.2）は読み戻しを行わないという裁定をそのまま維持する。
 
