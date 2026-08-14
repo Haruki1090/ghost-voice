@@ -41,17 +41,24 @@ struct RefinementPromptMeasurement {
     }
 
     /// 現行の指示文へ 1 行足しただけの候補。
-    private static let withNoContinuationRule = """
-        あなたは音声入力テキストの整形器です。入力は 日本語 です。
-        以下の規則に従ってください。
+    ///
+    /// **指示文を写経しない。** 実測当時は 5 規則を写して 6 番目を足していたが、
+    /// その後 `RefinementPrompt` に規則 5（数字の表記を変えない）が入り、
+    /// **写経した側が古い指示文になって「現行との差」を測れなくなった**
+    /// （この実験の主張は「現行 + 1 行」であって「当時の指示文 + 1 行」ではない）。
+    /// 現行から組み立てれば、規則が増えても差は 1 行のままになる。
+    private static var withNoContinuationRule: String {
+        RefinementPrompt.instructions(for: .jaJP)
+            + "\n\(nextRuleNumber). 入力が文の途中で終わっていても、続きを補わない。入力に無い語を足さない"
+    }
 
-        1. フィラー（えー、あの、まあ、その 等）を削除する
-        2. 言い直しは、後から言い直した方を残す
-        3. 句読点を適切に補う
-        4. 話者の意図・情報を変更しない。要約しない。語を削らない
-        5. 整形後のテキストのみを出力する。説明・前置き・引用符は付けない
-        6. 入力が文の途中で終わっていても、続きを補わない。入力に無い語を足さない
-        """
+    /// 現行の指示文の最後の規則番号 + 1。
+    private static var nextRuleNumber: Int {
+        RefinementPrompt.instructions(for: .jaJP)
+            .split(separator: "\n")
+            .compactMap { line in Int(line.prefix(while: \.isNumber)) }
+            .max().map { $0 + 1 } ?? 6
+    }
 
     /// **文の途中で切れた発話。** 実際の認識結果（3 / 6 / 10 秒スライス）と手で作った例。
     static let truncated: [String] = [

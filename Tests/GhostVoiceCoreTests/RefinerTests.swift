@@ -201,8 +201,43 @@ struct RefinementGuardTests {
         let raw = "えーっと、まあ、この配列をソートする関数を作りたい"  // 25 字 → 上限 41 字
         let short = "```\narr.sort()\n```"                              // 19 字
 
+        #expect(RefinementGuard.containsCodeFence(short), "フェンスを検出できない入力では門を弁別できない")
         #expect(RefinementGuard.isPlausible(short, refinementOf: raw), "長さでは落ちない前提")
         #expect(RefinementGuard.accept(short, refinementOf: raw) == nil)
+    }
+
+    /// **コードフェンスの門が、他の門と独立に効く唯一の場所を駆動する。**
+    ///
+    /// 最終レビューの変異検査で、`accept` からフェンスの条件を外しても
+    /// `containsCodeFence` を常に false にしても**全件緑だった**（変異 G6 / G6b）。
+    /// **他のすべての例では追加字数の検査が同じ出力を落としていた**からである
+    /// ——バッククォートは Unicode 分類 Sk（記号）で `freelyInsertable` に入らず、
+    /// フェンス 1 個で追加 3 字になる。
+    ///
+    /// **独立に効くのは「入力側にフェンスがある」場合だけ**である。そのとき
+    /// フェンスは入力由来なので追加字数は 0 になり、**追加字数の検査は通してしまう。**
+    /// 音声認識がバッククォートを返すことは無いが、**FR-6 の辞書は利用者が手で書く**
+    /// （`applyingVocabulary` が入力へ当てるので、辞書経由で `expected` に入りうる）。
+    ///
+    /// **「整形結果にコードフェンスは決して現れない」は入力に依らない絶対条件**である。
+    @Test("入力にコードフェンスが含まれていても、出力のフェンスは受け入れない")
+    func rejectsCodeFenceEvenWhenInputContainsIt() {
+        let raw = "```arr.sort()```"
+        let output = "```arr.sort()```"
+
+        #expect(
+            RefinementGuard.unsupportedAdditions(output, of: raw) == 0,
+            "追加字数の検査は素通りする（だからこの門が独立に要る）")
+        #expect(RefinementGuard.isPlausible(output, refinementOf: raw), "長さでも落ちない")
+        #expect(RefinementGuard.keepsSomeContent(output, of: raw), "内容の検査でも落ちない")
+        #expect(
+            RefinementGuard.accept(output, refinementOf: raw) == nil,
+            "フェンスの門だけがこれを落とす")
+
+        // 辞書経由でも同じ。頼んだ置換の結果がフェンスでも受け入れない
+        let terms = [VocabularyTerm(canonical: "```sort```", misheard: ["ソート"])]
+        #expect(
+            RefinementGuard.accept("```sort```", refinementOf: "ソート", terms: terms) == nil)
     }
 
     @Test("膨らんだ出力は受け入れない")
@@ -294,21 +329,80 @@ struct FoundationModelRefinerDeviceTests {
         return refiner
     }
 
+    /// **「モデルが応答しなかった」を検査の失敗にしない。**
+    ///
+    /// 最終レビュー §9 が断続的失敗の機序を特定した: 冷えた日は `prewarm()` の 10 秒でも
+    /// 温まらず、続く `refine` も 10 秒で打ち切られて nil になる（**84 回中 4 回、
+    /// 静穏の 14 連発では 3/14**）。`#require(out)` はそれをそのまま失敗にしていた。
+    /// **落ちるゲートは読み飛ばされるようになり、無いより悪い**（開発サイクル §5）。
+    ///
+    /// 応答が無い理由はタイムアウトだけではない。実測（2026-08-15）で、
+    /// **`五人で行きます` `参加者は百人です` のような無害な発話が `guardrailViolation` で
+    /// 拒否される**ことを確認した。`成功` の 1 語では 52.1 秒暴走した末に
+    /// `exceededContextWindowSize` になった。**どれも製品としては正しい縮退**である
+    /// （生テキストを挿入する）。
+    ///
+    /// **一方「応答はあったが検査が捨てた」は失敗にする。** そこは縮退ではなく退行で、
+    /// この検査が守るべきもの（`RefinementGuard` が正当な整形を落としていないこと）そのもの。
+    private func refinedOnDevice(
+        _ refiner: FoundationModelRefiner, _ raw: String,
+        locale: Locale = .jaJP, terms: [VocabularyTerm] = [],
+        _ label: String, sourceLocation: SourceLocation = #_sourceLocation
+    ) async -> String? {
+        let generated = await refiner.generate(
+            prompt: RefinementPrompt.prompt(rawText: raw, terms: terms),
+            locale: locale, timeout: .seconds(10)
+        )
+        guard let generated else {
+            print("\(label): モデルが応答しなかった（縮退。判定は行わない）: \(raw)")
+            return nil
+        }
+        let accepted = RefinementGuard.accept(generated, refinementOf: raw, terms: terms)
+        #expect(
+            accepted != nil,
+            "整形は返ったのに検査が捨てた（退行）: \(raw) -> \(generated.debugDescription)",
+            sourceLocation: sourceLocation)
+        return accepted
+    }
+
     @Test("フィラーを落として内容語を残す")
-    func removesFillers() async throws {
+    func removesFillers() async {
         let refiner = await warmedRefiner()
 
-        let out = await refiner.refine(
-            "えーっと、あの、来週までに要件定義を完了させます",
-            locale: .jaJP, terms: [], timeout: .seconds(10)
-        )
+        guard let result = await refinedOnDevice(
+            refiner, "えーっと、あの、来週までに要件定義を完了させます", "removesFillers"
+        ) else { return }
 
-        let result = try #require(out)
         print("removesFillers: \(result)")
         #expect(!result.contains("えーっと"))
         #expect(!result.contains("あの"))
         #expect(result.contains("要件定義"))
         #expect(result.contains("来週"))
+    }
+
+    /// **規則 5（数字の表記を変えない）が実機で効いていることを、既定の検査で押さえる。**
+    ///
+    /// これが効かなくなると、`RefinementGuard` の許容量 0 が**正当な整形を落とし始める**
+    /// （実測: `十時` → `10時` で追加 2 字、`百二十パーセント` → `120％` で追加 3 字）。
+    /// 症状は「整形が黙って効かなくなる」なので、検査で見ていないと気づけない。
+    @Test("実機で数字の表記が変わらない（規則 5）")
+    func keepsNumeralNotation() async {
+        let refiner = await warmedRefiner()
+
+        for raw in [
+            "えー明日の会議は十時からですのでよろしくお願いします",
+            "今日の売上は前年比で百二十パーセントでした",
+            "あの、予算は一万円です",
+        ] {
+            guard let result = await refinedOnDevice(refiner, raw, "keepsNumeralNotation")
+            else { continue }
+
+            print("keepsNumeralNotation: \(raw) -> \(result)")
+            let hasArabicNumeral = result.contains { $0.isNumber && $0.isASCII }
+            #expect(
+                !hasArabicNumeral,
+                "漢数字を算用数字へ直している（規則 5 が効いていない）: \(raw) -> \(result)")
+        }
     }
 
     /// 発話が命令文に読めると、モデルは整形ではなく「その依頼への回答」を返す。
@@ -340,17 +434,15 @@ struct FoundationModelRefinerDeviceTests {
     /// 固有名詞の誤認識対策はこのプロンプト注入だけが手段（`contextualStrings` は
     /// 実測で無効）。辞書が効かなければ FR-6 は満たせない。
     @Test("辞書の誤認識表記を正規表記へ直す")
-    func appliesVocabulary() async throws {
+    func appliesVocabulary() async {
         let refiner = await warmedRefiner()
 
-        let out = await refiner.refine(
-            "えー、ネクサデータの件で連絡しました",
-            locale: .jaJP,
+        guard let result = await refinedOnDevice(
+            refiner, "えー、ネクサデータの件で連絡しました",
             terms: [VocabularyTerm(canonical: "Nexadata", misheard: ["ネクサデータ"])],
-            timeout: .seconds(10)
-        )
+            "appliesVocabulary"
+        ) else { return }
 
-        let result = try #require(out)
         print("appliesVocabulary: \(result)")
         #expect(result.contains("Nexadata"))
         #expect(!result.contains("ネクサデータ"))
@@ -368,17 +460,17 @@ struct FoundationModelRefinerDeviceTests {
         "頭字語のカタカナ読みも正規表記へ直す",
         .disabled("既知の欠陥: microCMS 等の頭字語は置換されない。task-6-report.md 参照")
     )
-    func appliesVocabularyToSpelledOutAcronyms() async throws {
+    func appliesVocabularyToSpelledOutAcronyms() async {
         let refiner = await warmedRefiner()
 
-        let out = await refiner.refine(
-            "えー、マイクロシーエムエスの記事を更新します",
-            locale: .jaJP,
+        // 無効化されているが、有効に戻したときに §9 の断続的失敗を持ち込まないよう、
+        // 他の実機検査と同じ形（応答なしは縮退として扱う）にしてある。
+        guard let result = await refinedOnDevice(
+            refiner, "えー、マイクロシーエムエスの記事を更新します",
             terms: [VocabularyTerm(canonical: "microCMS", misheard: ["マイクロシーエムエス"])],
-            timeout: .seconds(10)
-        )
+            "appliesVocabularyToSpelledOutAcronyms"
+        ) else { return }
 
-        let result = try #require(out)
         #expect(result.contains("microCMS"))
     }
 
@@ -447,23 +539,27 @@ struct FoundationModelRefinerDeviceTests {
         print("前の発話    : \(first?.debugDescription ?? "nil")")
         print("前の発話の後: \(after?.debugDescription ?? "nil")")
 
+        // **応答が無い日は判定しない**（§9 の断続的失敗。`refinedOnDevice` の doc）。
+        // ここは 2 回の応答を突き合わせるので、片方でも欠けたら比較が成立しない。
+        guard let alone, let after else {
+            print("priorUtteranceDoesNotChangeResult: モデルが応答しなかった（判定は行わない）")
+            return
+        }
         #expect(after == alone, "前の発話が結果を変えている")
-        let result = try #require(after)
-        #expect(!result.contains("品川"))
+        #expect(!after.contains("品川"))
     }
 
     /// ロケールごとに `instructions` を作り分けている意味。ja-JP の指示のまま英語を
     /// 渡すと、実測で「会議は明日の午前10時に開催されます。」と日本語へ訳された。
     @Test("英語ロケールでは英語のまま整形する")
-    func refinesEnglish() async throws {
+    func refinesEnglish() async {
         let refiner = await warmedRefiner()
 
-        let out = await refiner.refine(
-            "uh, like, the meeting is at ten tomorrow morning",
-            locale: Locale(identifier: "en-US"), terms: [], timeout: .seconds(10)
-        )
+        guard let result = await refinedOnDevice(
+            refiner, "uh, like, the meeting is at ten tomorrow morning",
+            locale: Locale(identifier: "en-US"), "refinesEnglish"
+        ) else { return }
 
-        let result = try #require(out)
         print("refinesEnglish: \(result)")
         #expect(result.localizedCaseInsensitiveContains("meeting"))
         #expect(!result.contains("会議"), "日本語へ訳している")
@@ -636,51 +732,190 @@ struct UnsupportedAdditionsTests {
         }
     }
 
-    /// **数量表記の正規化（十時 → 10 時）は実測で起きる。** 落とさない側に置く。
-    /// これが観測された正当な追加の最大値（2 字）であり、許容量の下限を決めている。
-    @Test("数量表記を算用数字へ直した出力は受け入れる")
-    func acceptsNumeralNormalization() {
+    /// **数量表記の正規化は「起こさせない」側で解いた。** `RefinementPrompt` の規則 5
+    /// （数字の表記を変えない）を入れる前は `十時` → `10時` が実測で必ず起きており、
+    /// **その追加 1〜3 字ぶんだけ許容量を開ける必要があった**（開けた量は逸脱にも開く）。
+    ///
+    /// 規則 5 を入れた後の実測（2026-08-15 / 各 3 回同一）:
+    ///
+    /// | 入力 | 規則 5 なし | 規則 5 あり |
+    /// |---|---|---|
+    /// | `…会議は十時から…` | `…10時から…`（追加 2） | `…十時から…`（**追加 0**） |
+    /// | `予算は一万円です` | `予算は1万円です。`（追加 1） | `予算は一万円です。`（**追加 0**） |
+    /// | `…前年比で百二十パーセント…` | `…120％…`（**追加 3 = 旧許容量ちょうど**） | `…百二十パーセント…`（**追加 0**） |
+    ///
+    /// **だからこの検査は向きが逆になっている**——数字を保った出力を受け入れ、
+    /// 数字を変えた出力は落ちる。落ちても失うのは整形だけで、生テキストは挿入される。
+    @Test("数字の表記を保った整形を受け入れる（正規化した出力は落ちる）")
+    func acceptsNumeralsKeptAsSpoken() {
+        let raw = "えー明日の会議は十時からですのでよろしくお願いします"
+
+        // 規則 5 のもとで実際にモデルが返す形（実測 3/3）
         #expect(
             RefinementGuard.accept(
-                "明日の会議は10時からですのでよろしくお願いします。",
-                refinementOf: "えー明日の会議は十時からですのでよろしくお願いします") != nil)
+                "明日の会議は十時からですのでよろしくお願いします。", refinementOf: raw) != nil)
+        // 規則 5 が外れたときに返る形。**受け入れない**（許容量 0 の帰結）
+        #expect(
+            RefinementGuard.accept(
+                "明日の会議は10時からですのでよろしくお願いします。", refinementOf: raw) == nil,
+            "数字を変えた出力を受け入れている。規則 5 と許容量 0 は一体で設計されている")
+
+        // 算用数字で認識された発話は、算用数字のまま返るのが正しい
+        #expect(RefinementGuard.accept("10時に集合してください。", refinementOf: "えー、10時に集合してください") != nil)
+        #expect(RefinementGuard.accept("十時に集合してください。", refinementOf: "えー、10時に集合してください") == nil)
+    }
+
+    /// **反証役（`review-6-refute.md` §5）が構成した 4 例を、実際にモデルへ通した結果。**
+    ///
+    /// 実測（2026-08-15 / MacBook Pro M3 / macOS 26.5.2 / temperature 0 / 各 3 回）:
+    ///
+    /// | 入力 | 反証役が想定した出力 | **実際にモデルが返したもの** |
+    /// |---|---|---|
+    /// | `成功` | `失敗。` | **応答なし**（52.1 秒暴走して `exceededContextWindowSize`） |
+    /// | `可` | `不可。` | `可`（3/3。反転しない） |
+    /// | `参加者は百人です` | `参加者は100人です。` | **応答なし**（`guardrailViolation`） |
+    /// | `千円です` | `1,000円です。` | `千円です。`（3/3。正規化しない） |
+    ///
+    /// **4 例とも、モデルはその出力を返さなかった。** 短い意味反転は 18 の短い発話でも
+    /// 一度も観測されていない（`可` `不可` `承認` `却下` `中止` `続行` すべて素通し）。
+    ///
+    /// **それでも、構成された出力が来たらどう扱うかは決まっていなければならない。**
+    /// 許容量 0 の帰結として、4 例のうち**追加のある 3 例は落ちる**。
+    /// 残る 1 例（`千円です` → `1,000円です。`）も落ちるが、**これは正当な整形であり
+    /// 落ちるのは正しくない**——ただし規則 5 のもとでモデルはこの出力を返さない。
+    /// **「正当だが落ちる」から「そもそも起きない」へ移したのが今回の直しである。**
+    @Test("反証役の 4 例（構成された出力）をどう扱うか")
+    func handlesRefutersConstructedOutputs() {
+        // 意味の反転・否定: 落ちる
+        #expect(RefinementGuard.accept("失敗。", refinementOf: "成功") == nil)
+        #expect(RefinementGuard.accept("不可。", refinementOf: "可") == nil)
+        // 数量正規化: 落ちる（規則 5 のもとでは起きない出力）
+        #expect(RefinementGuard.accept("参加者は100人です。", refinementOf: "参加者は百人です") == nil)
+        #expect(RefinementGuard.accept("1,000円です。", refinementOf: "千円です") == nil)
+        // 実際にモデルが返した形は通る
+        #expect(RefinementGuard.accept("可", refinementOf: "可") != nil)
+        #expect(RefinementGuard.accept("千円です。", refinementOf: "千円です") != nil)
+    }
+
+    /// **英語では文頭の大文字化が正当な整形として起きる。**
+    /// 大文字小文字を畳まないと、許容量 0 の検査が**英語の整形を丸ごと落とす。**
+    ///
+    /// 逐語で残すのは実測した出力そのもの（2026-08-15 / en-US / 6 発話）。
+    @Test("英語の大文字化は追加として数えない（実機の実測）")
+    func capitalizationIsNotCountedAsAddition() {
+        let cases = [
+            ("so the meeting is at ten in the morning", "The meeting is at ten in the morning."),
+            ("you know the build is failing because of the cache", "Build is failing because of the cache."),
+            ("um so I think we should ship it tomorrow", "I think we should ship it tomorrow."),
+            ("uh yeah that works for me", "uh yeah, that works for me"),
+            ("well I guess we need about twenty more minutes", "well, we need about twenty more minutes"),
+        ]
+        for (raw, refined) in cases {
+            #expect(
+                RefinementGuard.unsupportedAdditions(refined, of: raw) == 0,
+                "大文字化を追加として数えている: \(raw) -> \(refined)")
+            #expect(RefinementGuard.accept(refined, refinementOf: raw) != nil)
+        }
+        // 畳んでいるのは大文字小文字だけ。**語が足されれば英語でも落ちる。**
+        #expect(
+            RefinementGuard.accept(
+                "The meeting is at ten in the morning in room A.",
+                refinementOf: "so the meeting is at ten in the morning") == nil)
+    }
+
+    /// **句読点だけの出力を落とす。** `unsupportedAdditions` は出力の内容文字を数えるので、
+    /// 内容が空なら 0 を返す——許容量 0 でもこれだけは別に塞ぐ必要がある。
+    @Test("内容が 1 字も残らない出力は受け入れない")
+    func rejectsContentlessOutput() {
+        #expect(RefinementGuard.unsupportedAdditions("。。。", of: "こんにちは") == 0,
+                "追加字数の検査は素通りする（だからこの門が別に要る）")
+        #expect(RefinementGuard.accept("。。。", refinementOf: "こんにちは") == nil)
+        #expect(RefinementGuard.accept("...", refinementOf: "hello there") == nil)
+    }
+
+    /// **この検査が原理的に捕まえられない形を、捕まえられないまま固定する。**
+    ///
+    /// 見ているのは**足された文字**だけなので、**入力の文字しか使わない逸脱は通る。**
+    /// 閾値をどう動かしても分けられない（文字の編集距離は意味を見ていない）。
+    /// **「守っているつもり」を作らないために、通ることを検査で明示する。**
+    ///
+    /// 安全網は **FR-7（Undo）と、履歴が `rawText` を保持していること**である。
+    /// 正本: 要件定義書 §2.8 / 詳細設計書 §5.5.1。
+    @Test("削ることで意味が変わる逸脱は通る（原理的な限界。安全網は Undo と rawText）")
+    func documentsUncatchableDeletionDeviations() {
+        // 否定の脱落。出力は入力の部分列なので追加 0
+        #expect(RefinementGuard.unsupportedAdditions("行きたいです", of: "行きたくないです") == 0)
+        #expect(
+            RefinementGuard.accept("行きたいです", refinementOf: "えー、行きたくないです") != nil,
+            "捕まえられるようになったなら、正本 §2.8 の限界の記述を更新すること")
+        // 削るだけの要約は通る（言った語しか使っていない）
+        #expect(
+            RefinementGuard.accept(
+                "エラーハンドリングを追加したいです。",
+                refinementOf: "えー、エラーハンドリングが抜けてるので、そこを追加したいです") != nil)
+
+        // **ただし「削るだけ」でない要約は落ちる。** 実測された L-5 の例
+        // （`…追加したいです` → `…追加します。`）は語尾を書き換えているので追加 1 字になり、
+        // **この検査が落とす。** 正本 §2.8 L-5 の「規則 4 は効かない」は
+        // プロンプトについての記述であって、`RefinementGuard` が全部素通しする意味ではない。
+        #expect(
+            RefinementGuard.accept(
+                "エラーハンドリングを追加します。",
+                refinementOf: "えー、エラーハンドリングが抜けてるので、そこを追加したいです") == nil)
     }
 
     /// **指標そのものを固定する。** 閾値だけを見ていると、指標の誤りに気づけない
-    /// ——V-37 で実際にそれが起きた。
+    /// ——V-37（残存率）と V-38（間隙 3）で実際にそれが起きた。
     ///
-    /// ここが押さえるのは「正当な整形と逸脱の間に**間隙がある**」ことである。
-    /// 実測（2026-08-15）:
+    /// **「間隙の真ん中に線を引く」のは 2 回とも破れた。だからここは間隙を見ない。**
+    /// 押さえるのは **「正当な整形の追加字数は 0 である」** ——線ではなく、
+    /// 「整形は足す操作ではない」という定義そのもの。
     ///
-    /// | 種別 | 追加字数（句読点・空白を除く） |
+    /// 実測（2026-08-15 / 規則 5 のもとで応答が返った 48 発話）:
+    ///
+    /// | 種別 | 追加字数（句読点・空白・大文字小文字を除く） |
     /// |---|---|
-    /// | 正当な整形 12 例（5〜124 字） | 0〜**2** |
-    /// | 逸脱・捏造 6 例 | **5**〜38 |
-    @Test("追加字数が正当な整形と逸脱を分ける（間隙は 2 と 5 の間）")
-    func additionsSeparateDeviationFromRefinement() {
+    /// | 正当な整形 48 例（1〜76 字・日英・数量表記を含む） | **すべて 0** |
+    /// | 逸脱 9 例 | **6**〜166 |
+    ///
+    /// 破れていた旧標本（`十時` → `10時` = 2、`百二十パーセント` → `120％` = 3）は、
+    /// **プロンプト側で起こさせないようにして消してある**（`acceptsNumeralsKeptAsSpoken`）。
+    @Test("正当な整形の追加字数は 0 である（逸脱の最小は 6）")
+    func legitimateRefinementAddsNothing() {
         let legitimate = [
             ("えー、こんにちは", "こんにちは。"),
             ("えー、はい", "はい。"),
             ("あの先月の実績は目標を少し下回りましたが今月は挽回できる見込みですので引き続きよろしくお願いします",
              "先月の実績は目標を少し下回りましたが、今月は挽回できる見込みですので、引き続きよろしくお願いします。"),
+            // 規則 5 のもとで実際に返る形（旧標本の `10時` はもう返らない）
             ("えー明日の会議は十時からですのでよろしくお願いします",
-             "明日の会議は10時からですのでよろしくお願いします。"),
+             "明日の会議は十時からですのでよろしくお願いします。"),
+            ("今日の売上は前年比で百二十パーセントでした", "今日の売上は前年比で百二十パーセントでした。"),
+            ("えー、部数は千二百部です", "部数は千二百部です。"),
+            ("会議は明日、あ、明後日です", "会議は明日、明後日です。"),
+            ("えーっと、この関数の戻り値がオプショナルなので、あの、アンラップが必要です",
+             "関数の戻り値がオプショナルなので、アンラップが必要です。"),
         ]
+        // **実測した逸脱の追加字数。** 最小は 6 で、そのうち 2 例は「短い発話への言い足し」
+        // という、旧標本には無かった形である（`よろしく` → `よろしくお願いします。`）。
         let deviation = [
-            ("東京の天気どんな感じですか？", "東京の天気は晴れています。"),
-            ("おはようございます", "承知しました。"),
+            ("東京の天気どんな感じですか？", "東京の天気は晴れています。", 6),
+            ("よろしく", "よろしくお願いします。", 6),
+            ("あの、スラックの方に資料を上げておきました", "資料をスラックの方にアップしました。", 7),
+            ("えー、現状の課題としては、外部のクラウドサービスに音声データを送信することへのセキュリティ上の",
+             "現状の課題としては、外部のクラウドサービスに音声データを送信することへのセキュリティ上の懸念があります。", 7),
             ("本日はお時間をいただきありがとうございます。まず前回のミーティングの振替",
-             "本日はお時間をいただきありがとうございます。まず前回のミーティングの振替についてお話しします。"),
+             "本日はお時間をいただきありがとうございます。まず前回のミーティングの振替についてお話しします。", 10),
         ]
 
         for (raw, refined) in legitimate {
             let added = RefinementGuard.unsupportedAdditions(refined, of: raw)
-            #expect(added <= 2, "正当な整形の追加字数が 2 を超えた: \(raw) -> \(refined) = \(added)")
+            #expect(added == 0, "正当な整形が字を足している: \(raw) -> \(refined) = \(added)")
             #expect(added <= RefinementGuard.maximumUnsupportedAdditions)
         }
-        for (raw, output) in deviation {
+        for (raw, output, expected) in deviation {
             let added = RefinementGuard.unsupportedAdditions(output, of: raw)
-            #expect(added >= 5, "逸脱の追加字数が 5 を下回った: \(raw) -> \(output) = \(added)")
+            #expect(added == expected, "逸脱の追加字数が実測と違う: \(raw) -> \(output) = \(added)")
             #expect(added > RefinementGuard.maximumUnsupportedAdditions)
         }
     }
@@ -727,7 +962,7 @@ struct RetainedRatioTests {
     }
 
     /// **用語の正規化は、置換を当てずに測ると逸脱より悪く見える**（実測: 追加 16 字。
-    /// 逸脱の最小は 5 字）。頼んだ置換を先に当てて初めて追加 0 字になる。
+    /// 逸脱の最小は 6 字）。頼んだ置換を先に当てて初めて追加 0 字になる。
     /// **辞書を渡さなければ落ちる**ことも併せて固定する
     /// ——そこが崩れると FR-6 が黙って効かなくなる。
     @Test("用語を正規表記へ置き換えた出力は、辞書を渡せば受け入れる")
