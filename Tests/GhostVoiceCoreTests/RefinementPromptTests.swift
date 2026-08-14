@@ -13,7 +13,7 @@ struct RefinementPromptTests {
 
     /// `contains` だけだと規則が 1 つ消えても他の規則の文言で素通りする。
     /// 番号付きの行として何番に何が書かれているかを固定する。
-    @Test("instructions に 5 つの規則が番号どおりに並ぶ")
+    @Test("instructions に 6 つの規則が番号どおりに並ぶ")
     func listsAllRulesInOrder() {
         let lines = instructionLines("ja-JP")
         func rule(_ number: Int) -> String? {
@@ -26,8 +26,24 @@ struct RefinementPromptTests {
         // 規則 4 は実測された過剰要約への対策。消えると壊れることを明示する。
         #expect(rule(4)?.contains("要約しない") == true)
         #expect(rule(4)?.contains("変更しない") == true)
-        #expect(rule(5)?.contains("整形後のテキストのみ") == true)
-        #expect(rule(6) == nil, "規則は 5 つのはず: \(lines)")
+        // **規則 5 は `RefinementGuard` の成立条件である。**
+        // これが消えると数量表記の正規化（`十` → `10`。実測で追加 1〜3 字）が復活し、
+        // 許容量 0 の検査が**正当な整形を落とし始める**。プロンプトと検査は一体。
+        #expect(rule(5)?.contains("数字の表記を変えない") == true)
+        #expect(rule(6)?.contains("整形後のテキストのみ") == true)
+        #expect(rule(7) == nil, "規則は 6 つのはず: \(lines)")
+    }
+
+    /// 規則 5 はロケールに依らず入る。**英語の整形にも同じ凍結が要る**
+    /// （`ten` → `10` の正規化は英語でも起こりうる。指示文は日英共通で、
+    /// 変わるのは「入力は X です」の行だけである）。
+    @Test("数字の凍結はどのロケールでも入る")
+    func numeralRuleAppliesToEveryLocale() {
+        for locale in ["ja-JP", "en-US"] {
+            #expect(
+                instructionLines(locale).contains { $0.contains("数字の表記を変えない") },
+                "\(locale) に規則 5 が無い")
+        }
     }
 
     @Test("入力言語をロケールから決める")
