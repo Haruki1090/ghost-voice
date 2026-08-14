@@ -1440,7 +1440,19 @@ public actor DictationSession {
     /// **差し替えできない経路で挿入した直近の発話に限り、生テキストをクリップボードへ置く。**
     /// クリップボードを奪ってよいのは、これが**利用者の明示操作**だからである。
     /// 該当が無ければ何もしない（「戻せません」を告げるだけ）。
+    ///
+    /// - Important: **secure input 中は行わない。**
+    ///   ここは、挿入・差し替え・Undo 本体・再挿入のうちで**唯一 secure input の判定を
+    ///   通らない「クリップボードへ置く」経路**だった。到達しないと考えられてはいた
+    ///   ——この関数を呼ぶのは Undo キーの打鍵だけで、secure input が有効な間は
+    ///   `CGEventTap` にキーイベントが配送されないためである——が、
+    ///   **それは偶然の性質に依存した守り方であり、UI から Undo を撃てるようにした
+    ///   瞬間に穴が開く**（最終レビュー 視点5 の P-4）。**推定に頼らず判定を置く。**
     private func offerRawTextToClipboard() {
+        guard !isSecureInputEnabled() else {
+            notify(.undoUnavailable)
+            return
+        }
         guard let clipboard, let latest = history.entries.first,
             latest.isManualUndoFallbackCandidate,
             (0...HistoryStore.undoWindow).contains(Date().timeIntervalSince(latest.timestamp))

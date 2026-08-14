@@ -181,6 +181,48 @@ struct UndoExecutionTests {
             #expect(rig.clipboard.left.last == RevisionRig.raw)
         }
     }
+
+    /// **クリップボードへの取り出しにも secure input の判定を掛ける。**
+    ///
+    /// `offerRawTextToClipboard()` は、挿入・差し替え・Undo 本体・再挿入のうちで
+    /// **唯一 secure input の判定を通らない「クリップボードへ置く」経路**だった。
+    ///
+    /// 到達しないと考えられてはいた——この関数を呼ぶのは Undo キーの打鍵だけで、
+    /// **secure input が有効な間は `CGEventTap` にキーイベントが配送されない**ためである。
+    /// **しかしそれは偶然の性質に依存した守り方である**（最終レビュー 視点5 の P-4）。
+    /// 将来 HUD やメニューから Undo を撃てるようにした瞬間に穴が開く。
+    /// **推定に頼らず、判定を置く。**
+    @Test("secure input 中は、生テキストをクリップボードへ取り出さない")
+    func doesNotOfferRawTextToTheClipboardUnderSecureInput() async throws {
+        try await withTempRoot { root in
+            let rig = RevisionRig.make(root: root, focusedProcess: RevisionRig.ownProcess)
+            let collector = rig.notices.follow(rig.session)
+            defer { collector.cancel() }
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") {
+                if case .recording = await rig.session.state { return true }
+                return false
+            }
+            rig.audio.emit(frames: 1_600)
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+            #expect(rig.history.entries.first?.insertionMethod == .clipboardOnly)
+
+            // ここでパスワード欄へ移った。
+            rig.isSecureInput.enable()
+            let leftBefore = rig.clipboard.left.count
+            rig.hotkey.emit(.undoRequested)
+            try await waitUntil("顛末が出る") { !rig.notices.notices.isEmpty }
+
+            #expect(
+                rig.clipboard.left.count == leftBefore,
+                "secure input 中なのに発話をクリップボードへ置いた")
+            #expect(rig.notices.notices == [.undoUnavailable])
+        }
+    }
 }
 
 /// 打鍵の判定。**1 打鍵あたり p50 0.75 μs で、これはシステム全体の打鍵に乗る。**

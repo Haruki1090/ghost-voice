@@ -269,6 +269,11 @@ public final class HistoryStore: @unchecked Sendable {
     ///   退避され、健全な空の履歴に置き換わる）。**通知は実際に消えたときだけ**行う。
     /// - Important: これを呼ぶと `undoCandidate(now:)` も無くなる。Undo は
     ///   `entries.first` を見るためで、**消したのに戻せる方が危ない。**
+    /// - Important: **退避された `history.json.corrupt` も消す。**
+    ///   中身は利用者の発話そのものである（`history.json` には認識テキストが平文で入る）。
+    ///   `history.json` を空配列で書き直すだけだった頃は、
+    ///   **「全部削除」を押しても退避先に過去の発話が残り続けた**
+    ///   （最終レビュー 視点5 の P-2）。「削除した」と「まだ在る」が食い違ってはならない。
     @concurrent
     public func removeAll() async throws {
         try mutate(saveEvenIfUnchanged: true) { entries in
@@ -276,6 +281,9 @@ public final class HistoryStore: @unchecked Sendable {
             entries.removeAll()
             return true
         }
+        // **書き直しの後に消す。** 先に消すと、`mutate` が投げた場合に
+        // 「退避だけ消えて履歴は残る」という中途半端な状態になる。
+        try file.removeQuarantinedCopy()
     }
 
     /// 保存件数の上限を実行時に変える（設定画面から。欠落 10）。
