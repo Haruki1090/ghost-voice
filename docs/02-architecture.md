@@ -399,7 +399,9 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 | `transcriberKind` | 列挙 | `dictation` | `dictation` / `speech`（NFR-M1） |
 | `refinementEnabled` | 真偽 | `true` | LLM 整形の有効化 |
 | `refinementTimeoutMs` | 整数 | `750` | 整形の打ち切り時間（NFR-P4 の目標値 500 ms とは別。§7） |
-| `historyLimit` | 整数 | `50` | 履歴保持件数 |
+| `historyLimit` | 整数 | `50` | 履歴保持件数。**実行時に変更できる**（`HistoryStore.setLimit`） |
+
+**ホットキーの妥当性は読み込みの時点で検査する**（フェーズ 2）。修飾キー単独のバインドに追加の修飾キーを付けた組（設定どおりに動かない。詳細設計書 §2.3）や、PTT と修飾キーが衝突する Undo キー（押すと録音が始まる。§8.3）を含むファイルは**復元できない**——既定値で起動し、元のファイルは `.corrupt` へ退避される。フェーズ 1 では設定 UI の保存経路にしか検査が無く、手編集は素通りしていた。
 
 ### 9.2 ユーザー辞書 (`vocabulary.json`)
 

@@ -82,6 +82,8 @@ public struct SessionFailureNotice: Sendable, Equatable {
     /// （毎回強く出すと、本当に失った回が埋もれる）。
     public let speechWasLost: Bool
 
+    /// 縮退の理由から表示材料を作る。**純粋な変換で、副作用も I/O も無い。**
+    /// MainActor から直接呼んでよい（`SwiftUI` の `body` の中でも構わない）。
     public init(_ failure: SessionFailure) {
         switch failure {
         case .audioUnavailable:
