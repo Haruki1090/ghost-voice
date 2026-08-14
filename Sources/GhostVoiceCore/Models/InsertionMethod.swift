@@ -19,6 +19,10 @@ public enum InsertionMethod: String, Codable, Sendable {
     ///
     /// 整形も経ていないため `refinedText` は nil であり、`undoCandidate` の
     /// 対象にはならない（戻すべき挿入が存在しない）。効くのは FR-9 の再挿入だけである。
+    ///
+    /// **差し替え（FR-5(a) / FR-7）の観点でも同じである。** 差し替えハンドルは
+    /// `.ax` 経路でしか作られないので、この経路の発話を戻そうとする道が構造的に無い
+    /// （要件定義書 §2.8.6 / 詳細設計書 §8.3）。
     case notInserted
 }
 

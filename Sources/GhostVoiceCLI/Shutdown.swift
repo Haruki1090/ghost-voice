@@ -76,7 +76,7 @@ public actor ShutdownGate {
 /// 4. それでも待機でなければ、**失われたことを言う**
 public enum Shutdown {
 
-    /// 既定の猶予。挿入まで（NFR-P6）は 1 秒だが、ここが待つのは
+    /// 既定の猶予。テキストが出るまで（NFR-P6a）は 1 秒だが、ここが待つのは
     /// **人がキーを離すまで**を含む。押しっぱなしの録音は最大 120 秒続きうるので、
     /// 「もう終わらせたい」という要求としては 10 秒で打ち切る。
     public static let defaultGrace: Duration = .seconds(10)

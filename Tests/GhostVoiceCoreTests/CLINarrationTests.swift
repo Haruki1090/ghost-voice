@@ -35,7 +35,7 @@ struct CLINarrationTests {
         #expect(line == "[metrics] finalize 70ms / refine 400ms / insert 5ms / total 475ms OK\n")
     }
 
-    /// **NFR-P6 を超えた発話が「OK」に紛れてはならない。**
+    /// **NFR-P6a を超えた発話が「OK」に紛れてはならない。**
     @Test("合計が 1000 ms を超えたら目標超過と出す")
     func idleMarksBudgetOverrun() throws {
         let sample = Metrics.Sample(

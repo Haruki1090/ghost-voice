@@ -3,7 +3,8 @@ import Foundation
 public struct HistoryEntry: Codable, Sendable, Equatable, Identifiable {
     public let id: UUID
     public let timestamp: Date
-    /// 整形前の書き起こし。Undo で復元する対象。
+    /// 整形前の書き起こし。Undo（FR-7）で復元する対象であり、
+    /// **整形が間に合わなかったときに挿入されるテキストでもある。**
     public let rawText: String
     /// 整形後の書き起こし。整形せずに挿入した場合は nil。
     public let refinedText: String?

@@ -117,7 +117,7 @@ public enum SessionNarration {
         }
     }
 
-    /// 1 発話ぶんの計測（詳細設計書 §10 の M2 / M3 / M4 / M5）。
+    /// 1 発話ぶんの計測（詳細設計書 §10 の M2 / M3 / M4 / M5a）。
     public static func metricsLine(_ metrics: Metrics.Sample) -> String {
         var line =
             "[metrics] finalize \(metrics.finalizeMs)ms / refine \(metrics.refineMs)ms"

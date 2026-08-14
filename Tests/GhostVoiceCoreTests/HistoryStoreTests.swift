@@ -200,7 +200,14 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("10 秒以内に整形挿入した履歴は Undo 対象になる")
+    // MARK: - undoCandidate（履歴側の述語）
+    //
+    // **`undoCandidate` は Undo（FR-7）の門ではない**（要件定義書 FR-7 の細目 / 詳細設計書 §8.3）。
+    // 自動で戻せるのは差し替えできる経路で挿入した発話だけで、その門は
+    // **メモリ上に生きている差し替えハンドル**である。以下の検査が固定しているのは
+    // 「直近・整形済み・猶予内」という履歴側の述語であって、「戻せること」ではない。
+
+    @Test("10 秒以内に整形挿入した履歴は undoCandidate に載る")
     func undoCandidateWithinWindow() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)

@@ -55,8 +55,8 @@ public final class HistoryStore: @unchecked Sendable {
         lock.withLock { cached }
     }
 
-    /// - Important: ファイル I/O を同期で行う。発話終了から挿入完了まで 1 秒以内
-    ///   （要件定義書 NFR-P6）を守るため、呼び出し側は**挿入を終えたあと**に、
+    /// - Important: ファイル I/O を同期で行う。発話終了からテキストが出るまで 1 秒以内
+    ///   （要件定義書 NFR-P6a）を守るため、呼び出し側は**挿入を終えたあと**に、
     ///   クリティカルパスの外で呼ぶこと（詳細設計書 §8.2）。
     public func append(_ entry: HistoryEntry) throws {
         try lock.withLock {
@@ -68,7 +68,13 @@ public final class HistoryStore: @unchecked Sendable {
         }
     }
 
-    /// Undo できる直近の履歴。整形して挿入し、かつ猶予時間内のものだけ。
+    /// 直近の「整形して挿入し、かつ猶予時間内」の履歴。
+    ///
+    /// - Important: **これは Undo の門ではない**（要件定義書 FR-7 の細目 / 詳細設計書 §8.3）。
+    ///   自動で戻せるのは**差し替えできる経路で挿入した発話**だけで、その門は
+    ///   **メモリ上に生きている差し替えハンドル**である。ハンドルは AX 経路でしか作られないので、
+    ///   `.pasteboard` / `.clipboardOnly` の発話をここが拾っても戻せない。
+    ///   この述語が残るのは履歴 UI（FR-9）が「直近の整形済み発話」を拾うためである。
     ///
     /// 直近が条件を満たさないときに 1 つ前まで遡ることはしない。Undo が戻すのは
     /// 直前に挿入した文字列であって、それ以外を書き換えるとユーザーが見ていない
