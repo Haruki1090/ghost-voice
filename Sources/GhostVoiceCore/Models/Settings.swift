@@ -1,5 +1,13 @@
 import Foundation
 
+public enum SettingsError: Error, Equatable {
+    /// Undo ホットキーが PTT キーの修飾キーと衝突している。
+    ///
+    /// 既定（PTT = 右 Option）では **⌥ を含む Undo キー**がこれに当たる。押すと
+    /// 録音が始まってしまう（詳細設計書 §8.3）。
+    case hotkeyConflict
+}
+
 public struct Settings: Codable, Sendable, Equatable {
     public var hotkey: HotkeyBinding
     public var undoHotkey: HotkeyBinding
@@ -28,6 +36,49 @@ public struct Settings: Codable, Sendable, Equatable {
     }
 
     public static let `default` = Settings()
+
+    private enum CodingKeys: String, CodingKey {
+        case hotkey, undoHotkey, localeIdentifier, transcriberKind
+        case refinementEnabled, refinementTimeoutMs, historyLimit
+    }
+
+    /// **手編集した `settings.json` もここを通る。**
+    ///
+    /// 1 つのバインド単体の不変条件は `HotkeyBinding.init(from:)` が見る。ここでは
+    /// **PTT と Undo の関係**（`validateHotkeys()`）を見る。どちらかに反する設定ファイルは
+    /// **復元できない**——`SettingsStore` は「読めなかった」として既定値で起動し、
+    /// 元のファイルは `.corrupt` へ退避されるので、利用者は手で直せる。
+    ///
+    /// 黙って一部だけ既定へ倒す縮退は採らない。「PTT だけ既定に戻っている」状態は、
+    /// 利用者から見て**壊れ方が読めない**（フェーズ 1 の I-4 と同じ形の事故になる）。
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.hotkey = try container.decode(HotkeyBinding.self, forKey: .hotkey)
+        self.undoHotkey = try container.decode(HotkeyBinding.self, forKey: .undoHotkey)
+        self.localeIdentifier = try container.decode(String.self, forKey: .localeIdentifier)
+        self.transcriberKind = try container.decode(TranscriberKind.self, forKey: .transcriberKind)
+        self.refinementEnabled = try container.decode(Bool.self, forKey: .refinementEnabled)
+        self.refinementTimeoutMs = try container.decode(Int.self, forKey: .refinementTimeoutMs)
+        self.historyLimit = try container.decode(Int.self, forKey: .historyLimit)
+        try validateHotkeys()
+    }
+
+    /// ホットキーの妥当性を**一括で**検証する（詳細設計書 §12-9 の受け入れ条件）。
+    ///
+    /// 検査は 2 段ある。**単体の不変条件は `HotkeyBinding` が構築時に保証済み**なので、
+    /// ここに残るのは PTT と Undo の関係だけである。
+    ///
+    /// - **保存の経路**（`SettingsStore.update`）と**復元の経路**（`Settings.init(from:)`）の
+    ///   両方がここを呼ぶ。片方にしか無かったのが持ち越し項目 12 である。
+    /// - 設定画面は保存の前にこれを呼んでよい（副作用は無い。純粋な検査）。
+    ///
+    /// - Throws: `SettingsError.hotkeyConflict` — Undo キーが PTT キーの修飾キーを含む。
+    ///   既定（PTT = 右 Option）では **⌥ を含む Undo キーがこれに当たる**（§8.3）。
+    public func validateHotkeys() throws {
+        guard !hotkey.conflicts(with: undoHotkey) else {
+            throw SettingsError.hotkeyConflict
+        }
+    }
 
     public var locale: Locale { Locale(identifier: localeIdentifier) }
 

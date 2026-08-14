@@ -524,8 +524,10 @@ struct HotkeyDecisionSidednessTests {
     @Test("修飾キー単独として扱うキーコードは全て左右のビット表にある")
     func everyModifierOnlyKeyCodeHasDeviceBits() {
         // `HotkeyBinding.isModifierOnly` が真になるキーコードを総当たりで拾う。
+        // **インスタンスを作らずに問う。** 修飾キー単独のバインドは自分自身の修飾キーを
+        // 持たなければ作れない（不変条件）ので、`modifiers: []` では列挙できない。
         let modifierKeyCodes = (Int64(0)...0x7F).filter {
-            HotkeyBinding(keyCode: $0, modifiers: []).isModifierOnly
+            HotkeyBinding.isModifierOnly(keyCode: $0)
         }
         #expect(modifierKeyCodes.count == 8, "修飾キーの一覧が変わった: \(modifierKeyCodes)")
 
@@ -562,7 +564,7 @@ struct HotkeyDecisionNonModifierTests {
 
     /// `Settings.hotkey` は任意の `HotkeyBinding` を取れる。修飾キー以外を PTT に
     /// 割り当てた場合、`flagsChanged` は飛んで来ないので keyDown / keyUp で判定する。
-    private let ptt = HotkeyBinding(keyCode: 0x06, modifiers: [.control, .command])  // ⌃⌘Z
+    private let ptt = HotkeyBinding.controlCommandZ  // ⌃⌘Z
 
     @Test("⌃⌘Z の keyDown で pressed になる")
     func nonModifierKeyDown() {
@@ -621,8 +623,8 @@ struct HotkeyDecisionNonModifierTests {
     /// `Modifiers` → `CGEventFlags` の対応は 4 種すべてが要る。
     /// 1 つでも落とすと、その修飾キーを含むバインドが押されていなくても成立する。
     @Test("option / shift のバインドでも修飾キーの一致を要求する")
-    func optionShiftBindingRequiresBothModifiers() {
-        let binding = HotkeyBinding(keyCode: 0x06, modifiers: [.option, .shift])
+    func optionShiftBindingRequiresBothModifiers() throws {
+        let binding = try HotkeyBinding(keyCode: 0x06, modifiers: [.option, .shift])
 
         let (pressed, _) = HotkeyDecision.decide(
             type: .keyDown, keyCode: 0x06, flags: [.maskAlternate, .maskShift],

@@ -1,10 +1,5 @@
 import Foundation
 
-public enum SettingsError: Error, Equatable {
-    /// Undo ホットキーが PTT キーの修飾キーと衝突している
-    case hotkeyConflict
-}
-
 public final class SettingsStore: @unchecked Sendable {
     private let file: AtomicJSONFile<Settings>
     private let lock = NSLock()
@@ -47,15 +42,16 @@ public final class SettingsStore: @unchecked Sendable {
     /// - Important: `mutate` はロックを保持したまま実行される。`NSLock` は非再帰なので、
     ///   このクロージャの中から同じ store の `settings` を読んではならない（自己デッドロックする）。
     ///   クロージャは渡された `inout Settings` だけを触ること。
+    /// - Important: **ファイル I/O を同期で行う。MainActor から呼ぶとメインスレッドが止まる。**
+    ///   設定画面は 1 項目ごとに呼ぶのではなく、まとめて 1 回にすること。
     /// - Throws: `SettingsError.hotkeyConflict` — 変更後の Undo キーが PTT キーと衝突する場合。
-    ///   このとき保存もキャッシュ更新も行わない。
+    ///   このとき保存もキャッシュ更新も行わない。検査は復元経路と同じ
+    ///   `Settings.validateHotkeys()`（詳細設計書 §12-9「一括で検証する」）。
     public func update(_ mutate: (inout Settings) -> Void) throws {
         try lock.withLock {
             var next = cached
             mutate(&next)
-            guard !next.hotkey.conflicts(with: next.undoHotkey) else {
-                throw SettingsError.hotkeyConflict
-            }
+            try next.validateHotkeys()
             try file.save(next)
             cached = next
         }
