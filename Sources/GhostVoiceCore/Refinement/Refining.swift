@@ -84,7 +84,7 @@ enum RefinementGuard {
         output.contains("```")
     }
 
-    /// 出力が入力の**変換**になっているか。共通部分列の長さで測る。
+    /// 出力が入力の**変換**になっているか。**入力に無い語がどれだけ足されたか**で測る。
     ///
     /// **長さとコードフェンスだけでは、入力と同じくらいの長さの逸脱を止められない**
     /// （実機で観測 / 2026-08-14。要件定義書 §2.8.5）:
@@ -98,36 +98,57 @@ enum RefinementGuard {
     /// ある（モデルは天気を知らない）。テキストを失うより重い——言っていないことを
     /// 言ったことにしている。
     ///
-    /// 既存の 2 つの検査が見ているのは「大きさ」と「1 つの目印」だけで、
-    /// **出力が入力の変換であるかを一度も確かめていなかった。** ここがその検査である。
+    /// ## フェーズ 1 の指標が誤っていた（V-37 / 実測 2026-08-15）
     ///
-    /// 割る数を**短い方の長さ**にしてあるのが要点。フィラー削除（入力が縮む）と
-    /// 句読点の補完（出力が伸びる）の両方を通すためである。
+    /// 最初の指標は「共通部分列 / **短い方**の長さ」だった。これは
+    /// **max(入力の残存率, 出力の由来率)** に等しく、**2 方向の甘い方**を採る。
+    /// 結果、**入力が丸ごと残っていれば追加は何字あっても 1.000** になる——
+    /// **追加に対して原理的に盲目**だった。
     ///
-    /// **用語の正規化（FR-6）は、この指標だけでは逸脱と区別できない。** 実測:
+    /// 実機で実際に起きていたこと（`say -v Kyoko` のフィクスチャ 6 秒スライス）:
+    ///
+    /// ```
+    /// raw    : 本日は…まず前回のミーティングの振替                    （36 字）
+    /// refined: 本日は…まず前回のミーティングの振替についてお話しします。（47 字）
+    /// ```
+    ///
+    /// **「についてお話しします」は誰も言っていない。** 旧指標は 1.000 を返し、
+    /// 長さの検査も通り、**利用者の欄へ入っていた。**
+    /// 10 秒スライス（56 字 → 96 字。40 字ぶんの会議報告が丸ごと作り話）が捨てられたのは、
+    /// 指標が捕まえたからではなく**長さの上限に偶然引っ掛かった**だけである。
+    ///
+    /// ## 発話長への依存は「逆向き」だった
+    ///
+    /// V-37 の当初の疑いは「長い発話ほど比が下がって正当な整形が落ちる」だったが、
+    /// **実測は逆**で、旧指標は長いほど**上がった**（19 字 0.933 → 124 字 0.991。
+    /// フィラーが長文では相対的に小さくなるため）。
+    /// **5〜124 字の 9 例すべてで正当な整形は受け入れられていた。**
+    /// A4 が観測した「56 字が 10/10 捨てられる」は発話長の問題ではなく、
+    /// **音声を 10 秒で切ったために発話が文の途中で終わっていた**ことによる。
+    ///
+    /// ## 残存率の向きは閾値で分けられない（判定に使わない理由）
     ///
     /// | 操作 | 例 | 残存率 |
     /// |---|---|---|
-    /// | 句読点 | `はい` → `はい。` | 1.00 |
-    /// | フィラー削除 | `あのー、会議は、えっと明日です` → `会議は明日です。` | 0.88 |
-    /// | **用語の正規化** | `ジーエイエスを使いました` → `Google Apps Script を使いました。` | **0.50** |
-    /// | **逸脱（回答）** | `東京の天気どんな感じですか？` → `東京の天気は晴れています。` | **0.46** |
-    /// | 無関係 | `おはようございます` → `承知しました。` | 0.14 |
+    /// | フィラー削除（短文） | `えー、はい` → `はい。` | **0.400** |
+    /// | フィラー削除（中） | `あのー、会議は、えっと明日です` → `会議は明日です。` | 0.467 |
+    /// | **逸脱（回答）** | `東京の天気どんな感じですか？` → `東京の天気は晴れています。` | **0.429** |
     ///
-    /// **0.50 と 0.46 は閾値で分けられない。** どちらも「入力の文字を大きく置き換える」
-    /// 操作だからである。違いは**片方は我々が頼んだ置換で、もう片方は頼んでいない**
-    /// という一点にある。だから `accept` は**先に頼んだ置換を適用してから**ここへ渡す
-    /// （`applyingVocabulary(_:terms:)`）。適用後は用語の正規化がほぼ恒等変換になり、
-    /// 逸脱だけが低いまま残る。
+    /// **0.400 と 0.429 は分けられない。** フィラー削除は「消す」操作で、
+    /// 短い発話ほど消える割合が大きい。**分かれるのは消した量ではなく足した量である。**
+    /// `coverageRatio` は計測のために残してあるが、判定には使わない。
     ///
-    /// - Note: **観測点はまだ少ない**（逸脱 2 例・正当 5 例）。境界は 0.6 に置いてあるが、
-    ///   正当な整形を落とす報告が出たら、**閾値ではなく指標そのものを見直すこと。**
-    ///   最初に書いた「用語の正規化は約 0.79 だから通る」という見積もりは**外れていた**
-    ///   （実測 0.50）。検査が先に潰した。
-    static func retainedRatio(_ output: String, refinementOf raw: String) -> Double {
-        let a = Array(raw), b = Array(output)
+    /// ## 用語の正規化（FR-6）を逸脱と分ける工夫は残してある
+    ///
+    /// `ジーエイエスを使いました` → `Google Apps Script を使いました。` は、
+    /// 素で測ると **16 字の追加**（逸脱の最小 5 字を大きく超える）。
+    /// だから `accept` は**先に頼んだ置換を入力へ当ててから**測る
+    /// （`applyingVocabulary(_:terms:)`）。当てた後は追加 0 字になる。
+    /// **辞書を渡さなければ同じ出力が落ちる**ことも検査で固定してある。
+    ///
+    /// 共通部分列の長さ。1 行ぶんだけ持って回す。
+    static func commonSubsequenceLength(_ a: [Character], _ b: [Character]) -> Int {
         guard !a.isEmpty, !b.isEmpty else { return 0 }
-        // 共通部分列の長さ。1 行ぶんだけ持って回す。
         var previous = [Int](repeating: 0, count: b.count + 1)
         var current = previous
         for i in 1...a.count {
@@ -136,15 +157,69 @@ enum RefinementGuard {
             }
             swap(&previous, &current)
         }
-        return Double(previous[b.count]) / Double(min(a.count, b.count))
+        return previous[b.count]
     }
 
-    /// 残存率の下限。詳細は `retainedRatio(_:refinementOf:)`。
-    static let minimumRetainedRatio = 0.6
+    /// 入力のどれだけが出力に残ったか。**言われたことが消えていないか**を見る。
+    /// **判定には使わない**（`unsupportedAdditions` の doc にある実測のとおり、
+    /// この向きは正当な整形と逸脱を分けられない）。計測と報告のために置いてある。
+    static func coverageRatio(_ output: String, of expected: String) -> Double {
+        let a = Array(expected), b = Array(output)
+        guard !a.isEmpty else { return 0 }
+        return Double(commonSubsequenceLength(a, b)) / Double(a.count)
+    }
+
+    /// 出力のうち、**入力にも句読点にも由来しない文字の数**。
+    ///
+    /// 判定はこの 1 つで行う。詳細は `maximumUnsupportedAdditions`。
+    static func unsupportedAdditions(_ output: String, of expected: String) -> Int {
+        let a = withoutFreelyInsertable(expected)
+        let b = withoutFreelyInsertable(output)
+        guard !b.isEmpty else { return 0 }
+        return b.count - commonSubsequenceLength(a, b)
+    }
+
+    /// **整形が自由に足してよい文字**——句読点と空白。
+    ///
+    /// 整形の仕事の一つは「句読点を適切に補う」ことなので、句読点の追加は勘定に入れない。
+    /// 入れると**節の多い長い発話ほど落ちる**指標になり、V-37 が疑った長さ依存を
+    /// 直した側で作り込むことになる（実測: 句読点の少ない 49 字の発話で読点 2 + 句点 1）。
+    private static func withoutFreelyInsertable(_ text: String) -> [Character] {
+        text.filter { character in
+            !character.unicodeScalars.allSatisfy(freelyInsertable.contains)
+        }
+    }
+
+    private static let freelyInsertable = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
+
+    /// 入力に無い語の許容量。**句読点・空白は数に入らない**ので、これは
+    /// 「利用者が言っていない語をどれだけ通すか」そのものである。
+    ///
+    /// 実測（2026-08-15 / MacBook Pro M3 / macOS 26.5.2 / temperature 0 / 各 3 回同一）:
+    ///
+    /// | 種別 | 例 | 追加字数 |
+    /// |---|---|---|
+    /// | フィラー削除・句読点補完（5〜124 字の 11 例） | `えーっと、あの、来週までに…` → `来週までに…。` | **0** |
+    /// | 数量表記の正規化 | `…は十時から…` → `…は10時から…。` | **2** |
+    /// | **逸脱: 質問への回答** | `東京の天気どんな感じですか？` → `東京の天気は晴れています。` | **6** |
+    /// | **逸脱: 無関係な応答** | `おはようございます` → `承知しました。` | **5** |
+    /// | **逸脱: 続きの捏造** | `…振り返りから始めさせてください。前回は新しい` → `…新しいプロジェクトの進捗を確認し、…強化しました。` | **38** |
+    ///
+    /// 正当な整形の最大は 2、逸脱の最小は 5。**境界は 3 に置いてある**——
+    /// 観測した正当側に 1 字、逸脱側に 2 字の余裕がある。
+    ///
+    /// - Note: **この量は発話長に依存しない。** 句読点を勘定から外したことで、
+    ///   長い発話ほど不利になる項が消えている（V-37 の再発防止）。
+    ///   閾値ではなく指標を疑うべき報告——**正当な整形が落ちる、あるいは
+    ///   捏造が通る**——が出たら、まず「何字足されたか」を実測して表へ足すこと。
+    static let maximumUnsupportedAdditions = 3
 
     /// 頼んだ置換（FR-6 の用語辞書）を入力へ先に当てる。
     ///
-    /// **これをしないと、用語の正規化と逸脱が残存率で区別できない**（上記の表）。
+    /// **これをしないと、用語の正規化が逸脱と区別できない。**
+    /// `ジーエイエスを使いました` → `Google Apps Script を使いました。` は素で測ると
+    /// **16 字の追加**で、逸脱の最小（5 字）を大きく超える（上記の表）。
     /// 整形器はこの辞書をプロンプトへ入れて置換を依頼しているので、
     /// **置換後の姿こそが「期待される入力」である。**
     static func applyingVocabulary(_ raw: String, terms: [VocabularyTerm]) -> String {
@@ -163,12 +238,14 @@ enum RefinementGuard {
         _ output: String, refinementOf raw: String, terms: [VocabularyTerm] = []
     ) -> String? {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 残存率は**頼んだ置換を当てた後の入力**と比べる（`applyingVocabulary` の理由）。
+        // 追加字数は**頼んだ置換を当てた後の入力**と比べる（`applyingVocabulary` の理由）。
         let expected = applyingVocabulary(raw, terms: terms)
+        // 長さの検査を先に通す。`unsupportedAdditions` は共通部分列を取るので
+        // 出力の長さに比例して重くなり、暴走した生成をそのまま渡したくない。
         guard !trimmed.isEmpty,
               !containsCodeFence(trimmed),
               isPlausible(trimmed, refinementOf: raw),
-              retainedRatio(trimmed, refinementOf: expected) >= minimumRetainedRatio
+              unsupportedAdditions(trimmed, of: expected) <= maximumUnsupportedAdditions
         else { return nil }
         return trimmed
     }
