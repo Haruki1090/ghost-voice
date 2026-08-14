@@ -116,7 +116,12 @@ public enum Shutdown {
         //
         // **確認するのは `state`（最後に emit した状態）ではなく `phase` 由来の
         // `isBusy` である。** `state` は emit でしか変わらないので、押下を受けてから
-        // 最初の emit までの窓（起動直後の 1 発話で 44〜540 ms）を「待機」と読み違える。
+        // 最初の emit までの窓を「待機」と読み違える。
+        //
+        // **窓の長さは `begin()` の費用そのものである。** 起動後の最初の 1 発話が
+        // 44〜540 ms 掛かっていた件は、フェーズ 2 で起動時に解析器を 1 往復させて
+        // 捨てることで吸収した（詳細設計書 §10）。**現在の窓は定常時の 1.2〜1.4 ms
+        // に縮んでいるが、窓が消えたわけではないのでこの読み替えは今も要る。**
         let deadline = ContinuousClock.now + grace
         var settled = false
         while ContinuousClock.now < deadline {
