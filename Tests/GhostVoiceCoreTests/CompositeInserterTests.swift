@@ -472,9 +472,22 @@ struct RealSecureInputTests {
     }
     /// 既定の組み立てが実 API を見ていること。値そのものは機体の権限状態に依存するので、
     /// **実 API と一致すること**だけを見る（規律: 権限のある機体でも正しく動くこと）。
+    ///
+    /// - Important: **照会し直してから比べる。**
+    ///   `PostEventAuthorization.shared` は**生成時に一度だけ**照会して値を握る
+    ///   （`isGranted` は照会しない、という設計）。一方この検査が作る `expected` は
+    ///   **その場の `CGPreflightPostEventAccess()`** である。
+    ///   実測（2026-08-15 / 全件実行を 8 回）では**この 2 つが食い違って 2 回落ちた**——
+    ///   `CGPreflightPostEventAccess()` は同じプロセスの中でも時点によって
+    ///   答えが変わりうる（`shared` の生成が早い実行では false を握り、
+    ///   後の直接照会は true を返した）。
+    ///   **握った時点の違いを検査の失敗として出してはならない**ので、
+    ///   ここで一度そろえてから比べる。**このスイートは `.serialized` で、
+    ///   共有インスタンスを触るのはここだけである。**
     @Test("既定の送出器は実 API の状態を映す")
     func defaultSenderReflectsSystemState() {
-        let expected = CGPreflightPostEventAccess() && !IsSecureEventInputEnabled()
+        let granted = PostEventAuthorization.shared.refresh()
+        let expected = granted && !IsSecureEventInputEnabled()
         #expect(SystemPasteShortcutSender().canSend == expected)
     }
 
