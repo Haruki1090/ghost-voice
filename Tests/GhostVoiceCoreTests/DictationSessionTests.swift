@@ -409,6 +409,95 @@ struct DictationSessionTests {
         }
     }
 
+    // MARK: - 中断（処理中）
+
+    /// **整形中の ESC は間に合う。** 処理窓は実測 400〜800 ms あり、人が押すのに十分な長さ。
+    /// 押した意味は 1 つ——「これを挿入するな」——なので、挿入も履歴の整形結果も残さない。
+    @Test("整形中に ESC を押したら挿入しない")
+    func cancelDuringRefiningStopsInsertion() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                refiner: SpyRefiner(result: "整形後テキストです", delay: .milliseconds(300)))
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("整形へ入る") { await rig.session.state == .refining }
+
+            rig.hotkey.emit(.cancelled)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(rig.inserter.inserted.isEmpty, "ESC を押したのに挿入された")
+
+            // 発話は失わない。履歴には残す（基本設計書 §4）。
+            let entry = try #require(rig.history.entries.first, "中断で発話が消えた")
+            #expect(entry.rawText == "えー、生テキストです")
+            #expect(entry.insertionMethod == .notInserted)
+            // 整形結果を残すと、一度も挿入していない文字列が Undo 対象になる。
+            #expect(entry.refinedText == nil)
+            #expect(rig.history.undoCandidate() == nil)
+        }
+    }
+
+    /// 確定を待っている間の ESC も間に合う。認識器が遅い機体ではこの窓が最も長い。
+    @Test("確定待ちの間に ESC を押したら挿入しない")
+    func cancelDuringFinalizingStopsInsertion() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                // 確定を流さない。締め切りまで `.finalizing` に留まる。
+                transcriber: StubTranscriber(
+                    StubTranscriber.Script(emitsFinal: false, finishesStream: false)),
+                finalizeDeadline: .seconds(3)
+            )
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("確定待ちへ入る") { await rig.session.state == .finalizing }
+
+            rig.hotkey.emit(.cancelled)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(rig.inserter.inserted.isEmpty, "ESC を押したのに挿入された")
+            #expect(rig.refiner.refinedInputs.isEmpty, "中断した発話を整形へ回した")
+            #expect(rig.history.entries.first?.insertionMethod == .notInserted)
+        }
+    }
+
+    /// **挿入を始めた後の ESC は手遅れとして扱い、完走させる。**
+    ///
+    /// ⌘V を送出した後に中断すると、クリップボードの復元だけが走って
+    /// テキストがどこにも残らない（Task 8 が潰した欠陥と同じ形）。
+    /// 「中断が効かない」より「テキストが消える」ほうが重い。
+    @Test("挿入を始めた後の ESC では完走する")
+    func cancelAfterInsertionStartedIsIgnored() async throws {
+        try await withTempRoot { root in
+            let inserter = RecordingInserter(delay: .milliseconds(300))
+            let rig = makeRig(root: root, inserter: inserter)
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("挿入へ入る") { await rig.session.state == .inserting }
+
+            rig.hotkey.emit(.cancelled)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(inserter.inserted == ["整形後テキストです"], "挿入が途中で止められた")
+            // 完走したので、中断ではなく通常の挿入として記録される。
+            #expect(rig.history.entries.first?.insertionMethod == .ax)
+            #expect(rig.history.entries.first?.refinedText == "整形後テキストです")
+        }
+    }
+
     // MARK: - 安全弁
 
     /// 左右のデバイスビットを報告しない入力源が混ざると、キーを離しても押下と
@@ -560,6 +649,33 @@ struct DictationSessionTests {
         }
     }
 
+    /// **設定は発話の頭で 1 度だけ写し取る。** 整形と履歴で別々に読み直すと、
+    /// 発話の途中で設定が変わったときに 1 発話へ 2 つの設定が混ざる。
+    @Test("発話の途中で設定が変わっても 1 発話には 1 つの設定しか使わない")
+    func usesOneSettingsSnapshotPerUtterance() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                refiner: SpyRefiner(result: "整形後テキストです", delay: .milliseconds(300)))
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("整形へ入る") { await rig.session.state == .refining }
+
+            // 整形の最中にロケールを変える。この発話は既に ja-JP で始まっている。
+            try rig.settings.update { $0.localeIdentifier = "en-US" }
+
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(
+                rig.history.entries.first?.localeIdentifier == "ja-JP",
+                "履歴が設定を読み直して、整形と別のロケールを記録した")
+        }
+    }
+
     // MARK: - 状態機械としての振る舞い
 
     @Test("1 発話は idle → recording → finalizing → refining → inserting → idle を辿る")
@@ -660,8 +776,41 @@ struct DictationSessionTests {
 
             let sample = try #require(await rig.session.latestMetrics)
             #expect(sample.refineMs >= 100, "整形の所要が計測されていない（\(sample.refineMs) ms）")
-            #expect(sample.total == sample.finalize + sample.refine + sample.insert)
+            // **`total == finalize + refine + insert` を書いてはならない。**
+            // `Metrics.Sample.total` はその式で定義されているので、同じ値から同じ式を
+            // 組み立てて比べるだけになり、決して落ちない。
+            //
+            // 代わりに丸めの規約を見る。`totalMs` は 3 区間を切り捨ててから足すのではなく
+            // 合計の実時間から丸めるので、**切り捨ての和以上**になる。
+            #expect(sample.totalMs >= sample.finalizeMs + sample.refineMs + sample.insertMs)
+            #expect(sample.totalMs <= sample.finalizeMs + sample.refineMs + sample.insertMs + 2)
             #expect(sample.meetsTarget)
+        }
+    }
+
+    /// **計測値は発話ごとに畳む。** 中断や失敗で終わった発話の後に読んだとき、
+    /// 前の発話の値が「今の発話の計測値」として返ってはならない。
+    @Test("中断した発話の後に前の発話の計測値が残らない")
+    func clearsMetricsBetweenUtterances() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root)
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            // 1 発話目は成功させ、計測値を残す。
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("1 発話目の録音") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("1 発話目が終わる") { !rig.inserter.inserted.isEmpty }
+            #expect(await rig.session.latestMetrics != nil)
+
+            // 2 発話目は中断する。挿入していないので計測値は無い。
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("2 発話目の録音") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.cancelled)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            #expect(await rig.session.latestMetrics == nil, "前の発話の計測値が残っている")
         }
     }
 
@@ -690,6 +839,27 @@ struct DictationSessionTests {
 
     // MARK: - 起動
 
+    /// マイク権限が無いなど `prepare()` が投げた場合、**起動時にそれを知らせる。**
+    /// 黙って進むと、ユーザーには「押しても何も起きない」としか見えない（FR-10）。
+    @Test("音声エンジンを準備できなければ起動時に知らせる")
+    func reportsAudioWarmUpFailure() async throws {
+        try await withTempRoot { root in
+            let audio = StubAudioCapture()
+            audio.prepareError = AudioCaptureError.microphoneAccessNotGranted(.denied)
+            let rig = makeRig(root: root, audio: audio)
+            let log = StateLog()
+            let collector = await log.collect(from: rig.session.stateUpdates)
+            defer { collector.cancel() }
+
+            await rig.session.warmUp()
+
+            try await waitUntil("失敗が届く") {
+                await log.states.contains(.failed(.audioUnavailable))
+            }
+            #expect(await rig.session.state == .idle)
+        }
+    }
+
     /// 捨て推論は実測でコールド 1.9〜3.3 秒掛かる。**これを待ってから
     /// ホットキーを読み始めると、起動直後の数秒間、押しても何も起きない。**
     @Test("起動は整形器の捨て推論を待たない")
@@ -709,6 +879,10 @@ struct DictationSessionTests {
 
             #expect(elapsed < .seconds(1), "捨て推論の完了を待っている（実測 \(elapsed)）")
             #expect(rig.audio.prepareCount == 1, "音声エンジンのウォームアップは待つ")
+
+            // **待たないことと、呼ばないことは違う。** 上の検査だけだと、捨て推論を
+            // まるごと消す変更が素通りする（消せば当然「待っていない」ので通る）。
+            try await waitUntil("捨て推論が投げられている") { refiner.prewarmCount == 1 }
         }
     }
 }

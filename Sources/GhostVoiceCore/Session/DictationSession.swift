@@ -96,6 +96,13 @@ public actor DictationSession {
     private var maxDurationTask: Task<Void, Never>?
     private var finalDeadlineTask: Task<Void, Never>?
 
+    /// 確定 → 整形 → 挿入を走らせているタスク。
+    ///
+    /// **`run()` のイベントループはこれを待たない。** 待つと、処理中（実測 400〜800 ms）に
+    /// 届いた ESC がループの手前で滞留し、**中断が原理的に効かなくなる**。
+    /// 次の押下だけが `startRecording()` の頭でこれを待ち、発話の直列性を保つ。
+    private var completionTask: Task<Void, Never>?
+
     private var latestVolatile = ""
     private var latestFinal = ""
     private var droppedAtStart = 0
@@ -108,6 +115,9 @@ public actor DictationSession {
     /// 「確定を待っている」状態を勝手に解いてしまい、**まだ届いていない確定を
     /// 待たずに暫定テキストで挿入する**（＝発話の一部を失う）。
     private var utterance = 0
+
+    /// 処理中に ESC が届いたか（基本設計書 §4「中断はどの状態からでも」）。
+    private var isCancelRequested = false
 
     /// キー解放以降に確定を待っているか。**録音中の `.final` で先へ進んではならない**
     /// （長い発話では途中で確定が出る。V-2 のテストが実測で確認している）。
@@ -142,7 +152,11 @@ public actor DictationSession {
         self.maxRecordingDuration = maxRecordingDuration
         self.finalizeDeadline = finalizeDeadline
         // 消費者が居ない構成（常駐デーモン）で際限なく溜め込まないよう上限を置く。
-        // 1 発話が出す状態は多くて 6 件なので、32 あれば取りこぼしはまず起きない。
+        //
+        // **1 発話が出す状態は 6 件ではない。** `.recording(volatileText:)` は暫定結果の
+        // たびに emit されるので、長い発話では数百件出る。`.bufferingNewest` は古い方から
+        // 捨てるため、溢れて失われるのは**古い暫定表示**だけで、`.finalizing` 以降の
+        // 遷移は直近に入って残る。上限の目的はメモリであって取りこぼしの防止ではない。
         (stateUpdates, stateContinuation) = AsyncStream<SessionState>.makeStream(
             bufferingPolicy: .bufferingNewest(32)
         )
@@ -207,25 +221,61 @@ public actor DictationSession {
     /// 監視器のイベント列が終端するか、このタスクがキャンセルされると戻る。
     /// 戻る際に `stateUpdates` も終端させるので、状態を購読している側もそこで抜けられる。
     ///
-    /// - Note: 処理中の発話は巻き添えにしない（`stopRecording` の注記）。ただし
-    ///   `run()` が戻った後にその発話の状態が流れる場合、終端済みのストリームへの
-    ///   `yield` は捨てられる。**終了処理は `state == .idle` を待ってから行うこと。**
+    /// - Note: 処理中の発話は巻き添えにしない。イベント列が尽きた後、処理中の発話を
+    ///   見届けてから `stateUpdates` を終端する（`Task<Void, Never>.value` は待つ側が
+    ///   キャンセルされても早く返らないので、`run()` を畳んでも見届けは行われる）。
+    ///   **ただしプロセスの寿命はここの管轄外である。** `exit()` で落とすと、⌘V の送出後・
+    ///   クリップボードの復元前で切れてテキストが失われうる。**終了処理は
+    ///   `state == .idle` を待ってから行うこと。**
     public func run() async {
         await warmUp()
         for await event in hotkey.events {
             switch event {
             case .pressed: await startRecording()
-            case .released: await stopRecording(cancelled: false)
-            case .cancelled: await stopRecording(cancelled: true)
+            case .released: stopRecording(cancelled: false)
+            case .cancelled: requestCancel()
             }
         }
+        await completionTask?.value
+        completionTask = nil
         stateContinuation.finish()
+    }
+
+    /// ESC（`.cancelled`）を受けたときの分岐。**どの状態から押されたかで意味が変わる。**
+    ///
+    /// - 録音中: そのまま中断する
+    /// - 確定待ち・整形中: 中断を予約する。挿入も履歴への整形結果も行わない
+    /// - **挿入を始めた後: 何も起きない。** 予約は立つが、`completeUtterance` が
+    ///   それを読むのは挿入の手前までなので、挿入は完走する。**これは意図した挙動である。**
+    ///   ⌘V を送出した後に中断すると、クリップボードの復元だけが走って
+    ///   **テキストがどこにも残らない**（Task 8 が潰した欠陥と同じ形）。
+    ///   「中断が効かない」より「テキストが消える」ほうが重い。
+    ///
+    /// - Important: **挿入より後で `isCancelRequested` を読んではならない。**
+    ///   読んだ瞬間に上記の欠陥が復活する。境界は
+    ///   `cancelAfterInsertionStartedIsIgnored` が押さえている。
+    private func requestCancel() {
+        switch phase {
+        case .recording: stopRecording(cancelled: true)
+        case .processing: isCancelRequested = true
+        case .idle: break
+        }
     }
 
     // MARK: - 録音
 
     private func startRecording() async {
+        // 前の発話の確定〜挿入が走っていれば、終わるまで待つ。**押下は取りこぼさない。**
+        // `run()` 側で待たないのは ESC を滞留させないためで、直列性はここが担う。
+        await completionTask?.value
+        completionTask = nil
+
         // 二重の押下は無視する。混在入力源では押下だけが繰り返し届きうる。
+        //
+        // **この guard が有効なのは `run()` が唯一の呼び出し元で、単一のイベントループから
+        // 直列に呼ぶからである。** 判定から `phase = .recording` までの間に `await` が
+        // 3 つあるので、複数の文脈からこれを呼ぶと 2 回通り抜けうる。
+        // 呼び出し元を増やすときは、ここに中間相（`.starting`）を置くこと。
         guard phase == .idle else { return }
 
         // 前の発話の確定処理が残っていれば、先に片付ける。
@@ -252,6 +302,10 @@ public actor DictationSession {
         latestFinal = ""
         isAwaitingFinal = false
         isFinalSettled = false
+        isCancelRequested = false
+        // **前の発話の計測値を残さない。** 中断や失敗で終わった発話の後に読むと、
+        // 前の発話の値が「今の発話の計測値」として返る。
+        latestMetrics = nil
         droppedAtStart = audio.droppedBufferCount
 
         let updates: AsyncThrowingStream<TranscriptionUpdate, Error>
@@ -298,15 +352,22 @@ public actor DictationSession {
             await self?.updatesEnded(for: utterance)
         }
 
-        startMaxDurationTimer()
+        startMaxDurationTimer(for: utterance)
     }
 
-    private func startMaxDurationTimer() {
+    private func startMaxDurationTimer(for utterance: Int) {
         maxDurationTask = Task { [weak self, maxRecordingDuration] in
             try? await Task.sleep(for: maxRecordingDuration)
             guard !Task.isCancelled else { return }
-            await self?.stopRecording(cancelled: false)
+            await self?.stopRecordingFromTimer(for: utterance)
         }
+    }
+
+    /// 満了が `cancel()` と競り合って通り抜けた場合に、**次の発話を打ち切らない**ための門。
+    /// `apply` / `updatesEnded` と同じ通し番号の締め出しをここにも掛ける。
+    private func stopRecordingFromTimer(for utterance: Int) {
+        guard utterance == self.utterance else { return }
+        stopRecording(cancelled: false)
     }
 
     private func apply(_ update: TranscriptionUpdate, for utterance: Int) {
@@ -333,7 +394,25 @@ public actor DictationSession {
 
     // MARK: - 確定 → 整形 → 挿入
 
-    private func stopRecording(cancelled: Bool) async {
+    /// 録音を終える。**確定から挿入までは待たずにタスクへ逃がす。**
+    ///
+    /// 待たない理由は 2 つある。
+    ///
+    /// 1. **キャンセルの遮蔽。** ここへ来る経路の 1 つは最大録音時間の満了で、
+    ///    そのときの呼び出し元は直上で `cancel()` した `maxDurationTask` 自身である。
+    ///    もう 1 つはアプリ終了時に `run()` のタスクが畳まれる場合。どちらでも、
+    ///    続きがキャンセル状態のタスクで走ると次が起きる（いずれも実測で確認した）:
+    ///    `AsyncStream` の `next()` が即座に nil を返すため `drainFeed` が末尾を待たずに
+    ///    抜けて**発話の末尾が認識器へ届かず**、同じ理由で `withTimeout` が常に nil を
+    ///    返して**整形が必ず縮退し**、`PasteboardInserter` の復元待ち（120 ms）が 0 に
+    ///    なって**⌘V が処理される前にクリップボードを戻して発話を失う**
+    ///    （Task 8 が潰した欠陥の再発）。非構造化タスクはキャンセルを継承しない。
+    /// 2. **ESC を滞留させない。** `run()` のループがここで 400〜800 ms 止まると、
+    ///    その間に届いた `.cancelled` はイベント列に溜まったままになり、
+    ///    中断が原理的に効かなくなる（基本設計書 §4）。
+    ///
+    /// 発話の直列性は `startRecording()` の頭が `completionTask` を待つことで保つ。
+    private func stopRecording(cancelled: Bool) {
         // 解放を 2 回受け取る経路（最大録音時間の満了とキー解放の競合）がある。
         guard phase == .recording else { return }
         phase = .processing
@@ -342,28 +421,16 @@ public actor DictationSession {
         maxDurationTask?.cancel()
         maxDurationTask = nil
 
-        // **確定から挿入までを、キャンセルされうるタスクの中で走らせない。**
-        //
-        // ここへ来る経路の 1 つは最大録音時間の満了で、そのときの呼び出し元は
-        // 直上で `cancel()` した `maxDurationTask` 自身である。もう 1 つは
-        // アプリ終了時に `run()` のタスクが畳まれる場合。どちらでも、この続きが
-        // キャンセル状態のタスクで走ると次が起きる（いずれも実測で確認した）:
-        //
-        //   - `AsyncStream` の `next()` が即座に nil を返すため、`drainFeed` が
-        //     末尾を待たずに抜け、**発話の末尾が認識器へ届かない**
-        //   - 同じ理由で `withTimeout` が常に nil を返し、**整形が必ず縮退する**
-        //   - `PasteboardInserter` の復元待ち（120 ms）が 0 になり、**⌘V が処理される
-        //     前にクリップボードを戻して発話を失う**（Task 8 が潰した欠陥の再発）
-        //
-        // 非構造化タスクはキャンセルを継承しない（実測で確認）。`Task<Void, Never>` の
-        // `value` は待つ側がキャンセルされても早く返らないので、直列性も保たれる。
-        await Task { [self] in
+        completionTask = Task { [self] in
             await completeUtterance(cancelled: cancelled, releasedAt: releasedAt)
-        }.value
+        }
     }
 
     private func completeUtterance(cancelled: Bool, releasedAt: ContinuousClock.Instant) async {
         let textDeadline = releasedAt + finalizeDeadline
+        // **設定はここで 1 度だけ写し取る。** 整形と履歴で別々に読み直すと、
+        // 発話の途中で設定が変わったときに 1 発話へ 2 つの設定が混ざる。
+        let current = settings.settings
         emit(.finalizing)
 
         // 1. タップを外す。`removeTap` の端数バッファとリサンプラの drain 出力
@@ -404,14 +471,9 @@ public actor DictationSession {
             return
         }
 
-        guard !cancelled else {
-            // 基本設計書 §4: 中断でも録音済み内容は破棄せず履歴へ残す。
-            // 挿入はしていないので `.notInserted` で記録する。整形もしていないので
-            // `refinedText` は nil、したがって Undo の対象にもならない。
-            if !raw.isEmpty {
-                record(raw: raw, refined: nil, method: .notInserted)
-            }
-            finishIdle()
+        // 解放時に中断だった場合と、確定を待つ間に ESC が届いた場合の両方をここで受ける。
+        guard !cancelled, !isCancelRequested else {
+            finishCancelled(raw: raw, locale: current.localeIdentifier)
             return
         }
 
@@ -423,7 +485,6 @@ public actor DictationSession {
         // --- 整形（失敗・超過時は生テキストへ縮退）
         emit(.refining)
         let refineStart = ContinuousClock.now
-        let current = settings.settings
         let refined: String? = current.refinementEnabled
             ? await refiner.refine(
                 raw, locale: current.locale, terms: vocabulary.terms,
@@ -431,7 +492,16 @@ public actor DictationSession {
             : nil
         let refine = ContinuousClock.now - refineStart
 
+        // 整形は実測で 350〜750 ms 掛かる。**その間に押された ESC はまだ間に合う。**
+        guard !isCancelRequested else {
+            finishCancelled(raw: raw, locale: current.localeIdentifier)
+            return
+        }
+
         // --- 挿入
+        //
+        // **直上が最後の中断点である。ここから後で `isCancelRequested` を読まないこと**
+        // （`requestCancel()` の注記。読むと ⌘V の後で止まって発話が消える）。
         emit(.inserting)
         let insertStart = ContinuousClock.now
         let outcome = await inserter.insert(refined ?? raw)
@@ -448,17 +518,30 @@ public actor DictationSession {
         // `recordableMethod` が nil を返すのがその一手間で、ここを素通りさせると
         // パスワードが `history.json` へ平文で入る。
         if let method = outcome.recordableMethod {
-            record(raw: raw, refined: refined, method: method)
+            record(raw: raw, refined: refined, locale: current.localeIdentifier, method: method)
         }
 
         finishIdle()
     }
 
-    private func record(raw: String, refined: String?, method: InsertionMethod) {
+    /// 中断された発話の後始末。
+    ///
+    /// 基本設計書 §4: 中断でも録音済み内容は破棄せず履歴へ残す。挿入はしていないので
+    /// `.notInserted` で記録する。**整形結果は残さない。** `refinedText` を入れると
+    /// `undoCandidate` の条件（`refinedText != nil`）を満たしてしまい、
+    /// **一度も挿入していない文字列を「戻せる」ことになる。**
+    private func finishCancelled(raw: String, locale: String) {
+        if !raw.isEmpty {
+            record(raw: raw, refined: nil, locale: locale, method: .notInserted)
+        }
+        finishIdle()
+    }
+
+    private func record(raw: String, refined: String?, locale: String, method: InsertionMethod) {
         try? history.append(
             HistoryEntry(
                 rawText: raw, refinedText: refined,
-                localeIdentifier: settings.settings.localeIdentifier, insertionMethod: method
+                localeIdentifier: locale, insertionMethod: method
             )
         )
     }
@@ -518,7 +601,12 @@ public actor DictationSession {
     }
 
     /// 前の発話の `finish()` が終わるのを待つ。
-    /// **挿入のあと（＝ユーザーから見えるクリティカルパスの外）で呼ぶ。**
+    ///
+    /// - Important: **実際の呼び出し位置は次の押下の直後**（`startRecording()` の頭）であり、
+    ///   そこは M1a（キー押下 → タップ武装、NFR-P1 の 50 ms）の計測区間の中である。
+    ///   通常は前の発話の挿入が終わるまでに `finish()` も終わっているので 0 ms だが、
+    ///   **Task 7 が実測した M1a にはこの待ちが入っていない。**
+    ///   ここを動かすときは M1a を測り直すこと。
     private func drainFinalizeTask() async {
         guard let finalizeTask else { return }
         self.finalizeTask = nil
@@ -540,6 +628,7 @@ public actor DictationSession {
         finalDeadlineTask = nil
         collectTask = nil
         isAwaitingFinal = false
+        isCancelRequested = false
         phase = .idle
         emit(.idle)
     }
