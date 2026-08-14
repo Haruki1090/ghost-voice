@@ -318,7 +318,41 @@ public struct SystemAccessibility: AccessibilityProbing {
     ///
     /// `kCGWindowLayer == 0` は通常のアプリケーションウィンドウを指す。メニューバーや
     /// カーソルなどは別のレイヤに載るので、それらを飛ばして最初に見つかったものを返す。
-    static func frontmostProcessIdentifier() -> pid_t? {
+    ///
+    /// ## 何のために公開しているか
+    ///
+    /// **「挿入先がどこになるか」を、挿入する前に知るためである。**
+    /// この規則はプロセス全体でここ 1 箇所にしかなく、`focusedElement()` は
+    /// **必ずこれを通って**挿入先のアプリを決める。したがって
+    /// **「いま挿入したらどこへ入るか」を問うには、これを呼ぶしかない。**
+    ///
+    /// 実際の呼び出し側は `GhostVoiceApp` の `AppWindow.dismissAndReturnFocus` である。
+    /// 設定・履歴の窓を閉じた後、**この値が自分の pid でなくなるまで待ってから**
+    /// 再挿入する（待たないと再挿入が Ghost Voice 自身の窓へ入る）。
+    /// 待つ側が別の規則（`NSApp.isActive` / `NSWorkspace.frontmostApplication`）を
+    /// 使うと**原理的に足りない**——それらは活性の帳簿であって、
+    /// この規則が読む window server の窓の並びとは 24〜32 ms ずれる（詳細設計書 §13 の V-43）。
+    ///
+    /// ## 呼び出し側が仮定してよいこと / してはいけないこと
+    ///
+    /// - **仮定してよい**: 返り値は `focusedElement()` が挿入先として名指しするのと
+    ///   **同一の pid** である（同じ関数を呼んでいる）。
+    /// - **仮定してよい**: 副作用も内部状態も持たない。何度呼んでもよく、順序も問わない。
+    /// - **仮定してよい**: TCC の許可を要さない。ウィンドウ名を読まないので
+    ///   画面収録の許可も要らない（`focusedElement()` の注記）。
+    /// - **仮定してはいけない**: 「返った pid が次の瞬間もまだ最前面である」こと。
+    ///   これは**その瞬間の観測**であって予約ではない。呼んでから挿入するまでの間に
+    ///   利用者が窓を切り替えれば挿入先は変わる。
+    /// - **仮定してはいけない**: `nil` が異常であること。`nil` は「`kCGWindowLayer == 0`
+    ///   の窓が画面に 1 つも無い」であり、**正常に起こりうる**（全アプリを隠した状態など）。
+    ///   `nil` のとき `focusedElement()` も `nil` を返す——つまり**挿入先が自分になることは
+    ///   ない**ので、「自分でなくなるのを待つ」用途では `nil` は成立とみなしてよい。
+    ///
+    /// - Note: **1 プロセスの最初の 1 回だけ約 38〜52 ms 掛かる**（window server との
+    ///   接続の確立。実測 2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2）。
+    ///   2 回目以降は 0.3〜1.1 ms（n=1500 / p50 0.65 ms / p95 1.05 ms）。
+    ///   **窓を出したことのあるプロセスでは接続が既にあるので、この初回費用は掛からない。**
+    public static func frontmostProcessIdentifier() -> pid_t? {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
             as? [[String: Any]]

@@ -109,10 +109,66 @@ struct HistoryViewModelTests {
             store: HistoryStore(rootURL: temp.url, limit: 10), output: output)
 
         let outcome = await model.reinsert(
-            makeHistoryEntry(rawText: "なま", refinedText: "整形済み"), field: .inserted)
+            makeHistoryEntry(rawText: "なま", refinedText: "整形済み"), field: .inserted,
+            focus: .returned)
 
         #expect(outcome == .reinserted(.ax))
         #expect(output.insertedTexts == ["整形済み"])
+    }
+
+    // MARK: - 前面が戻らなかったとき（待ちの上限に達した場合の振る舞い）
+
+    /// **待ちの上限に達したら、挿入しない。**
+    ///
+    /// 最前面がまだ Ghost Voice のまま挿入すると、**挿入先が Ghost Voice 自身になる**
+    /// （`SystemAccessibility.frontmostProcessIdentifier()` が挿入先を決める）。
+    /// そのとき Pasteboard 経路まで落ちると、**⌘V はどこにも刺さらないうえに
+    /// 300 ms 後にクリップボードが元へ戻される**——テキストの行き先が 1 つも残らない。
+    /// **だから挿入をやめ、代わりにクリップボードへ置く。**
+    @Test("前面が戻らなかったら挿入せず、クリップボードへ置く")
+    func abandonsReinsertionWhenFocusNeverCameBack() async throws {
+        let temp = try SettingsHistoryTempDirectory()
+        let output = HistoryTextOutputSpy(outcome: .inserted(.ax))
+        let model = HistoryViewModel(
+            store: HistoryStore(rootURL: temp.url, limit: 10), output: output)
+
+        let outcome = await model.reinsert(
+            makeHistoryEntry(rawText: "なま", refinedText: "整形済み"), field: .inserted,
+            focus: .notReturned)
+
+        #expect(outcome == .reinsertAbandoned(copied: true))
+        // **1 文字も挿入していない。** ここが要点である。
+        #expect(output.insertedTexts.isEmpty, "前面が戻っていないのに挿入している")
+        #expect(output.copiedTexts == ["整形済み"])
+    }
+
+    /// **どこにあるかを必ず言う。** 「挿入しませんでした」だけでは、
+    /// 利用者はテキストが消えたと読む。
+    @Test("挿入をやめたときは、テキストがどこにあるかを言う")
+    func saysWhereTheTextIsWhenItGivesUp() {
+        let copied = HistoryViewModel.ActionOutcome.reinsertAbandoned(copied: true)
+        #expect(copied.message.contains("クリップボード"))
+        #expect(copied.message.contains("履歴"))
+        // クリップボードへ入っており、履歴にも残っている。**失われていないので赤くしない。**
+        #expect(copied.isFailure == false)
+
+        let notCopied = HistoryViewModel.ActionOutcome.reinsertAbandoned(copied: false)
+        // クリップボードにも入らなかった場合、**残る出口は履歴だけ**である。
+        #expect(notCopied.message.contains("履歴"))
+        #expect(notCopied.isFailure, "唯一の出口が履歴だけになったことを黙って通している")
+    }
+
+    @Test("クリップボードへも置けなければ、そのことも言う")
+    func reportsWhenEvenTheClipboardFailed() async throws {
+        let temp = try SettingsHistoryTempDirectory()
+        let output = HistoryTextOutputSpy(outcome: .inserted(.ax), copySucceeds: false)
+        let model = HistoryViewModel(
+            store: HistoryStore(rootURL: temp.url, limit: 10), output: output)
+
+        let outcome = await model.reinsert(makeHistoryEntry(), field: .inserted, focus: .notReturned)
+
+        #expect(outcome == .reinsertAbandoned(copied: false))
+        #expect(output.insertedTexts.isEmpty)
     }
 
     @Test("secure input による拒否は、**失敗ではなく拒否として**出す")
@@ -122,7 +178,7 @@ struct HistoryViewModelTests {
         let model = HistoryViewModel(
             store: HistoryStore(rootURL: temp.url, limit: 10), output: output)
 
-        let outcome = await model.reinsert(makeHistoryEntry(), field: .inserted)
+        let outcome = await model.reinsert(makeHistoryEntry(), field: .inserted, focus: .returned)
 
         #expect(outcome == .reinsertRefusedSecureInput)
         #expect(outcome.isFailure == false, "赤く出すと「発話を失った」と読まれる")
@@ -138,7 +194,7 @@ struct HistoryViewModelTests {
 
         let cancelled = makeHistoryEntry(
             rawText: "中断した発話", refinedText: nil, method: .notInserted)
-        let outcome = await model.reinsert(cancelled, field: .inserted)
+        let outcome = await model.reinsert(cancelled, field: .inserted, focus: .returned)
 
         #expect(outcome == .reinserted(.ax))
         #expect(output.insertedTexts == ["中断した発話"])

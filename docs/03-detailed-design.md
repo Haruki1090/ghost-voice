@@ -1605,7 +1605,7 @@ notch 非搭載の内蔵ディスプレイの実測（該当機が手元に無�
 
 **`NSApp.run()` を呼ぶ前に window を `orderFrontRegardless()` すると、AppKit が `finishLaunching` の時点でアプリを活性化する。**
 `setActivationPolicy(.accessory)` を先に呼んでいても起きる。**`.nonactivatingPanel` でも `canBecomeKey == false` でも防げない**（アプリごと前面に出るため）。
-活性化すると `AccessibilityInserter.frontmostProcessIdentifier()` が拾う最前面 pid が Ghost Voice 自身になり、**挿入先が壊れる**（§6.2）。
+活性化すると `SystemAccessibility.frontmostProcessIdentifier()` が拾う最前面 pid が Ghost Voice 自身になり、**挿入先が壊れる**（§6.2）。
 
 → **「起動時に非表示の HUD を用意しておく」実装にしてはならない。** 生成も表示も `run()` の後に行う。
 
@@ -1688,7 +1688,7 @@ notch 非搭載の内蔵ディスプレイの実測（該当機が手元に無�
 
 #### フォーカスを奪わないことの実測（2026-08-15 / 実装した HUD で / MacBook Pro Mac15,3 / M3 / macOS 26.5.2）
 
-`AccessibilityInserter.frontmostProcessIdentifier()` とまったく同じ規則（`CGWindowListCopyWindowInfo(.optionOnScreenOnly, .excludeDesktopElements)` の `kCGWindowLayer == 0` の最前面 pid）で、**起動前・HUD 表示中・終了後を 0.25 秒ごとに観測した**（`--hud-check`。セッションを作らないので TCC には一切触れていない）。
+`SystemAccessibility.frontmostProcessIdentifier()` とまったく同じ規則（`CGWindowListCopyWindowInfo(.optionOnScreenOnly, .excludeDesktopElements)` の `kCGWindowLayer == 0` の最前面 pid）で、**起動前・HUD 表示中・終了後を 0.25 秒ごとに観測した**（`--hud-check`。セッションを作らないので TCC には一切触れていない）。
 
 ```
 === 起動前 ===        frontmost(layer0) pid=85997 name=Google Chrome
@@ -2953,7 +2953,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-40 | **ディスプレイの抜き差しで HUD が付いていくか** | HUD の実機確認時 | **未実施。** `NSApplication.didChangeScreenParametersNotification` を購読して再配置する実装は入れてあるが、**通知が実際に来ることを確かめていない**（抜き差しの操作が要る）。来なければ HUD が古い座標に出続けるだけで、**挿入は壊れない。** 外部ディスプレイを抜き差しし、内蔵の切り欠きに出続けることを見る |
 | V-41 | **notch 非搭載の内蔵ディスプレイでの表示先** | 該当機が手に入ったとき | **未実施。手元に機体が無い**（MacBook Air M1 / Intel 機 / 13" MBP）。**コード上は防御済み**——`CGDisplayIsBuiltin` で内蔵を選び、`auxiliaryTop*Area` が nil なのでメニューバー直下へ倒れる（代役での検査あり。`HUDPlacementTests`）。ただし**代役の値は推測であり、実機が同じ値を返すことは確かめていない** |
 | V-42 | **設定画面で打鍵を捕まえられるか。`HotkeyMonitor` の `CGEventTap` と干渉しないか** | 打鍵捕獲の実装時 | **実装済み・一部実測（2026-08-15 / 配線トラック）。** 裁定どおり **2 本目のタップを立てず、既存の監視器を「捕獲モード」へ入れた**（§2.6）。**干渉しないことは構造で保証されている**——捕獲モードのイベントは `HotkeyDecision.decide` を 1 度も通らないので、**捕獲中に PTT / Undo / ESC の中断が発火しえない**（合成イベントで本物の `handle` を通す検査が固定）。**残る未実測は実キーボードでの捕獲そのもの**（`CGEvent.tapCreate` が通ることが要る。V-4 と同じ制約）: ①修飾キー単独（右 Option）を離した瞬間に捕まるか、②⌃⌘Z のような組が捕まるか、③捕獲中に他アプリへ打鍵が漏れないか。手順は [README](../README.md) の「設定画面（フェーズ 2 / FR-11）」 |
-| V-43 | **窓を閉じてから前面が戻るまでの待ち方** | 履歴からの再挿入の配線時 | **実測して答えが出た（2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2 / n=3）。`didResignActiveNotification` では足りない。** `NSApp.hide(nil)` の直後には `NSApp.isActive` が既に false であり（通知は 1 度も来ない＝待った気になるだけ）、**それでもなお `kCGWindowLayer == 0` の最前面は 24〜32 ms のあいだ Ghost Voice のままだった。** `NSWorkspace.shared.frontmostApplication` も同じく即座に切り替わるので使えない——**遅れているのは活性の帳簿ではなく window server の窓の並びである。** 対処: 活性の切り替えを待ったうえで **150 ms の整定**を置いた（`AppWindow.frontmostSettle`。**決めごとであって要件値ではない**。観測した最大の約 5 倍）。**残る未実測: 負荷下での入れ替わり時間の分布**（n=3 は低負荷）。外れても失うのは再挿入 1 回であり、発話は失われない（履歴からコピーで取り出せる） |
+| V-43 | **窓を閉じてから前面が戻るまでの待ち方** | 履歴からの再挿入の配線時 | **実測して答えが出た。時間で待つのをやめ、事実で待つ形にした（2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2 / 内蔵ディスプレイのみ）。** ①**活性を見る実装では原理的に足りない**: `NSApp.hide(nil)` の直後には `NSApp.isActive` が既に false（`didResignActiveNotification` は 1 度も来ない＝待った気になるだけ）、`NSWorkspace.shared.frontmostApplication` も 0 ms で切り替わる。**それでもなお `kCGWindowLayer == 0` の最前面は 24〜32 ms のあいだ Ghost Voice のままだった**（n=3）——**遅れているのは活性の帳簿ではなく window server の窓の並びである。** ②**そこで挿入先の判定そのものを待つ**: `SystemAccessibility.frontmostProcessIdentifier()` を `public` にし（トラック D2 の申し送り 1）、**その値が自分の pid でなくなるまで 4 ms 間隔で照会する**（`AppWindow.waitUntilAnotherAppIsFrontmost`）。**150 ms の整定（`frontmostSettle`）は削除した**——あれは決めごとで、実測の上限ではなかった。③**やり直した実測**: `--window-check` で設定・履歴の窓を閉じてから決着するまで、**静穏時 16 / 17 / 21 / 17 / 19 / 22 ms（3 回・6 事象）、負荷下 17 / 15 / 16 / 12 ms（2 回・4 事象。load average 10.6〜24.5）。10 事象すべて `.returned` で、上限には 1 度も達していない。** 外の観測器（同じ規則で 4 ms 間隔）は、子が「戻った」と判定した 1〜4 ms 後に同じ入れ替わりを観測しており、**判定が事実より早く出ていないことが外から裏付けられている。** **負荷下は遅くならなかった**（事実を待つので、遅い機体でも待ちが伸びるだけである）。④**上限は 600 ms**（`frontmostHandbackTimeout`。**決めごと**。観測した最大 22 ms の約 27 倍）。**上限に達したら再挿入しない**——挿入先が Ghost Voice 自身になり、AX は自プロセスを弾き、Pasteboard 経路は ⌘V がどこにも刺さらないまま 300 ms 後にクリップボードを戻すので**行き先が 1 つも残らない。** 代わりにクリップボードへ退避し、**テキストがどこにあるかを告げる**（`ActionOutcome.reinsertAbandoned`。**発話はクリップボードと履歴の両方に残る**）。**残る未実測: 上限に達する経路そのもの**（10 事象で 1 度も再現していない。振る舞いは検査 `FrontmostHandbackTests.givesUpAtTheBound` / `HistoryViewModelTests` で固定してある） |
 | V-44 | **`NSApp.hide(nil)` で前面が確実に戻るか** | 設定／履歴の窓を配線した後 | **実測して達成（2026-08-15 / 同上）。戻る。** `--window-check` で設定 → 履歴の順に開閉し、`kCGWindowLayer == 0` の最前面 pid を 4 ms 間隔で追った。**窓を出していない区間では 2,451 回の観測で 1 度も奪っていない**（HUD は layer 26）。**窓を開いた区間では意図どおり Ghost Voice が最前面になり、閉じると元のアプリ（起動前と同じ pid）へ戻った。** `--hud-check`（HUD を実際に表示した状態）でも **1,488 回で奪取 0 回。** **ただし戻るまでの遅れがある**（V-43）。**残る未実測: 実バンドル（`Ghost Voice.app`）での確認**——素の実行ファイルで測った |
 
 ---
@@ -3057,6 +3057,21 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 - **再挿入は窓を閉じて前面が戻ってから行う。** 窓が前面のままだと挿入先が
   Ghost Voice 自身になる。`HistoryView` は**閉じる口を渡されないと再挿入のボタンを
   出さない**——順序の間違いを構造で防ぐため。
+- **「前面が戻ったか」は時間ではなく事実で判定する。** 待つ相手は
+  **挿入先を決めるのとまったく同じ規則**（`SystemAccessibility.frontmostProcessIdentifier()`
+  ＝ `kCGWindowLayer == 0` の最前面 pid）であり、**それが自分の pid でなくなるまで
+  4 ms 間隔で照会する**（`AppWindow.waitUntilAnotherAppIsFrontmost`。実測 12〜22 ms / n=10。V-43）。
+  **活性（`NSApp.isActive` / `NSWorkspace.frontmostApplication`）を見る実装では原理的に足りない**
+  ——活性の帳簿は 0 ms で切り替わるが、window server の窓の並びは 24〜32 ms 遅れる。
+- **上限は 600 ms（決めごと）。上限に達したら再挿入しない。**
+  そこで進んでも挿入先は Ghost Voice 自身であり、**AX は自プロセスを弾き、Pasteboard 経路は
+  ⌘V がどこにも刺さらないまま 300 ms 後にクリップボードを元へ戻す**
+  ——つまり**「挿入しました」と出しながらテキストの行き先が 1 つも残らない。**
+  代わりに**クリップボードへ退避し、テキストがどこにあるかを告げる**
+  （`ActionOutcome.reinsertAbandoned`）。**発話はクリップボードと履歴の両方に残る。**
+  クリップボードへも置けなかった場合は**残る出口が履歴だけであることを告げ、失敗として赤く出す。**
+- **`reinsert` の `focus` 引数に既定値を置かない。** 置くと「待ったかどうか」を言わずに
+  挿入でき、順序の間違いが型で防げなくなる（`FocusHandback`）。
 - 履歴画面が使う挿入器は、発話の挿入に使うものとは**別のインスタンス**である
   （世代を共有しない）。したがって**再挿入は差し替えの錨を作らず、Undo の対象にならない。**
   再挿入は「もう一度打ち直す」操作であって発話の続きではない。
@@ -3102,7 +3117,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 内容 | 結果 | 採番 |
 |---|---|---|
 | **設定画面で打鍵を捕まえられるか。`CGEventTap` と干渉しないか** | **干渉しない形で実装した**（§2.6）。2 本目のタップを立てず、捕獲モードのイベントは `HotkeyDecision.decide` を 1 度も通らない——**捕獲中に PTT / Undo / ESC の中断が発火しえない。** 残るのは実キーボードでの捕獲そのもの（`CGEvent.tapCreate` が通ることが要る） | **V-42** |
-| **窓を閉じてから前面が戻るまでの待ち方** | **`didResignActiveNotification` では足りなかった。** `NSApp.hide(nil)` の直後には既に非活性で通知が来ず、**それでも最前面は 24〜32 ms のあいだ Ghost Voice のままだった。** 活性を待つ実装は「待った気になるだけ」だった。150 ms の整定で埋めてある | **V-43** |
+| **窓を閉じてから前面が戻るまでの待ち方** | **`didResignActiveNotification` では足りなかった。** `NSApp.hide(nil)` の直後には既に非活性で通知が来ず、**それでも最前面は 24〜32 ms のあいだ Ghost Voice のままだった。** 活性を待つ実装は「待った気になるだけ」だった。**いまは挿入先の判定（`SystemAccessibility.frontmostProcessIdentifier()`）を 4 ms 間隔で直接見て待つ。時間の整定は置いていない**（実測 12〜22 ms / n=10 / 静穏・負荷下とも） | **V-43** |
 | **`NSApp.hide(nil)` で前面が確実に戻るか** | **戻る。** `--window-check` で 4 ms 間隔の観測。窓を出していない区間は 2,451 回で奪取 0 回、閉じた後は起動前と同じアプリへ戻った | **V-44** |
 
 #### 14.6.0 「キー監視を開始できなかった」を誰が言うか（HUD と設定画面の棲み分け）
@@ -3129,7 +3144,8 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 開く口は `NSStatusItem` のメニュー | 設定… / 履歴… / 終了。**`LSUIElement = true` なのでここが唯一の入口である** |
 | `RunLoopEntry` を受け取ってから窓を作る | `AppWindow` が鍵を要求する。**さらに、窓は利用者がメニューを選んだ瞬間に作る**（`AppSurface` の doc が「起動時に非表示の window を用意しておく実装は禁止」と定めているため） |
 | 開くときは `NSApp.activate()`、閉じたら `NSApp.hide(nil)` | `AppWindow.present()` / `windowWillClose` / `dismissAndReturnFocus` |
-| 再挿入は窓を閉じて前面が戻ってから | `HistoryView` へ閉じる口を渡す。**渡さなければボタンが出ない**設計はそのまま |
+| 再挿入は窓を閉じて前面が戻ってから | `HistoryView` へ閉じる口を渡す。**渡さなければボタンが出ない**設計はそのまま。**閉じる口は「前面が戻ったか」を返し**（`FocusHandback`）、それを `reinsert(_:field:focus:)` へそのまま渡す——`StatusMenuSurface` 側で判断しない |
+| 窓が無い / 自身が既に解放されている場合 | **`.notReturned` へ倒す。**「戻ったことを確かめられなかった」を「戻った」と読み替えると挿入先が Ghost Voice 自身になる |
 
 **`makeKeyAndOrderFront` を使ってよいのは `AppWindow` だけ**であり、HUD で使うことは
 ソース走査で禁じてある（`HUDWindowContractTests`）。**HUD とこの窓は要件が正反対である**——

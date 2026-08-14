@@ -13,7 +13,7 @@ import GhostVoiceCore
 /// `setActivationPolicy(.accessory)` を先に呼んでいても、`.nonactivatingPanel` でも、
 /// `canBecomeKey == false` でも防げない（フェーズ 2 事前調査 `core-api-and-hud.md` B-3 の実測）。
 ///
-/// 活性化すると `AccessibilityInserter.frontmostProcessIdentifier()` が拾う最前面 pid が
+/// 活性化すると `SystemAccessibility.frontmostProcessIdentifier()` が拾う最前面 pid が
 /// **Ghost Voice 自身**になり、**挿入先が壊れる。**
 ///
 /// したがって「起動時に非表示の window を用意しておく」実装は禁止である。

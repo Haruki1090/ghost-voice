@@ -150,7 +150,8 @@ public final class StatusMenuSurface: NSObject, AppSurface {
                     // **これが「閉じる口」である。** 渡さないと `HistoryView` は
                     // 再挿入のボタンを出さない（順序の間違いを構造で防ぐ設計。§14.4）。
                     dismissAndReturnFocus: { [weak self] in
-                        await self?.dismissHistoryAndReturnFocus()
+                        // **self が居なければ「戻った」と言えない。** 安全側へ倒す。
+                        await self?.dismissHistoryAndReturnFocus() ?? .notReturned
                     }),
                 onClose: {})
         historyWindow = window
@@ -160,10 +161,14 @@ public final class StatusMenuSurface: NSObject, AppSurface {
     /// **再挿入の直前に呼ばれる。** 窓を閉じ、前面が戻るまで待つ。
     ///
     /// 待たずに挿入すると、挿入先が Ghost Voice 自身になる
-    /// （`AccessibilityInserter.frontmostProcessIdentifier()`）。
-    /// **待ち方そのものは未実測項目である**（正本 §13 の V-43 / V-44）。
-    private func dismissHistoryAndReturnFocus() async {
-        await historyWindow?.dismissAndReturnFocus()
+    /// （`SystemAccessibility.frontmostProcessIdentifier()`）。
+    /// **待ち方は実測済みで、挿入先の判定そのものを見て待つ**（正本 §13 の V-43）。
+    ///
+    /// - Returns: 前面が戻ったか。**窓が無い（＝開かれていない・畳まれた後）ときは
+    ///   `.notReturned` に倒す。** 「戻ったことを確かめられなかった」を
+    ///   「戻った」と読み替えると、挿入先が Ghost Voice 自身になりうる。
+    private func dismissHistoryAndReturnFocus() async -> FocusHandback {
+        await historyWindow?.dismissAndReturnFocus() ?? .notReturned
     }
 
     @objc private func quit() {
@@ -204,7 +209,11 @@ extension StatusMenuSurface: WindowRehearsing {
             self?.openHistory()
             try? await Task.sleep(for: step)
             AppDiagnostics.note("[--window-check] 履歴画面を閉じて前面を返します（再挿入の直前と同じ経路）。")
-            await self?.dismissHistoryAndReturnFocus()
+            // **決着を必ず出す。** V-43 の実測はこの 1 行を読む。
+            let handback = await self?.dismissHistoryAndReturnFocus() ?? .notReturned
+            AppDiagnostics.note(
+                "[--window-check] 再挿入の可否: "
+                    + (handback == .returned ? "挿入してよい（前面が戻った）" : "挿入しない（前面が戻らなかった）"))
 
             try? await Task.sleep(for: step)
             AppDiagnostics.note("[--window-check] 終了します。")

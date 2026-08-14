@@ -9,7 +9,7 @@ import Observation
 /// | 何を | どう |
 /// |---|---|
 /// | 開く口 | **ステータス項目（`NSStatusItem`）のメニューの「設定…」。** `LSUIElement = true` なので Dock も標準のアプリメニューも無い（正本 §10）。⌘, は窓が前面のときだけ効く |
-/// | 窓 | `NSWindow` + `NSHostingView(rootView: SettingsView(model:))`。**`AppSurface` の実装が `RunLoopEntry` を受け取ってから作ること**（`AppSurface.swift`。`NSApp.run()` の前に窓を作るとアプリが活性化し、`AccessibilityInserter.frontmostProcessIdentifier()` が Ghost Voice 自身を拾って**挿入先が壊れる**） |
+/// | 窓 | `NSWindow` + `NSHostingView(rootView: SettingsView(model:))`。**`AppSurface` の実装が `RunLoopEntry` を受け取ってから作ること**（`AppSurface.swift`。`NSApp.run()` の前に窓を作るとアプリが活性化し、`SystemAccessibility.frontmostProcessIdentifier()` が Ghost Voice 自身を拾って**挿入先が壊れる**） |
 /// | 前面 | **開くときは `NSApp.activate()` してよい**（利用者が能動的に開く画面なので）。**閉じたら `NSApp.hide(nil)` で前面を明示的に返すこと。** 返さないと、次の発話が Ghost Voice 自身へ挿入される |
 /// | HUD との関係 | **窓を共有しない。** HUD は `.nonactivatingPanel` で活性化を避ける設計であり、活性化してよいこの窓と要件が正反対である |
 /// | 寿命 | **ストアと同じ寿命の場所に置く**（`AppServices` を握る `AppSurface`）。作り直すと `loadFailure` の事実が消える（`StoreFileNotice.collect` の注記） |

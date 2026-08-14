@@ -13,7 +13,7 @@ import Testing
 struct HUDWindowContractTests {
 
     /// **`level == 0` にした瞬間に挿入先が Ghost Voice 自身になる。**
-    /// `AccessibilityInserter.frontmostProcessIdentifier()` は
+    /// `SystemAccessibility.frontmostProcessIdentifier()` は
     /// `kCGWindowLayer == 0` の最前面ウィンドウの pid を見る（実測 B-3 の結果 3）。
     @Test("ウィンドウレベルが 0 ではない")
     func levelIsNeverZero() {

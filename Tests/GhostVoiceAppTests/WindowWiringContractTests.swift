@@ -118,9 +118,24 @@ struct WindowWiringContractTests {
         // その口は、窓を閉じてから**前面が戻るのを待つ**。
         let window = try Self.text("Shell/Windows/AppWindow.swift")
         #expect(window.contains("waitUntilAnotherAppIsFrontmost"))
-        // **活性の切り替えを待つだけでは足りない**（実測: window server の窓の並びが
-        // 入れ替わるまで、さらに 24〜32 ms 掛かる）。整定時間を必ず置く。
-        #expect(window.contains("frontmostSettle"))
+        // **待つ根拠は挿入先の判定そのものである。** 時間ではなく事実で待つ。
+        #expect(
+            window.contains("SystemAccessibility.frontmostProcessIdentifier"),
+            "挿入先と同じ規則で待っていない")
+    }
+
+    /// **時間の決めごとで前面の復帰を待たない。**
+    ///
+    /// かつては「活性の切り替えを待ってから 150 ms の整定を置く」形だった
+    /// （`AppWindow.frontmostSettle`）。**あれは実測の上限ではなく決めごとで**、
+    /// 負荷下で外れれば再挿入が Ghost Voice 自身へ入る。
+    /// **挿入先の判定（`kCGWindowLayer == 0` の最前面 pid）を直接見れば、
+    /// 時間ではなく事実で判定できる**ので、整定は要らなくなった。
+    @Test("前面が戻るのを時間の整定で待っていない")
+    func doesNotWaitOnAFixedSettleTime() throws {
+        let window = try Self.text("Shell/Windows/AppWindow.swift")
+        let hits = Self.codeLines(window).filter { $0.text.contains("frontmostSettle") }
+        #expect(hits.isEmpty, "決めごとの整定が残っている: \(hits.map(\.line))")
     }
 
     /// **`didResignActiveNotification` を待つ形へ戻さない。**
@@ -141,7 +156,7 @@ struct WindowWiringContractTests {
     /// **規則を 2 つに増やさない。**
     ///
     /// 挿入先の判定（`kCGWindowLayer == 0` の最前面 pid）は
-    /// `AccessibilityInserter.frontmostProcessIdentifier()` が唯一の持ち主である。
+    /// `SystemAccessibility.frontmostProcessIdentifier()` が唯一の持ち主である。
     /// App 側で `CGWindowListCopyWindowInfo` を書くと、**2 つの「最前面」が生まれる。**
     @Test("App 側で最前面の判定を書き直していない")
     func frontmostRuleIsNotDuplicated() throws {
@@ -204,6 +219,116 @@ struct WindowWiringContractTests {
         let hits = Self.codeLines(source).filter { $0.text.contains("cancelCapture()") }
         // `teardown()` と、設定画面の `onClose`。
         #expect(hits.count == 2, "見つかった地点: \(hits.map(\.line))")
+    }
+}
+
+/// **窓を閉じてから再挿入するまでの待ち方**（正本 §13 の V-43）。
+///
+/// 待つ条件は「**挿入先の判定が Ghost Voice を指さなくなること**」であって、
+/// 時間ではない。ここでは判定の口を差し替えて、待ちの決着だけを決定的に確かめる。
+///
+/// - Important: **実時間を合否線にしていない**（`00-development-cycle.md` §5）。
+///   ①上限に達したことは「`.timedOut` が返る」で判定し、**経過時間そのものは一切見ない。**
+///   ②**戻る側の 3 件には、機体が飽和しても届かない上限（30 秒）を渡してある**——
+///   短い上限を渡すと、`poll` の眠りが伸びただけで「戻らなかった」に化けて
+///   **断続的に落ちる検査になる**（フェーズ 1 で 2 度、同じ形の未再現失敗が起きている）。
+///   ③**諦める側は逆向きに安全である**——機体が遅いほど確実に上限へ達する。
+@Suite("前面が戻るのを待つ")
+@MainActor
+struct FrontmostHandbackTests {
+
+    /// 決められた順で pid を返す偽の判定。
+    private final class FrontmostStub {
+        private var answers: [pid_t?]
+        private(set) var queries = 0
+        init(_ answers: [pid_t?]) { self.answers = answers }
+        func next() -> pid_t? {
+            queries += 1
+            // 尽きたら最後の答えを繰り返す（上限まで待つ検査で使う）。
+            return answers.count > 1 ? answers.removeFirst() : answers.first ?? nil
+        }
+    }
+
+    private static let own: pid_t = 4242
+    private static let other: pid_t = 99
+
+    /// **戻る側の検査に渡す上限。**
+    ///
+    /// これらの検査が見たいのは「照会の順序どおりに決着すること」であって、
+    /// **時間ではない。** 上限を短く取ると、他の検査と並行して機体が飽和したときに
+    /// `poll` の眠りが伸び、**結論が時計に決められて断続的に落ちる。**
+    /// **30 秒は「この検査では時計が結論を決めない」という宣言であり、要件値ではない。**
+    private static let unreachableTimeout: Duration = .seconds(30)
+
+    @Test("最初の照会で他アプリが最前面なら、待たずに戻る")
+    func returnsImmediatelyWhenFocusIsAlreadyElsewhere() async {
+        let stub = FrontmostStub([Self.other])
+        let outcome = await AppWindow.waitUntilAnotherAppIsFrontmost(
+            timeout: Self.unreachableTimeout, poll: .milliseconds(1),
+            ownProcessIdentifier: Self.own, frontmost: { stub.next() })
+
+        #expect(outcome.handedBack)
+        // **眠る前に 1 度は見る。** 見ないと、既に戻っている場合でも必ず 1 周期待つ。
+        #expect(stub.queries == 1)
+    }
+
+    @Test("最前面が自分のあいだは待ち、離れた時点で戻る")
+    func waitsWhileWeAreStillFrontmost() async {
+        let stub = FrontmostStub([Self.own, Self.own, Self.own, Self.other])
+        let outcome = await AppWindow.waitUntilAnotherAppIsFrontmost(
+            timeout: Self.unreachableTimeout, poll: .milliseconds(1),
+            ownProcessIdentifier: Self.own, frontmost: { stub.next() })
+
+        #expect(outcome.handedBack)
+        #expect(stub.queries == 4, "自分を指している間に抜けている")
+    }
+
+    /// `nil` は「`kCGWindowLayer == 0` の窓が 1 つも無い」であって異常ではない。
+    /// **そのとき挿入先も `nil` になる**（`focusedElement()` が同じ規則を通る）ので、
+    /// **「挿入先が自分になる」ことはありえない**——待つ理由が消える。
+    @Test("最前面の窓が 1 つも無い状態は、前面が戻ったものとして扱う")
+    func treatsAnEmptyWindowListAsHandedBack() async {
+        let stub = FrontmostStub([nil])
+        let outcome = await AppWindow.waitUntilAnotherAppIsFrontmost(
+            timeout: Self.unreachableTimeout, poll: .milliseconds(1),
+            ownProcessIdentifier: Self.own, frontmost: { stub.next() })
+
+        #expect(outcome.handedBack)
+    }
+
+    /// **事実で判定するとはいえ、永久には待たない。**
+    /// 何かの理由で前面が戻らないとき、ここで固まると履歴画面が操作不能になる。
+    @Test("前面が戻らなければ、上限で待つのをやめる")
+    func givesUpAtTheBound() async {
+        let stub = FrontmostStub([Self.own])
+        let outcome = await AppWindow.waitUntilAnotherAppIsFrontmost(
+            timeout: .milliseconds(20), poll: .milliseconds(1),
+            ownProcessIdentifier: Self.own, frontmost: { stub.next() })
+
+        // **経過時間そのものは見ない**（実時間を合否線にすると断続的に落ちる）。
+        #expect(!outcome.handedBack)
+        #expect(stub.queries >= 1, "1 度も照会せずに諦めている")
+    }
+
+    // MARK: - 決めごとの数値が、実測とどう繋がっているか
+
+    /// **照会の間隔は、待つ相手（入れ替わり 24〜32 ms）より十分細かいこと。**
+    /// 粗いと「事実で待つ」と言いながら答えが間隔に丸められる。
+    @Test("照会の間隔は、実測した入れ替わり時間より十分細かい")
+    func pollIsFinerThanTheObservedSwitch() {
+        // 24 ms は D2 が実測した最小の入れ替わり時間（n=3 / 32・26・24 ms）。
+        #expect(AppWindow.frontmostPoll * 4 <= .milliseconds(24))
+        // 1 回の照会の実測は p50 0.65 ms / p95 1.05 ms（n=1500）。
+        // **照会より短い間隔にすると、実質の busy loop になる。**
+        #expect(AppWindow.frontmostPoll >= .milliseconds(2))
+    }
+
+    /// **上限は、実測した入れ替わり時間よりずっと大きいこと。**
+    /// 近いと、普通に戻る場合まで「戻らなかった」と扱ってしまう。
+    @Test("待ちの上限は、実測した入れ替わり時間の桁を上回る")
+    func boundIsWellAboveTheObservedSwitch() {
+        // 32 ms は D2 が実測した最大の入れ替わり時間。
+        #expect(AppWindow.frontmostHandbackTimeout >= .milliseconds(320))
     }
 }
 

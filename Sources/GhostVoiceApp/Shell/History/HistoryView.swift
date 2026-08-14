@@ -13,13 +13,16 @@ public struct HistoryView: View {
     /// **`nil` なら再挿入のボタンを出さない。** 窓を閉じられない文脈で挿入すると、
     /// 挿入先が Ghost Voice 自身になる（`HistoryViewModel.reinsert` の注記）。
     /// **押せてしまう形にしないことで、順序の間違いを構造で防ぐ。**
-    private let dismissAndReturnFocus: (@MainActor () async -> Void)?
+    ///
+    /// **返り値は「前面が戻ったか」である。** 戻らなかったときは挿入しない
+    /// （`HistoryViewModel.reinsert(_:field:focus:)` がクリップボードへ退避する）。
+    private let dismissAndReturnFocus: (@MainActor () async -> FocusHandback)?
 
     @State private var confirmingDeleteAll = false
 
     public init(
         model: HistoryViewModel,
-        dismissAndReturnFocus: (@MainActor () async -> Void)? = nil
+        dismissAndReturnFocus: (@MainActor () async -> FocusHandback)? = nil
     ) {
         self.model = model
         self.dismissAndReturnFocus = dismissAndReturnFocus
@@ -110,9 +113,10 @@ public struct HistoryView: View {
                     Button("再挿入") {
                         Task {
                             // **窓を閉じて前面が戻ってから挿入する。** 順序が逆だと
-                            // 挿入先が Ghost Voice 自身になる。
-                            await dismissAndReturnFocus()
-                            await model.reinsert(entry, field: .inserted)
+                            // 挿入先が Ghost Voice 自身になる。**戻らなかったときは
+                            // 挿入せず、クリップボードへ退避する**（モデルが決める）。
+                            let focus = await dismissAndReturnFocus()
+                            await model.reinsert(entry, field: .inserted, focus: focus)
                         }
                     }
                 }

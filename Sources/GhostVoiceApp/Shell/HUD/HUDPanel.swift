@@ -9,7 +9,7 @@ import SwiftUI
 /// AppKit が `finishLaunching` の時点でアプリを**活性化する**。
 /// `setActivationPolicy(.accessory)` を先に呼んでいても、`.nonactivatingPanel` でも、
 /// `canBecomeKey == false` でも防げない（`core-api-and-hud.md` B-3 の実測）。
-/// 活性化すると `AccessibilityInserter.frontmostProcessIdentifier()` が拾う最前面 pid が
+/// 活性化すると `SystemAccessibility.frontmostProcessIdentifier()` が拾う最前面 pid が
 /// **Ghost Voice 自身**になり、**挿入先が壊れる。**
 ///
 /// **禁止を注意書きではなく構造で守る。** この型を作れるのは `RunLoopEntry` を

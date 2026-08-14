@@ -20,7 +20,7 @@ public enum HUDWindowContract {
     /// | マイク／カメラのプライバシーインジケータ（緑ドット） | 2147483630 |
     /// | `.maximumWindow` | 2147483631 |
     ///
-    /// - Important: **0 にしてはならない。** `AccessibilityInserter.frontmostProcessIdentifier()`
+    /// - Important: **0 にしてはならない。** `SystemAccessibility.frontmostProcessIdentifier()`
     ///   は `kCGWindowLayer == 0` の最前面ウィンドウの pid を見る。0 にした瞬間、
     ///   **挿入先が Ghost Voice 自身になる。**
     /// - Important: **`.maximumWindow` は採らない。** 緑ドット（2147483630）より前面に出てしまい、

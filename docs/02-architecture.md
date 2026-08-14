@@ -490,7 +490,7 @@ M2 が 177 ms、M4 の予算が NFR-P5 の 50 ms なので、整形に割ける�
 >
 > **`NSApp.run()` の前に window を `orderFrontRegardless()` すると、AppKit が `finishLaunching` の時点でアプリを活性化する**（実測）。
 > `setActivationPolicy(.accessory)` を先に呼んでいても、`.nonactivatingPanel` でも、`canBecomeKey == false` でも防げない。
-> 活性化すると `AccessibilityInserter.frontmostProcessIdentifier()` が拾う最前面 pid が Ghost Voice 自身になり、**挿入先が壊れる。**
+> 活性化すると `SystemAccessibility.frontmostProcessIdentifier()` が拾う最前面 pid が Ghost Voice 自身になり、**挿入先が壊れる。**
 > したがって「起動時に非表示の HUD を用意しておく」実装にしてはならない。詳細設計書 §7.2。
 
 ### 8.1.1 内蔵ディスプレイが存在しない構成（クラムシェル）

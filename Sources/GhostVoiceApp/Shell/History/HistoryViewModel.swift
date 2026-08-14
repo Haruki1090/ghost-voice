@@ -18,6 +18,22 @@ public enum HistoryTextField: Sendable, Equatable, CaseIterable {
     }
 }
 
+/// **窓を閉じたあと、前面が Ghost Voice から離れたか**（FR-9 の再挿入の前提）。
+///
+/// 再挿入は「そのとき最前面にある窓」へ書く。**まだ Ghost Voice が最前面なら、
+/// 挿入先は Ghost Voice 自身になる。** 提示側（`AppWindow.dismissAndReturnFocus`）が
+/// 挿入先の判定（`SystemAccessibility.frontmostProcessIdentifier()`）そのものを見て
+/// 待ち、その決着をこの値で渡す。
+///
+/// - Important: **`reinsert` の引数に既定値を置いていない。** 置くと
+///   「待ったかどうか」を言わずに挿入できてしまい、順序の間違いが型で防げなくなる。
+public enum FocusHandback: Sendable, Equatable {
+    /// 最前面が Ghost Voice でなくなった。**挿入してよい。**
+    case returned
+    /// 上限まで待っても最前面が Ghost Voice のままだった。**挿入してはならない。**
+    case notReturned
+}
+
 /// 挿入経路の集計（検証項目 V-3 の実地データ）。
 ///
 /// - Important: **`.notInserted` は分母に入れない。** ESC で中断された発話は
@@ -61,7 +77,7 @@ public struct InsertionMethodTally: Sendable, Equatable {
 /// | 開く口 | **ステータス項目（`NSStatusItem`）のメニューの「履歴…」。** 設定画面と同じ場所に並べる |
 /// | 窓 | `NSWindow` + `NSHostingView(rootView: HistoryView(model:))`。**`AppSurface` が `RunLoopEntry` を受け取ってから作る**（`AppSurface.swift`。run() 前に窓を作るとアプリが活性化し、挿入先が壊れる） |
 /// | 前面 | 開くときは `NSApp.activate()` してよい。**閉じたら `NSApp.hide(nil)`** |
-/// | **再挿入だけは順序が要る** | **窓を閉じて前面が戻ってから挿入すること。** 窓が前面のまま `reinsert` を呼ぶと、挿入先は Ghost Voice 自身の窓になる（`AccessibilityInserter.frontmostProcessIdentifier()`）。`reinsert` は自分で窓を閉じない——窓を持っているのは提示側だからである。**提示側が「閉じる → 前面が戻るのを待つ → `reinsert`」の順で呼ぶこと。** 待ち方（`NSApplication.didResignActiveNotification` で足りるか）は**未実測**であり、実機で確かめる必要がある（報告書に検証項目として起こしてある） |
+/// | **再挿入だけは順序が要る** | **窓を閉じて前面が戻ってから挿入すること。** 窓が前面のまま `reinsert` を呼ぶと、挿入先は Ghost Voice 自身の窓になる（`SystemAccessibility.frontmostProcessIdentifier()`）。`reinsert` は自分で窓を閉じない——窓を持っているのは提示側だからである。**提示側が「閉じる → 前面が戻るのを待つ → `reinsert`」の順で呼ぶこと。** 待ち方は**実測して決着した**（正本 §13 の V-43）——`didResignActiveNotification` では足りず、**挿入先の判定そのものが自分を指さなくなるまで待つ**。その決着は `focus:` で渡す |
 /// | 購読 | **`start()` を 1 回だけ呼ぶ。** `HistoryStore.changes()` は呼ぶたびに独立したストリームを返すが、**1 本を 2 箇所で読んではならない**（`AsyncStream` の単一消費者制約）。ここは 1 本を 1 つのタスクで読む |
 /// | 寿命 | ストアと同じ寿命の場所へ。`deinit` で購読が解ける |
 ///
@@ -165,6 +181,15 @@ public final class HistoryViewModel {
         case reinserted(InsertionMethod)
         /// **secure input が有効だったので何もしなかった。** テキストはどこにも残していない。
         case reinsertRefusedSecureInput
+        /// **前面が Ghost Voice から戻らなかったので、挿入をやめた。**
+        ///
+        /// 挿入していれば Ghost Voice 自身へ入り、**行き先が 1 つも残らなかった**
+        /// （AX は自プロセスを弾き、Pasteboard 経路は ⌘V がどこにも刺さらないまま
+        /// 300 ms 後にクリップボードを元へ戻す）。
+        ///
+        /// - Parameter copied: クリップボードへ退避できたか。
+        ///   **できなくても発話は履歴に残っている**（この一覧のコピーで取り出せる）。
+        case reinsertAbandoned(copied: Bool)
         case deleted(count: Int)
         case deleteFailed(String)
 
@@ -183,6 +208,13 @@ public final class HistoryViewModel {
                 "挿入の結果を判定できませんでした"
             case .reinsertRefusedSecureInput:
                 "パスワード入力中（secure input）なので挿入しませんでした。**クリップボードにも残していません。**"
+            // **どこにあるかを必ず言う。**「挿入しませんでした」だけだと消えたと読まれる。
+            case .reinsertAbandoned(copied: true):
+                "前面のアプリへ戻らなかったので挿入しませんでした（Ghost Voice 自身へ入るため）。"
+                    + "テキストはクリップボードにあります（⌘V で貼れます）。履歴にも残っています。"
+            case .reinsertAbandoned(copied: false):
+                "前面のアプリへ戻らなかったので挿入しませんでした。**クリップボードへも置けませんでした。**"
+                    + "テキストは履歴に残っています（この一覧のコピーで取り出せます）。"
             case .deleted(let count): "\(count) 件削除しました"
             case .deleteFailed(let reason): "削除できませんでした（\(reason)）"
             }
@@ -195,6 +227,9 @@ public final class HistoryViewModel {
             // **拒否は失敗ではない**（要件定義書 FR-4 の例外。`SessionFailureNotice.isRefusal`
             // と同じ扱いにする。赤く出すと「発話を失った」と読まれる）。
             case .reinsertRefusedSecureInput: false
+            // クリップボードへ退避できたなら、`.clipboardOnly` と同じ縮退である
+            // （出口はある）。**できなければ残る出口が履歴だけになるので、赤く出す。**
+            case .reinsertAbandoned(let copied): !copied
             }
         }
     }
@@ -212,14 +247,38 @@ public final class HistoryViewModel {
     ///
     /// - Important: **この画面の窓が前面のまま呼んではならない。** 挿入先が
     ///   Ghost Voice 自身になる。提示側が「窓を閉じる → 前面が戻る → これを呼ぶ」の
-    ///   順で使うこと（型の上の注記）。
+    ///   順で使うこと（型の上の注記）。**その決着を `focus` で渡す。**
     /// - Important: **`.notInserted` の履歴も再挿入できる。** 中断された発話は
     ///   一度も挿入されていないので、**再挿入こそがその発話の唯一の出口である**
     ///   （`InsertionMethod.notInserted` の doc コメントが「効くのは FR-9 の再挿入だけ」
     ///   と定めている）。
+    ///
+    /// ## `focus == .notReturned` のときに挿入しない理由
+    ///
+    /// 最前面がまだ Ghost Voice なら、挿入先は Ghost Voice 自身である。
+    /// **そこへ進めても発話の出口にはならない**——
+    ///
+    /// - AX 経路は自プロセスを弾く（`AccessibilityInserter.isSafeTarget`）。
+    /// - Pasteboard 経路は ⌘V を送るが、窓を隠した後なのでどこにも刺さらず、
+    ///   **300 ms 後に元のクリップボードへ戻す**（`PasteboardInserter.defaultRestoreDelay`）。
+    ///   つまり**テキストの行き先が 1 つも残らないまま「挿入しました」と出る。**
+    ///
+    /// **だから挿入をやめ、クリップボードへ置く。** 発話は失われない
+    /// ——クリップボードと履歴の両方にある。置けなかった場合も履歴には残る。
+    ///
+    /// - Parameter focus: 窓を閉じたあと、前面が Ghost Voice から離れたか。
+    ///   **既定値を置いていない**（置くと待たずに挿入できてしまう）。
     @discardableResult
-    public func reinsert(_ entry: HistoryEntry, field: HistoryTextField) async -> ActionOutcome {
-        let result = await output.insert(field.text(of: entry))
+    public func reinsert(
+        _ entry: HistoryEntry, field: HistoryTextField, focus: FocusHandback
+    ) async -> ActionOutcome {
+        let text = field.text(of: entry)
+        guard focus == .returned else {
+            let outcome = ActionOutcome.reinsertAbandoned(copied: output.copy(text))
+            lastOutcome = outcome
+            return outcome
+        }
+        let result = await output.insert(text)
         let outcome: ActionOutcome
         switch result {
         case .inserted(let method): outcome = .reinserted(method)

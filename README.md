@@ -120,7 +120,7 @@ log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"'
 | 3 | 窓を閉じた後 | **元のアプリへ最前面が戻る。** 戻らないと次の発話が Ghost Voice 自身へ入る |
 
 測り方は「`kCGWindowLayer == 0` の最前面 pid を外から観測する」——
-**挿入先の判定（`AccessibilityInserter.frontmostProcessIdentifier()`）とまったく同じ規則である。**
+**挿入先の判定（`SystemAccessibility.frontmostProcessIdentifier()`）とまったく同じ規則である。**
 
 **実測（2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2 / 内蔵ディスプレイのみ）**
 
@@ -130,7 +130,10 @@ log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"'
   **最前面の窓が入れ替わるまでにさらに 24〜32 ms 掛かる**（n=3）。
   **活性の通知（`didResignActiveNotification`）を待つ実装では足りない**——
   その通知は 1 度も来ず（既に非活性なので）、待った気になるだけだった。
-  いまは 150 ms の整定を置いてあり、**再挿入は最前面が入れ替わった後に走る。**
+  **いまは時間で待たず、上の規則（`kCGWindowLayer == 0` の最前面 pid）を
+  4 ms 間隔で直接見て、それが Ghost Voice でなくなってから再挿入する。**
+  窓を閉じてから決着するまでの実測は **12〜22 ms（n=10。静穏 3 回・負荷下 2 回）** で、
+  **上限（600 ms）には 1 度も達していない。**
 
 ## HUD の目視確認（`--hud-check`）
 
@@ -294,10 +297,13 @@ log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"'
   中断した発話にとっては**再挿入がその発話の唯一の出口である。**
 - **再挿入は履歴の窓を閉じてから行う**（窓が前面のままだと、挿入先が Ghost Voice 自身になる）。
   ボタンを押すと、窓を閉じる → 前面が戻るのを待つ → 挿入する、の順で走る。
-  **前面が戻らなかった場合はその旨を告げる**（黙って Ghost Voice 自身へ入れない）。
+  **前面が戻らなかった場合は挿入せず、クリップボードへ残したうえでその旨を告げる**
+  （黙って Ghost Voice 自身へ入れない。**テキストはクリップボードと履歴の両方に残る**）。
   > **実測（2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2）**: `NSApp.hide(nil)` で
   > アプリの活性はその場で切り替わるが、**最前面の窓が入れ替わるまでにさらに 24〜32 ms 掛かる。**
-  > その隙に挿入すると Ghost Voice 自身へ入るので、150 ms の整定を置いてある。
+  > その隙に挿入すると Ghost Voice 自身へ入る。**そこで時間で待つのをやめ、挿入先の判定
+  > （`kCGWindowLayer == 0` の最前面 pid）が Ghost Voice でなくなるまで 4 ms 間隔で照会する。**
+  > 窓を閉じてから決着するまで **12〜22 ms（n=10。静穏・負荷下とも）**、上限 600 ms には未到達。
 
 固有名詞は `vocabulary.json` に登録すると整形時に補正される。
 
