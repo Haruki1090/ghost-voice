@@ -220,8 +220,16 @@ final class RevisionRig: Sendable {
         historyLimit: Int = 50,
         caret: FakeTextField.CaretAfterWrite = .endOfWrittenText,
         secureInputAtInsertion: Bool = false,
-        refiner: SpyRefiner? = nil,
-        clipboardSucceeds: Bool = true
+        // **`any Refining` を受ける。** 保留が 2 件重なる状況は「整形が返る順番」を
+        // 検査から握らないと決定的に作れず、`SpyRefiner` の遅延では作れない
+        // （`GatedRefiner`。`OverlappingRevisionTests`）。
+        refiner: (any Refining)? = nil,
+        clipboardSucceeds: Bool = true,
+        // **二段目を差し替えられるようにする。** 本番の二段目（`PasteboardInserter`）は
+        // 「退避 → ⌘V → 300 ms 待つ → 復元」の間クリップボードを握るので、
+        // **挿入がまだ終わっていない窓**を作らないと検査できない経路がある
+        // （`GatedInserter`。`ClipboardHandoverTests`）。
+        fallback: (any PrimaryInserting)? = nil
     ) -> RevisionRig {
         let identity = UUID()
         let field = FakeTextField(
@@ -251,7 +259,7 @@ final class RevisionRig: Sendable {
             primary: AccessibilityInserter(
                 accessibility: accessibility, ownProcessIdentifier: ownProcess, epoch: epoch),
             // **二段目は使えない相手にしておく。** ⌘V を送出しないため。
-            fallback: StubInserter(canInsert: false, succeeds: false),
+            fallback: fallback ?? StubInserter(canInsert: false, succeeds: false),
             lastResort: clipboard,
             epoch: epoch,
             isSecureInputEnabled: isSecureInputEnabled

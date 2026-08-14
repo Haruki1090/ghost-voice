@@ -260,17 +260,54 @@ public actor DictationSession {
     /// 処理中に ESC が届いたか（基本設計書 §4「中断は挿入が始まる前のどの状態からでも」）。
     private var isCancelRequested = false
 
+    /// **挿入器がクリップボードを握っている最中か**（`whileInserting(_:)`）。
+    ///
+    /// `PasteboardInserter` は「退避 → 貼り付け → **既定 300 ms 待つ** → 復元」の順で
+    /// 動き、その待ちのあいだ **actor は解放されている。**
+    /// その窓で Undo キーが届くと `offerRawTextToClipboard()` が生テキストを
+    /// クリップボードへ置き、**300 ms 後の復元がそれを上書きする**——
+    /// 利用者は「クリップボードへ取り出しました」に従って ⌘V を押し、
+    /// **まったく別のものを貼る**（最終レビュー 視点1 の B-2）。
+    ///
+    /// - Important: **この欠陥は差し替え器を本番へ配線するまで到達不能だった。**
+    ///   `clipboard` が nil だったので `offerRawTextToClipboard()` は必ず
+    ///   `.undoUnavailable` で戻っていた。配線した結果、本番で初めて生きた経路である。
+    /// - Note: **世代の錠（`InsertionEpoch`）では塞げない。** あれが直列化するのは
+    ///   AX の書き込みで、クリップボードは通らない。
+    private var isInsertionInFlight = false
+
     // MARK: - 保留中の差し替えと Undo（FR-5(a) / FR-7）
 
-    /// 整形の完了を待って差し替えを撃つタスク。**`isBusy` には数えない**（設計 opus §3.3）。
+    /// 整形の完了を待って差し替えを撃つタスクと、**その持ち主の発話番号。**
     ///
-    /// 捨てても生テキストは欄にあるので、いつ捨てても「何も書き換えていない」状態で終わる。
-    private var pendingRevision: Task<Void, Never>?
-    /// 保留中の差し替えに対して ESC が届いたか。
-    ///
-    /// **書き込みが 1 回も起きていない段階でのみ効く**（基本設計書 §4）。
-    /// 差し替えが始まった後の ESC は受け付けない——範囲を選んだ直後に止めると選択だけが残る。
-    private var isRevisionCancelled = false
+    /// - Important: **発話番号を一緒に持つ理由。** (a) の分岐は挿入の直後に `.idle` へ
+    ///   戻して次の PTT を受け付けるので、**保留は 2 件以上重なりうる**
+    ///   （例外ではなく通常経路である）。番号を持たずに `Task` だけを置いていた頃は、
+    ///   古い方の `applyRevision` が 1 行目で `pendingRevision = nil` したときに
+    ///   **新しい方の持ち手まで消えていた**（最終レビュー 視点3 の指摘 3）。
+    ///   消えると「保留していない」ように見えるので、
+    ///   **ESC も Undo キーも新しい方を取りやめられなくなり**、
+    ///   「書き込みが 1 回も起きていないので完全に安全な取消しである」という
+    ///   FR-7 / 基本設計書 §4 の約束が破れる。**発話は失われない**
+    ///   （生テキストは欄にも履歴にもある）が、取消しの側が壊れる。
+    /// - Note: **追い越された古い方は握り直さない。** 次の発話の挿入で世代が進むので、
+    ///   撃っても `.staleEpoch` で断念され、**欄は 1 文字も変わらない**
+    ///   （`InsertionEpoch`）。持つべきなのは常に最新の 1 件である。
+    private struct PendingRevision {
+        /// この差し替えを立てた発話の番号。**持ち主の照合はこれで行う。**
+        let utterance: Int
+        let task: Task<Void, Never>
+        /// 取りやめ（ESC / Undo キー）が届いたか。
+        ///
+        /// **書き込みが 1 回も起きていない段階でのみ効く**（基本設計書 §4）。
+        /// 差し替えが始まった後の取りやめは受け付けない——
+        /// 範囲を選んだ直後に止めると選択だけが残る。
+        var isCancelled: Bool
+    }
+
+    /// 保留中の差し替え。**最新の 1 件だけを持つ**（`PendingRevision` の注記）。
+    /// **`isBusy` には数えない**（設計 opus §3.3）——捨てても生テキストは欄にある。
+    private var pendingRevision: PendingRevision?
     /// **Undo で戻せる場所。これが FR-7 の門である**（履歴ではない）。
     ///
     /// 錨は `.ax` 経路の挿入でしか作られず、`replace` が成功したときにだけ
@@ -683,7 +720,7 @@ public actor DictationSession {
         completionTask = nil
         // **保留中の差し替えは見届けない。** 捨てても生テキストは欄にあり、
         // 待つと終了が最大 NFR-P6b（既定 3 秒）延びる（設計 opus §3.3）。
-        pendingRevision?.cancel()
+        pendingRevision?.task.cancel()
         pendingRevision = nil
         undoTask?.cancel()
         undoTask = nil
@@ -999,7 +1036,7 @@ public actor DictationSession {
         // （`requestCancel()` の注記。読むと ⌘V の後で止まって発話が消える）。
         emit(.inserting)
         let insertStart = ContinuousClock.now
-        let outcome = await inserter.insert(refined ?? raw)
+        let outcome = await whileInserting { await inserter.insert(refined ?? raw) }
         let insert = ContinuousClock.now - insertStart
 
         // **挿入の直前に secure input が有効化された場合**（整形中にパスワード欄へ
@@ -1126,7 +1163,7 @@ public actor DictationSession {
     ) async {
         emit(.inserting)
         let insertStart = ContinuousClock.now
-        let inserted = await inserter.insertCapturingAnchor(raw)
+        let inserted = await whileInserting { await inserter.insertCapturingAnchor(raw) }
         let insert = ContinuousClock.now - insertStart
 
         // 挿入の直前に secure input が有効化された場合（(b) と同じ扱い）。
@@ -1211,17 +1248,21 @@ public actor DictationSession {
         releasedAt: ContinuousClock.Instant,
         refineStart: ContinuousClock.Instant
     ) {
-        isRevisionCancelled = false
         let utterance = self.utterance
         finishIdle(keepingSessionBusy: true)
 
-        pendingRevision = Task { [weak self] in
+        // **`Task` を作ってから代入するまでに suspension point を挟まない。**
+        // ここは同期の actor 隔離関数なので、作った `Task` が `applyRevision`
+        // （actor 隔離）へ入れるのはこの関数を抜けた後である。
+        let task = Task { [weak self] in
             let refined = await Self.awaitRefinement(
                 refinement, within: settings.revisionDeadline)
             await self?.applyRevision(
                 refined, anchor: anchor, entryID: entryID, utterance: utterance,
                 releasedAt: releasedAt, refineStart: refineStart)
         }
+        pendingRevision = PendingRevision(
+            utterance: utterance, task: task, isCancelled: false)
     }
 
     /// 整形が返った（あるいは打ち切られた）。**ここが唯一、欄を後から書き換える場所である。**
@@ -1261,7 +1302,13 @@ public actor DictationSession {
         releasedAt: ContinuousClock.Instant,
         refineStart: ContinuousClock.Instant
     ) async {
-        pendingRevision = nil
+        // **降ろすのは自分の持ち手だけ**（`PendingRevision` の注記）。
+        // 番号を見ずに nil を置くと、**追い越した新しい保留の持ち手を消す。**
+        // 取りやめも同じ理由で持ち主を照合してから読む。
+        let isMine = (pendingRevision?.utterance == utterance)
+        let wasCancelled = isMine && (pendingRevision?.isCancelled ?? false)
+        if isMine { pendingRevision = nil }
+
         // **この発話がまだ「直近」か。** 次の発話が始まっていたら、状態も計測値も
         // そちらのものなので触らない（差し替えそのものは撃ってよい——欄を触るのは
         // 挿入だけで、`TextReplacer` が世代と要素を照合する）。
@@ -1283,7 +1330,7 @@ public actor DictationSession {
         let refineElapsed = ContinuousClock.now - refineStart
         if isCurrent { latestMetrics = latestMetrics?.rewriting(refine: refineElapsed, revision: nil) }
 
-        guard !isRevisionCancelled else {
+        guard !wasCancelled else {
             notify(.refinementNotApplied(nil))
             return
         }
@@ -1335,6 +1382,16 @@ public actor DictationSession {
         }
     }
 
+    /// **挿入のあいだ「クリップボードは挿入器のもの」と印を立てる**
+    /// （`isInsertionInFlight` の注記）。
+    ///
+    /// - Important: **actor を塞がない。** 印を立てるだけで、待ちは `body` の中である。
+    private func whileInserting<T>(_ body: () async -> T) async -> T {
+        isInsertionInFlight = true
+        defer { isInsertionInFlight = false }
+        return await body()
+    }
+
     /// **actor を手放して、同期の AX 往復を走らせる。**
     ///
     /// `TextReplacer.replace` / `undo` は同期で AX を最大 12 回叩く。1 往復の上限は
@@ -1356,9 +1413,13 @@ public actor DictationSession {
     /// 保留中の差し替えを取りやめる（ESC / FR-7 の 1 行目）。
     ///
     /// **書き込みは 1 回も起きていないので、これは完全に安全な取消しである。**
+    ///
+    /// - Important: **効くのは最新の 1 件だけである。** 追い越された古い保留は
+    ///   世代が失効しているので、取りやめようと撃とうと欄は 1 文字も変わらない
+    ///   （`InsertionEpoch` / `TextReplacer.replace` の `.staleEpoch`）。
     private func cancelPendingRevision() {
         guard pendingRevision != nil else { return }
-        isRevisionCancelled = true
+        pendingRevision?.isCancelled = true
     }
 
     // MARK: - Undo（FR-7）
@@ -1465,8 +1526,17 @@ public actor DictationSession {
     ///   `CGEventTap` にキーイベントが配送されないためである——が、
     ///   **それは偶然の性質に依存した守り方であり、UI から Undo を撃てるようにした
     ///   瞬間に穴が開く**（最終レビュー 視点5 の P-4）。**推定に頼らず判定を置く。**
+    /// - Important: **挿入がクリップボードを握っている最中は行わない**
+    ///   （`isInsertionInFlight` の注記。最終レビュー 視点1 の B-2）。
+    ///   置いた生テキストは `PasteboardInserter` の復元に上書きされるので、
+    ///   **「取り出しました」が嘘になる。** 縮退は「戻せません」——
+    ///   **発話は履歴にある**ので、告げないより告げ間違えない方を取る。
     private func offerRawTextToClipboard() {
         guard !isSecureInputEnabled() else {
+            notify(.undoUnavailable)
+            return
+        }
+        guard !isInsertionInFlight else {
             notify(.undoUnavailable)
             return
         }
