@@ -1486,7 +1486,14 @@ guard let method = outcome.recordableMethod else { return }  // 拒否は記録�
 
 **残置は合成器の責務であり、Pasteboard 経路の副作用ではない。** 両段が「適用外」を返した場合、`tryInsert` は一度も走らないので Pasteboard 経路がクリップボードへ書く機会が無い。合成器が `.clipboardOnly` を返す前に自分で `ClipboardLeaving.leave(_:)` を呼ぶ。**`.clipboardOnly` を返すときは、テキストが実際にクリップボードへ残っていること。**
 
-> **`leave` の戻り値を必ず見る。** フェーズ 2 の最終レビューまで捨てており、**クリップボードへ置けなくても `.inserted(.clipboardOnly)` を返して「⌘V で貼れます」と告げていた**（A-2）。利用者はそこへ取りに行き、何も無い。さらに履歴書き込みも失敗すると、**「テキストは利用者の手元にある」と嘘を言ったうえで発話が完全に消える。** 置けなかった場合は `.failedEverywhere` を返し、`SessionFailure.insertionFailed`（案内先は履歴画面）で告げる。**履歴には `.notInserted` として必ず記録する**——そこが最後の写しだからである。
+> **`leave` の戻り値を必ず見る。** フェーズ 2 の最終レビューまで捨てており、**クリップボードへ置けなくても `.inserted(.clipboardOnly)` を返して「⌘V で貼れます」と告げていた**（A-2）。利用者はそこへ取りに行き、何も無い。さらに履歴書き込みも失敗すると、**「テキストは利用者の手元にある」と嘘を言ったうえで発話が完全に消える。** 置けなかった場合は `.failedEverywhere` を返し、`SessionFailure.insertionFailed(retainedInHistory:)` で告げる。**履歴には `.notInserted` として必ず記録する**——そこが最後の写しだからである。
+
+> **その履歴が残ったかまで見る**（再レビュー A-1 / B-1。2026-08-15）。履歴上限 0（設定画面のステッパーで到達できる。`HistoryStore.normalized`）では `append` が何も保存せず例外も投げないので、**「最後の写し」が 1 件も無い。** ここを見ずに `.insertionFailed` を出していたため:
+>
+> - **(b) 分岐**は「この発話は履歴にだけ残っています」と案内し、`speechWasLost = false` を告げていた。**案内先は空で、発話は失われている。**
+> - **(a) 分岐**はもっと悪く、`record` の顛末を見る `guard` が `.failedEverywhere` の判定より前にあったため、**`finishIdle()` で無言のまま成功として終わっていた**（`.refinementNotApplied(nil)` は HUD にも CLI にも出ない）。**欄・クリップボード・履歴のどこにも無い発話が、失敗を 1 つも出さずに消える。**
+>
+> `retainedInHistory` が false のときは「この発話は失われました」と告げ、`speechWasLost` を真にする。**`historyUnavailable(insertedElsewhere:)` が同じ区別をしているのとまったく同じ理由である**（利用者にとって失うものが違う）。両分岐の 4 通りは `InsertionFailedEverywhereTests` が表として押さえている。
 >
 > **同じ形が 2 箇所あった。** `DictationSession.offerRawTextToClipboard`（FR-7 の縮退）も戻り値を捨てて「クリップボードへ取り出しました」と告げていた。置けなければ `.undoUnavailable` へ倒す。
 >
@@ -1648,6 +1655,13 @@ public protocol AnchoringTextInserting: TextInserting {
 `ReplacementAnchor` は **`Codable` にしない**（C-2）。`HistoryEntry` に持たせてもならない——履歴は `history.json` へ落ちる。
 
 **挿入器と差し替え器は必ず一緒に作る**（`CompositeInserter.systemStack`）。世代（`InsertionEpoch`）を共有しないと差し替えが常に失効し、クリップボードを共有しないと喪失時の退避先が誰にも見えない場所になる。**どちらも黙って壊れる形の間違いである。**
+
+**組はプロセスに 1 つだけ作る**（再レビュー B-2。2026-08-15）。`InsertionEpoch` は世代であると同時に **AX 書き込みを直列化する錠**でもあり、**錠はインスタンスに属する。** `.app` は FR-9 の再挿入（`SystemHistoryTextOutput`）でも `systemStack()` を別に組んでいたため、
+
+1. 再挿入の AX 書き込みが、保留中の差し替えの AX 書き込みと**直列化されない**
+2. 再挿入が発話側の錨を**失効させない**（世代が別なので `.staleEpoch` が立たない）
+
+という形で不変条件の外にあった。`TextReplacer` の手順 2（読み戻して一致を確かめる）から手順 4（上書き）までの間に同じ欄の前方へ書かれると、**記録済みの範囲がずれたまま上書きが走り、利用者の別のテキストが整形結果で消える**（手順 5 は新しいキャレットから範囲を作り直すので `.replaced` が返りうる）。**セッションが使っている組をそのまま画面へ渡す**（`AppSessionRuntime.insertion` → `AppServices.insertion` → `SystemHistoryTextOutput.system(sharing:)`）。共有した場合の縮退は「保留中の差し替えが `.staleEpoch` で降りる」＝生テキストが欄に残る、で安全側である。
 
 #### 自動 Undo の門
 
@@ -1921,7 +1935,7 @@ notch 非搭載の内蔵ディスプレイの実測（該当機が手元に無�
 | `.refinementApplied` | **出さない** | 欄の文字が整ったこと自体が結果である。通知のためだけの通知になる |
 | `.refinementNotApplied(nil)` | **出さない** | nil は「整形そのものが返らなかった」（打ち切り・利用不可・逸脱の検査に落ちた）。**これは珍しくない**——実測で 56 字の発話は整形が締め切りの内側で完了していても 10/10 で捨てられている（V-37）。毎回出すと `.textMayHaveBeenLost` が埋もれる |
 | `.refinementNotApplied(理由あり)` | **出す** | こちらが「差し替えを断念した」側であり、上表が明示的に告げよと言っているもの |
-| `.textMayHaveBeenLost` | **最も強く出す。話している最中でも割り込む** | R-9。この設計で唯一「発話が欄から消えうる」経路であり、回収を促す必要がある |
+| `.textMayHaveBeenLost` | **最も強く出す。話している最中でも割り込む** | R-9。この設計で唯一「発話が欄から消えうる」経路であり、回収を促す必要がある。**在り処はクリップボードと履歴の両方を言う**——退避は次の発話の Pasteboard 経路（復元待ち 300 ms）と重なると上書きされるので、「クリップボードから貼り直せます」と言い切ると嘘になる窓がある（再レビュー B-3）。`TextReplacer` は挿入が進行中かを知る手段を持たない（Core の型に印が無い）ので、**塞ぐのではなく告げ方を事実に合わせた。** 整形前のテキストは履歴にある（(a) は履歴へ書けたときにしか差し替えを始めない） |
 | `.undone` / `.undoUnavailable` / `.undoDeclined` / `.undoCopiedRawTextToClipboard` | **出す（短く）** | 利用者の打鍵（⌃⌘Z）に対する返事。返事が無いと効いたのか判らない。**ただし録音中は割り込まない** |
 
 #### 更新の間引き（NFR-P1 / NFR-P3 を守るため）
