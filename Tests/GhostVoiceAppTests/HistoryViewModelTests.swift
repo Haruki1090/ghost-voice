@@ -185,6 +185,45 @@ struct HistoryViewModelTests {
         #expect(outcome.message.contains("クリップボードにも残していません"))
     }
 
+    /// **`.failedEverywhere` は `Tests/` に 1 度も現れていなかった**（再レビュー A-1）。
+    /// セッション側では、その取り落としが「発話がどこにも無いまま無言で成功する」
+    /// という A 級の欠陥になっていた。**画面側の双子もここで押さえる。**
+    ///
+    /// 再挿入では発話は失われない——**一覧に出ている項目そのものが履歴の写しである。**
+    /// ただし「⌘V で貼れます」（`.reinserted(.clipboardOnly)`）と混ぜてはならない。
+    @Test("どこにも挿入できずクリップボードへも置けなければ、履歴だけが残ると告げる")
+    func reinsertFailedEverywhereIsNotClipboardOnly() async throws {
+        let temp = try SettingsHistoryTempDirectory()
+        let output = HistoryTextOutputSpy(outcome: .failedEverywhere)
+        let model = HistoryViewModel(
+            store: HistoryStore(rootURL: temp.url, limit: 10), output: output)
+
+        let outcome = await model.reinsert(makeHistoryEntry(), field: .inserted, focus: .returned)
+
+        #expect(outcome == .reinsertFailedEverywhere)
+        #expect(outcome.isFailure, "残る出口が履歴だけなのに、失敗として出していない")
+        #expect(outcome.message.contains("クリップボードへも置けませんでした"))
+        #expect(outcome.message.contains("履歴に残っています"), "唯一の在り処を言っていない")
+        #expect(
+            !outcome.message.contains("⌘V"),
+            "クリップボードにも無いのに「⌘V で貼れます」と読める文言になっている")
+    }
+
+    /// クリップボードへ置けなかったことを黙って飲み込まない。
+    @Test("コピーに失敗したら失敗として出す")
+    func copyFailureIsReported() async throws {
+        let temp = try SettingsHistoryTempDirectory()
+        let output = HistoryTextOutputSpy(copySucceeds: false)
+        let model = HistoryViewModel(
+            store: HistoryStore(rootURL: temp.url, limit: 10), output: output)
+
+        let outcome = model.copy(makeHistoryEntry(), field: .raw)
+
+        #expect(outcome == .copyFailed)
+        #expect(outcome.isFailure)
+        #expect(!outcome.message.isEmpty)
+    }
+
     @Test("中断した発話も再挿入できる（**その発話の唯一の出口である**）")
     func cancelledEntryCanBeReinserted() async throws {
         let temp = try SettingsHistoryTempDirectory()
