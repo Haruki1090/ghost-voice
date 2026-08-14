@@ -31,6 +31,13 @@ public protocol PasteShortcutSending: Sendable {
 ///
 /// 権限は実行中に変わりうるので、**アプリ起動時と権限フローを通過した直後に
 /// `refresh()` を呼ぶこと。**
+///
+/// - Important: **外部で権限を変えられたときに追随しない。** ユーザーがシステム設定で
+///   許可しても、次の `refresh()` まで古い値を使う。発話は失われない
+///   （`.inserted(.clipboardOnly)` へ落ちてクリップボードには残る）が、
+///   **ユーザーから見ると「システム設定で許可したのに直らない」**という、
+///   原因の特定が難しい状態になる。権限フローの画面から戻った時点で必ず呼ぶこと。
+///   設定変更の監視までは行わない（詳細設計書 §9）。
 public final class PostEventAuthorization: Sendable {
 
     /// 本番で使う共有インスタンス。生成時に一度だけ照会する。
@@ -157,8 +164,9 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
     /// 計算資源ではなくイベント配送の周期で決まっている）。
     ///
     /// **この実測には上限として扱えない留保が 2 つある。**
-    /// 1. 計測は `NSApp.postEvent` で行った。この機体に AX 権限が無く `CGEvent.post`
-    ///    が黙って捨てられるため（`SystemPasteShortcutSender.canSend` 参照）、
+    /// 1. 計測は `NSApp.postEvent` で行った。この機体に送出の許可
+    ///    （`kTCCServicePostEvent`）が無く `CGEvent.post` が黙って捨てられるため
+    ///    （`SystemPasteShortcutSender.canSend` 参照）、
     ///    **WindowServer を経由する分の遅延が入っていない。**
     /// 2. 貼り付け先は自プロセスの `NSTextView` である。相手が重いアプリなら
     ///    相手のランループ待ちが上乗せされる。

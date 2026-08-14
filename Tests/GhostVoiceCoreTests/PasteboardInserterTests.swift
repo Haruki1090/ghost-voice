@@ -138,8 +138,8 @@ struct PasteboardInserterTests {
         }
     }
 
-    /// **実測に基づく設計。** AX 権限の無いプロセスでは `CGEvent.post` が黙って捨てられる
-    /// （実測: `AXIsProcessTrusted() == false` の状態で `.cgAnnotatedSessionEventTap` /
+    /// **実測に基づく設計。** 送出の許可（`kTCCServicePostEvent`）が無いプロセスでは
+    /// `CGEvent.post` が黙って捨てられる（実測: `.cgAnnotatedSessionEventTap` /
     /// `.cghidEventTap` の双方へ ⌘V を送り、いずれも 3/3 で貼り付かなかった）。
     /// `post` は `Void` を返すので送出の失敗を後から知る術が無い。**送る前に判定する。**
     @Test("キーイベントを送れない環境では適用外と判定する")
@@ -358,44 +358,5 @@ struct SystemPasteShortcutSenderTests {
         #expect(authorization.refresh())
         #expect(sender.canSend)
         #expect(probe.callCount == 2, "生成時 1 回 + refresh 1 回")
-    }
-
-    /// 既定の組み立てが実 API を見ていること。値そのものは機体の権限状態に依存するので、
-    /// **実 API と一致すること**だけを見る（規律: 権限のある機体でも正しく動くこと）。
-    @Test("既定の送出器は実 API の状態を映す")
-    func defaultSenderReflectsSystemState() {
-        let expected = CGPreflightPostEventAccess() && !IsSecureEventInputEnabled()
-        #expect(SystemPasteShortcutSender().canSend == expected)
-    }
-
-    /// **既定の secure input 判定が本当に `IsSecureEventInputEnabled()` を見ているか**を、
-    /// 実際に secure input を有効化して確かめる。
-    ///
-    /// **送出許可の側は true を注入する。** ここを実 API のままにすると、権限の無い機体では
-    /// `canSend` が secure input と無関係にもともと false で、
-    /// 「有効化したら false だった」が**何も検査していないアサーション**になる
-    /// （実際に一度そう書いて、ミューテーション #49 が生き残ったことで判明した）。
-    /// 有効化の前後で値が変わることまで見る。
-    ///
-    /// - Important: **システム全体の状態を一時的に変える。** `EnableSecureEventInput()` は
-    ///   参照カウント方式（実測: 2 回有効化 → 1 回解除では有効のまま、2 回解除で無効）なので、
-    ///   `defer` で必ず釣り合いを取る。有効な窓は実測 17 ms。
-    ///   プロセスが途中で落ちた場合もプロセス終了時に解除される。
-    @Test("secure input を有効にすると既定の判定が送出不可へ変わる")
-    func secureInputBlocksDefaultSender() throws {
-        try #require(!IsSecureEventInputEnabled(), "他プロセスが secure input を有効にしている")
-
-        // secure input 以外の門は開けておく。閉じたままだと差が出ず、何も検査できない。
-        // `isSecureInputEnabled` は既定のまま＝実 API を使う。
-        let sender = SystemPasteShortcutSender(
-            authorization: PostEventAuthorization(probe: { true })
-        )
-        #expect(sender.canSend, "有効化前は送れる前提が崩れている")
-
-        try #require(EnableSecureEventInput() == noErr)
-        defer { _ = DisableSecureEventInput() }
-
-        #expect(IsSecureEventInputEnabled(), "有効化できていない（前提が崩れている）")
-        #expect(!sender.canSend, "既定の判定が secure input を見ていない")
     }
 }

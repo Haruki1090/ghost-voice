@@ -764,9 +764,9 @@ restore(saved, to: pb)
 
 ⌘V の送出は `CGEvent(keyboardEventSource:virtualKey:keyDown:)` に `.maskCommand` を設定し、`post(tap: .cgAnnotatedSessionEventTap)` で行う。
 
-#### 送出には AX の許可が要る（実測）
+#### 送出には専用の許可が要る（実測）
 
-macOS 26.5.2 / M3。`AXIsProcessTrusted() == false` のプロセスが自分の最前面ウィンドウへ ⌘V を送る。`Edit > Paste` を持つメインメニューを用意し「⌘V の結び先が無い」交絡を除いてある。
+macOS 26.5.2 / M3。送出の許可が無いプロセス（`CGPreflightPostEventAccess() == false`）が自分の最前面ウィンドウへ ⌘V を送る。`Edit > Paste` を持つメインメニューを用意し「⌘V の結び先が無い」交絡を除いてある。
 
 | 送出方法 | 貼り付いた回数 |
 |---|---|
@@ -777,7 +777,14 @@ macOS 26.5.2 / M3。`AXIsProcessTrusted() == false` のプロセスが自分の�
 
 **`CGEvent.post` は `Void` を返す。** 捨てられたことを後から知る術が無い。送出したつもりで成功を報告すると、履歴には `.pasteboard` と記録されるのにテキストはどこにも入っておらず、しかもクリップボードは復元済み——つまり**発話が消えたうえに成功として残る**。
 
-したがって `PasteboardInserter.canInsert()` は**常に `true` ではない**。`AXIsProcessTrusted()` を返し、届けられないと判っている場合は試さずに `.clipboardOnly` へ落とす。
+したがって `PasteboardInserter.canInsert()` は**常に `true` ではない**。届けられないと判っている場合は試さずに落とす。門は 2 つある。
+
+| 門 | 判定 | 備考 |
+|---|---|---|
+| 送出の許可 | **`CGPreflightPostEventAccess()`**（`kTCCServicePostEvent`） | **`AXIsProcessTrusted()`（`kTCCServiceAccessibility`）ではない。** 別の TCC レコードなので片方だけ true はありうる。照会が実測 p50 10.6 ms 掛かるためキャッシュする（§9） |
+| secure input | `IsSecureEventInputEnabled()` が false であること | TCC とは無関係。許可があっても届かない。実測 0.000 ms なので毎回見る（キャッシュ禁止） |
+
+**取り違えの注意。** ここは当初 `AXIsProcessTrusted()` と書いていたが誤りである。`CGEvent.post` が要求するのは **event synthesizing access**（`kTCCServicePostEvent`）であって、AX API のアクセス権ではない。両者は隣り合った別 API（`CGPreflightPostEventAccess` / `CGPreflightListenEventAccess` / `AXIsProcessTrusted`）で、値がたまたま一致する機体では区別が付かない。
 
 #### 復元待ち時間 120 ms の根拠（実測）
 
@@ -792,7 +799,7 @@ CPU 負荷では動かない。約 33 ms は 60 Hz の 2 フレームにあた�
 
 **この実測には上限として扱えない留保が 2 つある。**
 
-1. 計測は `NSApp.postEvent` で行った。計測機に AX 権限が無く `CGEvent.post` が黙って捨てられるため、**WindowServer を経由する分の遅延が入っていない。**
+1. 計測は `NSApp.postEvent` で行った。計測機に送出の許可（`kTCCServicePostEvent`）が無く `CGEvent.post` が黙って捨てられるため、**WindowServer を経由する分の遅延が入っていない。**
 2. 貼り付け先は自プロセスの `NSTextView` である。相手が重いアプリなら相手のランループ待ちが上乗せされる。
 
 つまり実測 35 ms は**下限**であり、120 ms はそれに対する約 3.4 倍の余裕である。**値は据え置きとし、実アプリでの妥当性は V-3（実装 §12-11）で確かめる。**
@@ -817,14 +824,51 @@ CPU 負荷では動かない。約 33 ms は 60 Hz の 2 フレームにあた�
 ### 6.4 CompositeInserter
 
 ```
+secure input が有効か
+  └─ 有効 → 何も試さず拒否 → .refusedSecureInput（クリップボードにも残さない）
 AccessibilityInserter が適用可能か判定
-  ├─ 可 → 実行 → 成功: .ax / 失敗: 次へ
+  ├─ 可 → 実行 → 成功: .inserted(.ax) / 失敗: 次へ
   └─ 不可 → 次へ
 PasteboardInserter が適用可能か判定
-  ├─ 可 → 実行 → 成功: .pasteboard / 失敗: 次へ
+  ├─ 可 → 実行 → 成功: .inserted(.pasteboard) / 失敗: 次へ
   └─ 不可 → 次へ
-クリップボードへ残置 → .clipboardOnly（HUD 通知）
+クリップボードへ残置 → .inserted(.clipboardOnly)（HUD 通知）
 ```
+
+### secure input 中は挿入そのものを拒否する
+
+**secure input が有効なのは、ユーザーがパスワードを入力しているときである。** secure input は「この瞬間の入力を捕まえるな」という OS からの明示的な合図であり、AX 経路でそれを迂回するのは機能ではなく欠陥である。
+
+通してしまうと次が起きる。
+
+1. 発話が LLM 整形（`FoundationModels`）へ渡る
+2. **履歴ファイルへ平文で永続化される。** `HistoryStore` は `rawText` と `refinedText` を `history.json` に平文の JSON で保存する。NFR-V2 が禁じているのは**音声**のディスク書き出しなので、テキスト履歴はこの禁止を素通りする
+3. `.clipboardOnly` へ落ちればクリップボードにも残る
+
+したがって、**判定は合成器の入口に置き、どの経路も試さず、クリップボードにも残さない。** 判定は挿入のたびに行う（ユーザーはパスワード欄に出入りする。`IsSecureEventInputEnabled()` は実測 0.000 ms）。
+
+**ここはこの製品で唯一「発話を失う」ことを正とする分岐である。** 通常は発話を失わないことが最優先（基本設計書 §230）だが、パスワードは残す方が害が大きい。
+
+### 戻り値を `InsertionOutcome` にした理由
+
+```swift
+public enum InsertionOutcome: Sendable, Equatable {
+    case inserted(InsertionMethod)   // 履歴に記録してよい
+    case refusedSecureInput          // 履歴に記録してはならない
+
+    public var recordableMethod: InsertionMethod? { ... }
+}
+```
+
+拒否を `InsertionMethod` の一ケースとして足すこともできたが、そうすると **`HistoryEntry.insertionMethod`（`InsertionMethod` 必須）へそのまま入ってしまう**。つまり「記録してはならないもの」が型として記録可能になる。分けておけば、履歴を作るには `recordableMethod` を開く一手間が要り、拒否は `nil` で落ちる。
+
+**Task 10 への申し送り: `HistoryEntry` を作る前に弾くこと。**
+
+```swift
+guard let method = outcome.recordableMethod else { return }  // 拒否は記録しない
+```
+
+**フェーズ 2 への申し送り:** 拒否したことをユーザーへ伝える手段（HUD 表示）が要る。無言で消えると「動かない」と受け取られる。
 
 **残置は合成器の責務であり、Pasteboard 経路の副作用ではない。** 両段が「適用外」を返した場合、`tryInsert` は一度も走らないので Pasteboard 経路がクリップボードへ書く機会が無い。合成器が `.clipboardOnly` を返す前に自分で `ClipboardLeaving.leave(_:)` を呼ぶ。**`.clipboardOnly` を返すときは、テキストが実際にクリップボードへ残っていること。**
 
@@ -934,7 +978,14 @@ Undo のホットキーは既定で **⌃⌘Z**（Control + Command + Z）とす
 ## 9. 権限（Permissions）
 
 ```swift
-public enum PermissionKind: Sendable { case microphone, speechRecognition, accessibility }
+public enum PermissionKind: Sendable {
+    case microphone, speechRecognition
+    /// AX API へのアクセス（`kTCCServiceAccessibility`）。フォーカス要素の取得に要る。
+    case accessibility
+    /// キーイベントの合成（`kTCCServicePostEvent`）。⌘V の送出に要る。
+    /// **`accessibility` とは別の TCC レコードである。**
+    case postEvent
+}
 
 public protocol PermissionChecking: Sendable {
     func status(of kind: PermissionKind) -> PermissionStatus
@@ -947,7 +998,26 @@ public protocol PermissionChecking: Sendable {
 |---|---|---|
 | マイク | `AVCaptureDevice.authorizationStatus(for: .audio)` | `requestAccess(for:)` |
 | 音声認識 | `SFSpeechRecognizer.authorizationStatus()` | `requestAuthorization(_:)` |
-| アクセシビリティ | `AXIsProcessTrusted()` | `AXIsProcessTrustedWithOptions` にプロンプト表示オプションを付与 |
+| アクセシビリティ（AX API） | `AXIsProcessTrusted()` | `AXIsProcessTrustedWithOptions` にプロンプト表示オプションを付与 |
+| キーイベント送出 | `CGPreflightPostEventAccess()` | `CGRequestPostEventAccess()` |
+
+### キー送出の権限は AX とは別レコードである
+
+**`CGEvent.post` が要求するのは `kTCCServicePostEvent` であって `kTCCServiceAccessibility` ではない。** どちらもシステム設定の「アクセシビリティ」ペインで付与されるが、TCC のレコードは別で、**片方だけ許可された状態は原理的にありうる**。判定に `AXIsProcessTrusted()` を使うと、そのとき「送れるはずなのに送れない」状態を検出できず、**貼り付いていないのに `.pasteboard` として履歴に残る**（§6.3）。
+
+### 照会結果のキャッシュと、その限界
+
+`CGPreflightPostEventAccess()` は**照会のたびに実測 p50 10.6 ms**（初回 16.7 ms / 最大 24.7 ms）掛かる。挿入のたびに呼ぶと NFR-P5（50 ms）の 2 割を判定だけで使う。そこで `PostEventAuthorization` が結果を保持する。
+
+| 項目 | 内容 |
+|---|---|
+| 更新の契機 | **アプリ起動時**と、**権限フローを通過した直後**に `PostEventAuthorization.shared.refresh()` を呼ぶ |
+| 照会しない読み取り | `isGranted`（保持値を返すだけ） |
+| **限界** | **外部で権限を変えられたときに追随しない。** ユーザーがシステム設定で許可しても、次の `refresh()` まで古い値を使う |
+
+**限界の影響。** 発話は失われない（`.inserted(.clipboardOnly)` へ落ちてクリップボードには残る）が、**ユーザーから見ると「システム設定で許可したのに直らない」**という、原因の特定が難しい状態になる。権限フローの画面から戻った時点で必ず `refresh()` を呼ぶこと。設定変更の監視までは行わない。
+
+なお secure input（`IsSecureEventInputEnabled()`）は TCC ではなく実行時の状態なので**キャッシュしてはならない**。実測 0.000 ms なので毎回呼んでよい。
 
 **マイク権限の判定は、マイクを掴む前に行うこと。** 未許可のまま `AVAudioEngine.inputNode` へ
 触れると実測 510 秒ブロックする（§3.3）。判定 API 自体はハードウェアを開かないので安全である。
@@ -1177,7 +1247,14 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 
 以下のアプリで挿入経路と結果を記録する。
 
-**前提: AX 権限（システム設定 > プライバシーとセキュリティ > アクセシビリティ）が要る。** 権限が無いと AX 経路は必ず適用外になり、⌘V も黙って捨てられるため、全アプリで `.clipboardOnly` になる（§6.2 / §6.3 の実測）。**したがって V-3 は権限を付与した状態でしか意味を持たない。**
+**前提: 2 つの権限が要る。** どちらも「システム設定 > プライバシーとセキュリティ > アクセシビリティ」で付与されるが、**TCC のレコードは別**である（§9）。
+
+| 権限 | 無いと何が起きるか |
+|---|---|
+| AX API アクセス（`kTCCServiceAccessibility`） | フォーカス要素が取れず AX 経路が必ず適用外になる |
+| キーイベント送出（`kTCCServicePostEvent`） | ⌘V が黙って捨てられ Pasteboard 経路が適用外になる |
+
+どちらも無い状態では全アプリで `.inserted(.clipboardOnly)` になる（§6.2 / §6.3 の実測）。**したがって V-3 は両方を付与した状態でしか意味を持たない。**
 
 実施は Task 11（CLI での一気通貫）以降。それまで「結果」欄は空のまま残す。
 
@@ -1207,7 +1284,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 2 | `TranscriptionEngine`（ファイル入力） | ゴールデンテストが通る。**V-1 / V-2 をここで実測する** |
 | 3 | `AudioCapture` + マイク入力の結合 | CLI で発話 → 標準出力へ書き起こしが出る。**V-9 は実施済み**。**V-10（実デバイス切断）はここで実測する** |
 | 4 | `Refiner` | 整形あり／なし、タイムアウト、Apple Intelligence 無効時の縮退が動く |
-| 5 | `TextInserter`（二段構え） | 二段構えが動く。**V-3 は AX 権限が要るため実装 §12-11 へ繰り延べ** |
+| 5 | `TextInserter`（二段構え） | 二段構えが動く。**V-3 は AX API アクセスとキー送出の両権限が要るため実装 §12-11 へ繰り延べ** |
 | 6 | `HotkeyMonitor` | **V-4 を実施する** |
 | 7 | `DictationSession`（状態機械） | CLI 版で PTT → 挿入まで一気通貫 |
 | 8 | `NotchHUD` | **V-5 / V-6 を実施する** |
@@ -1224,7 +1301,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 |---|---|---|---|
 | V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 実装 §12-2 | **未完（肉声）**。合成音声のみ実施し CER 3.02 % vs 3.21 %（§11.2）。既定は `.dictation` を維持。肉声の録音が要るため保留 |
 | V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 | **完了**。40〜177 ms / 中央値 約 70 ms（推定値 300 ms を置き換え。§10） |
-| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 | **未実施（AX 権限待ち）**。二段構えの実装と単体検査は完了。実挿入には AX 権限が要り、無いと全アプリで `.clipboardOnly` になる。実施は Task 11 以降（§11.3） |
+| V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 | **未実施（権限待ち）**。二段構えの実装と単体検査は完了。実挿入には AX API アクセス（`kTCCServiceAccessibility`）とキー送出（`kTCCServicePostEvent`）の**両方**が要り、無いと全アプリで `.inserted(.clipboardOnly)` になる。実施は Task 11 以降（§11.3） |
 | V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-6 | 未実施 |
 | V-5 | DynamicNotchKit の表示先固定制御 | 実装 §12-8 | 未実施 |
 | V-6 | `.nonactivatingPanel` がフォーカスを奪わないこと | 実装 §12-8 | 未実施 |

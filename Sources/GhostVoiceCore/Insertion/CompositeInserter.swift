@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Foundation
 
 /// AX 経路を試し、駄目なら Pasteboard 経路へ落とし、それも駄目ならクリップボードへ残す。
@@ -22,24 +23,50 @@ public struct CompositeInserter: TextInserting {
     private let primary: any PrimaryInserting
     private let fallback: any PrimaryInserting
     private let lastResort: any ClipboardLeaving
+    private let isSecureInputEnabled: @Sendable () -> Bool
 
     /// - Parameters:
     ///   - primary: 一段目。成功すると `.ax` を報告する。
     ///   - fallback: 二段目。成功すると `.pasteboard` を報告する。
     ///   - lastResort: 最後の砦。**省略できないようにしてある**（下記）。
+    ///   - isSecureInputEnabled: secure input の判定。既定は実 API。
     public init(
         primary: any PrimaryInserting,
         fallback: any PrimaryInserting,
-        lastResort: any ClipboardLeaving
+        lastResort: any ClipboardLeaving,
+        isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) {
         self.primary = primary
         self.fallback = fallback
         self.lastResort = lastResort
+        self.isSecureInputEnabled = isSecureInputEnabled
     }
 
-    public func insert(_ text: String) async -> InsertionMethod {
-        if primary.canInsert(), await primary.tryInsert(text) { return .ax }
-        if fallback.canInsert(), await fallback.tryInsert(text) { return .pasteboard }
+    public func insert(_ text: String) async -> InsertionOutcome {
+        // **secure input が有効な間は、どの経路も試さずに拒否する。**
+        //
+        // secure input が有効なのは、ユーザーがパスワードを入力しているときである。
+        // secure input は「この瞬間の入力を捕まえるな」という OS からの明示的な合図で、
+        // AX 経路でそれを迂回するのは機能ではなく欠陥である。
+        //
+        // 通したときに起きること:
+        //   1. 発話が LLM 整形（`FoundationModels`）へ渡る
+        //   2. **履歴ファイルへ平文で永続化される。** `HistoryStore` は `rawText` と
+        //      `refinedText` を `history.json` に平文の JSON で保存する。
+        //      要件定義書 NFR-V2 が禁じているのは音声のディスク書き出しなので、
+        //      テキスト履歴はこの禁止を素通りする
+        //   3. `.clipboardOnly` へ落ちればクリップボードにも残る
+        //
+        // **ここはこの製品で唯一「発話を失う」ことを正とする分岐である。**
+        // 通常は発話を失わないことが最優先（基本設計書 §230）だが、
+        // パスワードは残す方が害が大きい。クリップボードにも残さない。
+        //
+        // 判定は挿入のたびに行う。ユーザーはパスワード欄に出入りするので、
+        // 起動時の値を握っていては意味が無い（実測 0.000 ms なので毎回呼べる）。
+        guard !isSecureInputEnabled() else { return .refusedSecureInput }
+
+        if primary.canInsert(), await primary.tryInsert(text) { return .inserted(.ax) }
+        if fallback.canInsert(), await fallback.tryInsert(text) { return .inserted(.pasteboard) }
 
         // **`.clipboardOnly` を返す前に、実際にクリップボードへ残す。**
         //
@@ -48,7 +75,7 @@ public struct CompositeInserter: TextInserting {
         // 「クリップボードへ残した」と報告しながら発話がどこにも無い状態になる。
         // 音声は再現できないので、これはこの製品で最も重い失敗である（基本設計書 §230）。
         lastResort.leave(text)
-        return .clipboardOnly
+        return .inserted(.clipboardOnly)
     }
 
     /// 本番の組み合わせ。
@@ -59,13 +86,15 @@ public struct CompositeInserter: TextInserting {
     public static func system(
         accessibility: any AccessibilityProbing = SystemAccessibility(),
         pasteboard: NSPasteboard = .general,
-        sender: any PasteShortcutSending = SystemPasteShortcutSender()
+        sender: any PasteShortcutSending = SystemPasteShortcutSender(),
+        isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) -> CompositeInserter {
         let pasteboardInserter = PasteboardInserter(pasteboard: pasteboard, sender: sender)
         return CompositeInserter(
             primary: AccessibilityInserter(accessibility: accessibility),
             fallback: pasteboardInserter,
-            lastResort: pasteboardInserter
+            lastResort: pasteboardInserter,
+            isSecureInputEnabled: isSecureInputEnabled
         )
     }
 }

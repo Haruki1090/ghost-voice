@@ -10,8 +10,11 @@ public protocol TextInserting: Sendable {
     /// テキストを挿入し、実際に使われた経路を返す。
     ///
     /// 戻り値は履歴に記録し、どのアプリでどの経路が使われたかの実地データとする（V-3）。
-    /// **`.clipboardOnly` を返すときは、テキストが実際にクリップボードへ残っていること。**
-    func insert(_ text: String) async -> InsertionMethod
+    /// **`.inserted(.clipboardOnly)` を返すときは、テキストが実際にクリップボードへ
+    /// 残っていること。**
+    ///
+    /// **`.refusedSecureInput` は履歴に記録してはならない**（`InsertionOutcome` を参照）。
+    func insert(_ text: String) async -> InsertionOutcome
 }
 
 /// 二段構えの各段。
