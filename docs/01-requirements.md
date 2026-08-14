@@ -410,7 +410,7 @@ Task 6 の実測（新規セッション・temperature 0・再現性 100 %）:
 | V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 基本設計完了後 | **未完**。合成音声では 3.02 % vs 3.21 %（§2.5 追記）。肉声は録音待ち |
 | V-2 | キー解放から認識確定までの実測（NFR-P3） | 同上 | **完了**。40〜177 ms / 中央値 約 70 ms（推定 300 ms を置換） |
 | V-3 | 主要アプリ（Slack / Chrome / Xcode / Notion / ターミナル）での AX 挿入成否 | 詳細設計完了後 | **未実施（権限待ち）**。挿入の実装と単体検査は完了。実挿入には AX API アクセス（`kTCCServiceAccessibility`）とキー送出（`kTCCServicePostEvent`）の**両方**が要り、無いと全アプリで `.inserted(.clipboardOnly)` になる。実施は Task 11 以降（詳細設計書 §11.3） |
-| V-4 | 右 Option 押しっぱなし時の他アプリへの副作用（R-1） | 同上 | 未実施 |
+| V-4 | 右 Option 押しっぱなし時の他アプリへの副作用（R-1） | 同上 | **未実施（権限待ち）**。判定ロジックと `CGEventTap` の実装・単体検査は完了。実キー入力の観測には `CGEvent.tapCreate` が通ること（`kTCCServiceListenEvent` / 入力監視）が要り、無いと 1 件も配送されない。実施は Task 11 以降。**あわせて実キーボードが左右のデバイスビット（`NX_DEVICERALTKEYMASK` 等）を立てることを確認する**（詳細設計書 §2.3） |
 
 ---
 

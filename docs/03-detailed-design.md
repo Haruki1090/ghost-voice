@@ -66,7 +66,7 @@ ghost-voice/
 public enum HotkeyEvent: Sendable {
     case pressed
     case released
-    case cancelled          // ESC 押下による中断
+    case cancelled          // ESC 押下による中断、またはタップ無効化で解放を取りこぼした場合
 }
 
 public protocol HotkeyMonitor: AnyObject, Sendable {
@@ -74,12 +74,24 @@ public protocol HotkeyMonitor: AnyObject, Sendable {
     func start() throws
     func stop()
 }
+
+public enum HotkeyError: Error, Equatable, Sendable {
+    case eventTapNotPermitted(TapPermissionSnapshot)   // tapCreate が nil を返した
+    case tapDisabledAtStart                            // 生成できたが有効化できなかった
+    case alreadyRunning
+    case stopped                                       // stop 済み。ストリームは復活しない
+}
 ```
+
+`stop()` は `AsyncStream` を終端する。**終端は取り消せないので、停止した監視器は再起動できない**（`start()` は `.stopped` を投げる）。再開したい場合は作り直す。
 
 ### 2.2 CGEventTap 実装
 
 ```swift
-let mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+// keyUp は修飾キー以外のバインドのときだけ含める（§2.3）
+var mask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
+if !binding.isModifierOnly { mask |= (1 << CGEventType.keyUp.rawValue) }
+
 let tap = CGEvent.tapCreate(
     tap: .cgSessionEventTap,
     place: .headInsertEventTap,
@@ -90,16 +102,62 @@ let tap = CGEvent.tapCreate(
 )
 ```
 
+#### 権限の門番は `tapCreate` 自身である（Task 9 実測）
+
+**`AXIsProcessTrusted()` を起動の門番にしてはならない。** §6.2 の取り違えと同じ形で、`kTCCServiceAccessibility` と `kTCCServiceListenEvent` は隣り合った別レコードであり、片方だけ許可された機体では事前照会と実際の可否がずれる。CoreGraphics のヘッダはこう定めている。
+
+> If the tap is not permitted to monitor these events when the tap is created, then the appropriate bits in the mask are cleared. If that results in an empty mask, then **NULL is returned**.
+
+つまり `tapCreate` の nil が権威ある答えである。**先に `tapCreate` を試し、nil だったときに初めて**両方の照会を行い、権限案内がどちらのペインへ導くべきかの手掛かりとして `TapPermissionSnapshot`（`listenEventAccess` / `accessibilityTrusted`）に載せる。
+
+実測（macOS 26.5.2 / M3、`AXIsProcessTrusted() == false` かつ `CGPreflightListenEventAccess() == false` の機体）:
+
+| 呼び出し | 結果 | 所要 |
+|---|---|---|
+| `tapCreate(.cgSessionEventTap, .defaultTap)` | **nil** | 約 40 ms |
+| `tapCreate(.cgSessionEventTap, .listenOnly)` | **非 nil。ただし恒久的に無効** | 約 26 ms |
+| `tapCreate(.cghidEventTap, .defaultTap)` | nil | 約 47 ms |
+| `tapCreateForPid(自プロセス, .defaultTap)` | nil | 約 0.3 ms |
+| `CGPreflightListenEventAccess()` | false | 初回 13.9 ms / 以降 p50 **10.657 ms** |
+| `AXIsProcessTrusted()` | false | 初回 44.7 ms / 以降 p50 0.0005 ms |
+
+- **`tapCreate` はブロックしない。** 権限が無くても約 40 ms で nil を返す（Task 7 の `AVAudioEngine.inputNode` は未許可のまま 510 秒ブロックした）。12 秒の期限を切って確認済み。
+- **`.listenOnly` へ替えてはならない。** 権限が無くても非 nil の `CFMachPort` が返るが、そのタップは `CGEvent.tapEnable(enable: true)` を通しても無効のままで、**イベントを 1 件も配送しない。** 「start に成功したのにホットキーが効かない」という §6.3 と同じ形の沈黙した失敗になる。`.defaultTap` は ESC の抑止にも要る。念のため `start()` で `tapIsEnabled` まで確かめる。
+- **どちらの TCC レコードが門番かは確定できていない。** 計測機では両方 false で一致しており、値の一致は同一性ではない（§6.2 と同じ理由）。上の設計はどちらであっても正しく動く。
+
+#### タップの無効化からの復帰
+
+タップのコールバックが遅いと、OS はタップを無効化して `kCGEventTapDisabledByTimeout` を配送する。**放置するとホットキーが二度と反応しない**（アプリは生きているのでユーザーからは原因が判らない）。通知を受けたら再有効化する。無効化されていた間に PTT キーの解放を取りこぼしている可能性があるため、**録音中だったなら `.cancelled` を出す**（出さないと録音が終わらない状態で固まる）。
+
+#### キー判定のコスト
+
+`handle` は**キーイベントごとに、しかもアプリへ配送される前に**走る。ここで `CGPreflightListenEventAccess()`（p50 10.7 ms）を呼ぶと、打鍵のたびに 10 ms がシステム全体の入力に乗る。**hot path は権限照会に一切触れない**（キャッシュではなく不参照）。実測は 1 打鍵あたり p50 0.75 μs（§2.5）。
+
 ### 2.3 修飾キーの押下判定
 
 既定の PTT キーは**右 Option**（`kVK_RightOption` = 0x3D）。修飾キーは `keyDown` を発生させないため、`flagsChanged` イベントの `keyCode` と `flags` の組で押下／解放を判定する。
 
+**左右の Option は同じ `.maskAlternate` を共有するため、汎用マスクだけでは判定できない。** 左 Option を押したまま右 Option を離すと `.maskAlternate` は立ったままなので、汎用マスクで判定すると**解放を取りこぼして録音が終わらなくなる。** 左右は `CGEventFlags` の下位に載っている device-dependent ビット（`IOKit/hidsystem/IOLLEvent.h`）で区別する。
+
+| 修飾キー | 左のビット | 右のビット | 汎用マスク |
+|---|---|---|---|
+| Option | `0x20`（`NX_DEVICELALTKEYMASK`） | `0x40`（`NX_DEVICERALTKEYMASK`） | `.maskAlternate` |
+| Shift | `0x02` | `0x04` | `.maskShift` |
+| Command | `0x08` | `0x10` | `.maskCommand` |
+| Control | `0x01` | `0x2000` | `.maskControl` |
+
 | 判定 | 条件 |
 |---|---|
-| 押下 | `keyCode == 0x3D` かつ `flags` に `.maskAlternate` が**立っている** |
-| 解放 | `keyCode == 0x3D` かつ `flags` に `.maskAlternate` が**立っていない** |
+| 押下 | `keyCode == 0x3D` かつ `flags` に**右 Option のデバイスビット**が立っている |
+| 解放 | `keyCode == 0x3D` かつ**右 Option のデバイスビット**が立っていない |
 
-左右の Option は同じ `.maskAlternate` を共有するため、`keyCode` による判別が必須である。
+> **退避経路**: 汎用マスクが立っているのに左右どちらのデバイスビットも無い入力源では、従来どおり汎用マスクで押下とみなす。ここで解放と誤判定すると、そういう入力源では PTT が押した瞬間に切れて**まったく使えなくなる**（取りこぼしより重い方へ倒れる）。実キーボードがデバイスビットを立てることは V-4 で確認する。
+
+#### 修飾キー以外のバインド
+
+`Settings.hotkey` は任意の `HotkeyBinding` を取れる。**修飾キー以外を PTT に割り当てた場合、`flagsChanged` は飛んで来ない。** `keyDown` だけを監視していると解放を検出できず、**録音が永遠に終わらない。** そのため `binding.isModifierOnly` が偽のときはマスクに `keyUp` を加え、`keyDown` / `keyUp` で押下・解放を判定する（修飾キーのバインドでは `keyUp` を含めない。全打鍵の keyUp をタップに通す分だけ無駄になる）。
+
+判定は `HotkeyDecision.decide(type:keyCode:flags:binding:isRecording:)` という純粋関数に閉じてあり、`CGEventTap` 無しでテストできる。
 
 ### 2.4 イベント抑止の設計（R-1 対策）
 
@@ -113,8 +171,21 @@ let tap = CGEvent.tapCreate(
 |---|---|---|
 | 右 Option の `flagsChanged` | しない | 上記のとおり |
 | 録音中の ESC `keyDown` | **する** | 中断操作を挿入先アプリに漏らさない |
+| 録音中の ESC `keyUp` | しない | 抑止しても中断は漏れず、下流アプリのキー状態だけが狂う |
+| PTT でも ESC でもないキー | **しない** | タップは全アプリの手前に居る。1 つでも抑止するとユーザーは文字を打てなくなる |
 
-> **V-4 の検証内容**: 右 Option 押下中に文字キーを打つと、挿入先アプリでは ⌥ 付き入力（`˙` `∆` 等の特殊文字）になる。PTT 中はユーザーがタイピングしない前提だが、実地で副作用を確認すること。問題があれば「右 Option の 2 回連続押下でトグル」方式へ変更する。
+> **V-4 の検証内容**: 右 Option 押下中に文字キーを打つと、挿入先アプリでは ⌥ 付き入力（`˙` `∆` 等の特殊文字）になる。PTT 中はユーザーがタイピングしない前提だが、実地で副作用を確認すること。問題があれば「右 Option の 2 回連続押下でトグル」方式へ変更する。**判定は純粋関数 `HotkeyDecision` に閉じてあるので、差し替えの範囲はそこに収まる。**
+
+### 2.5 キー判定のコスト（Task 9 実測）
+
+`handle`（`CGEvent` からのキーコード抽出・フラグ読み取り・判定・状態遷移・抑止の返却）の 1 打鍵あたりの所要。macOS 26.5.2 / M3、5,000 回計測（1,000 回の暖機後）。
+
+| 条件 | p50 | p99 | 最大 |
+|---|---|---|---|
+| 低負荷（load average 約 3.6） | 0.75 μs | 0.96 μs | 21.75 μs |
+| 負荷下（`yes` 16 本、load average 約 9.7） | 0.771 μs | 1.56 μs | 46.60 μs |
+
+CPU 負荷でほぼ動かない。**比較のため: ここで `CGPreflightListenEventAccess()` を 1 回呼ぶと 10,657 μs（p50）で、約 14,000 倍になる。**
 
 ---
 
@@ -1024,6 +1095,9 @@ public protocol PermissionChecking: Sendable {
 | 音声認識 | `SFSpeechRecognizer.authorizationStatus()` | `requestAuthorization(_:)` |
 | アクセシビリティ（AX API） | `AXIsProcessTrusted()` | `AXIsProcessTrustedWithOptions` にプロンプト表示オプションを付与 |
 | キーイベント送出 | `CGPreflightPostEventAccess()` | `CGRequestPostEventAccess()` |
+| キーイベント監視（ホットキー） | **`CGEvent.tapCreate` の成否**（§2.2）。事前照会は `CGPreflightListenEventAccess()` | `CGRequestListenEventAccess()` |
+
+> **ホットキーの判定だけは事前照会を門番にしない。** `tapCreate` が nil を返すこと自体が権威ある答えであり、事前照会は「どちらのペインへ案内するか」を決めるための補助でしかない（§2.2 に実測と根拠）。
 
 ### キー送出の権限は AX とは別レコードである
 
@@ -1309,7 +1383,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | 3 | `AudioCapture` + マイク入力の結合 | CLI で発話 → 標準出力へ書き起こしが出る。**V-9 は実施済み**。**V-10（実デバイス切断）はここで実測する** |
 | 4 | `Refiner` | 整形あり／なし、タイムアウト、Apple Intelligence 無効時の縮退が動く |
 | 5 | `TextInserter`（二段構え） | 二段構えが動く。**V-3 は AX API アクセスとキー送出の両権限が要るため実装 §12-11 へ繰り延べ** |
-| 6 | `HotkeyMonitor` | **V-4 を実施する** |
+| 6 | `HotkeyMonitor` | 判定と `CGEventTap` は完了。**V-4 はキーイベント監視の権限が要るため実装 §12-11 へ繰り延べ** |
 | 7 | `DictationSession`（状態機械） | CLI 版で PTT → 挿入まで一気通貫 |
 | 8 | `NotchHUD` | **V-5 / V-6 を実施する** |
 | 9 | 設定 UI・権限フロー・履歴 UI | FR-7〜FR-11 が満たされる |
@@ -1326,7 +1400,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-1 | 肉声での `DictationTranscriber` / `SpeechTranscriber` 精度比較 | 実装 §12-2 | **未完（肉声）**。合成音声のみ実施し CER 3.02 % vs 3.21 %（§11.2）。既定は `.dictation` を維持。肉声の録音が要るため保留 |
 | V-2 | キー解放 → 認識確定の実測（NFR-P3） | 実装 §12-2 | **完了**。40〜177 ms / 中央値 約 70 ms（推定値 300 ms を置き換え。§10） |
 | V-3 | 主要アプリでの AX 挿入成否 | 実装 §12-5 | **未実施（権限待ち）**。二段構えの実装と単体検査は完了。実挿入には AX API アクセス（`kTCCServiceAccessibility`）とキー送出（`kTCCServicePostEvent`）の**両方**が要り、無いと全アプリで `.inserted(.clipboardOnly)` になる。実施は Task 11 以降（§11.3） |
-| V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-6 | 未実施 |
+| V-4 | 右 Option 押しっぱなしの副作用 | 実装 §12-6 | **未実施（権限待ち）**。判定ロジックと `CGEventTap` の実装・単体検査は完了。実キー入力の観測には `CGEvent.tapCreate` が通ること（`kTCCServiceListenEvent` / 入力監視）が要り、無いと 1 件も配送されない。実施は Task 11 以降。**あわせて実キーボードが左右のデバイスビット（`NX_DEVICERALTKEYMASK` 等）を立てることを確認する**（§2.3） |
 | V-5 | DynamicNotchKit の表示先固定制御 | 実装 §12-8 | 未実施 |
 | V-6 | `.nonactivatingPanel` がフォーカスを奪わないこと | 実装 §12-8 | 未実施 |
 | V-7 | ウォームアップ常駐時のアイドルメモリ（NFR-S3） | 実装 §12-10 | 未実施 |

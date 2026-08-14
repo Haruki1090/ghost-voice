@@ -353,11 +353,13 @@ NFR-P6（合計 1 秒以内）を破るため、打ち切って生テキスト�
 | App Sandbox | **無効**（AX API に必須） |
 | Hardened Runtime | 有効 |
 | 必要な Info.plist | `NSMicrophoneUsageDescription`, `NSSpeechRecognitionUsageDescription` |
-| 必要な TCC 権限 | マイク、音声認識、アクセシビリティ（`kTCCServiceAccessibility` と `kTCCServicePostEvent` の両方） |
+| 必要な TCC 権限 | マイク、音声認識、アクセシビリティ（`kTCCServiceAccessibility` と `kTCCServicePostEvent` の両方）、キーイベント監視（`kTCCServiceListenEvent` / 入力監視。ホットキーの `CGEventTap` に要る） |
 | `LSUIElement` | `true`（Dock に表示しない） |
 | 配布 | Developer ID 署名 + notarization。Mac App Store は不可（要件定義書 §5） |
 
-> `AXUIElement` 系 API は `kTCCServiceAccessibility`、`CGEvent.post` は `kTCCServicePostEvent` という別の TCC サービスを使う。両方とも「システム設定 > プライバシーとセキュリティ > アクセシビリティ」に表示されるが、内部的には別枠である。二段構えの挿入（§5.2）は両方を必要とする。
+> `AXUIElement` 系 API は `kTCCServiceAccessibility`、`CGEvent.post` は `kTCCServicePostEvent`、`CGEvent.tapCreate`（ホットキー）は `kTCCServiceListenEvent` という**それぞれ別の TCC サービス**を使う。前 2 つは「システム設定 > プライバシーとセキュリティ > アクセシビリティ」に、`kTCCServiceListenEvent` は「入力監視」に表示されるが、内部的にはいずれも別枠である。二段構えの挿入（§5.2）は前 2 つを、ホットキー監視は 3 つ目を必要とする。
+>
+> **どれか 1 つを他の判定に流用してはならない。** 片方だけ許可された状態は原理的にありうるため、値が一致する機体では取り違えに気付けない（詳細設計書 §2.2 / §6.2）。
 
 ---
 
