@@ -18,6 +18,13 @@ public final class AppSessionRuntime {
 
     public let session: DictationSession
     private let monitor: CGEventTapHotkeyMonitor
+
+    /// 設定画面がキー監視器へ触る面（打鍵の捕獲と PTT キーの反映。FR-11）。
+    ///
+    /// **監視器そのものを渡さない。** 画面が `stop()` を呼べる形にすると、
+    /// 設定を触っただけでホットキーが二度と復活しなくなる
+    /// （`AsyncStream` は終端を取り消せない）。
+    public var hotkeyControl: any HotkeyControlling { MonitorHotkeyControl(monitor) }
     private var runTask: Task<Void, Never>?
     private var watchdog: Task<Void, Never>?
     private var isShuttingDown = false

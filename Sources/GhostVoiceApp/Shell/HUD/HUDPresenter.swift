@@ -74,6 +74,17 @@ public struct HUDPresenter: Sendable {
     private var level: Float = 0
     /// 保持の期限。nil なら保持していない。
     private var holdUntil: ContinuousClock.Instant?
+    /// **時間で畳まない表示を出しているか。**
+    ///
+    /// 2 つある。どちらも「いつ消えてよいかを時計では決められない」ものである。
+    ///
+    /// 1. **モデルの導入中**（数分掛かる。数秒で消すと「押しても何も起きない」へ戻る）
+    /// 2. **`.undoCopiedRawTextToClipboard`**（`SessionNoticeAnnouncement.isPersistent`。
+    ///    読み落とすとクリップボードに在る生テキストへ辿り着けない）
+    ///
+    /// **`holdUntil` を nil にするだけでは足りない。** 直後に必ず来る `.idle` が
+    /// 「貼り付いた表示を畳む」側へ落ちて消してしまう。
+    private var holdsIndefinitely = false
     /// 間引きで保留している録音中の中身。
     private var pendingRecording: HUDRecording?
     /// 最後に録音中の中身を反映した時刻。
@@ -118,6 +129,7 @@ public struct HUDPresenter: Sendable {
         pendingRecording = nil
         display = .message(message)
         holdUntil = now + hold
+        holdsIndefinitely = false
         return nextWakeup(after: now)
     }
 
@@ -128,7 +140,10 @@ public struct HUDPresenter: Sendable {
         case .recording(let volatileText):
             // **新しい発話は、保持中のどんな表示にも勝つ。**
             // 利用者が話し始めているのに前のエラーを出し続けるのは嘘である。
+            // **時間で畳まない表示も、ここでは畳む**（「時計で消すな」であって
+            // 「次の発話にも居座れ」ではない。`SessionNoticeAnnouncement.isPersistent`）。
             holdUntil = nil
+            holdsIndefinitely = false
             let recording = HUDRecording(
                 level: level, languageBadge: languageBadge, volatileText: volatileText)
             if case .recording = display {
@@ -157,6 +172,7 @@ public struct HUDPresenter: Sendable {
                         ? .lost : (notice.isRefusal ? .refusal : .warning)))
             // **`.failed` の直後には必ず `.idle` が続く**ので、ここで期限を持たないと消える。
             holdUntil = now + (notice.speechWasLost ? timing.speechLost : timing.failure)
+            holdsIndefinitely = false
 
         case .idle:
             pendingRecording = nil
@@ -164,7 +180,8 @@ public struct HUDPresenter: Sendable {
             // ここで落とさないとインジケータが振れたまま止まる。
             level = 0
             // 保持中（エラーの直後の `.idle` がこれ）なら何も変えない。
-            guard holdUntil == nil else { return }
+            // **時間で畳まない表示も保持中である**（導入の進捗・クリップボードへの退避）。
+            guard holdUntil == nil, !holdsIndefinitely else { return }
             if display == .processing(.inserting) {
                 // **挿入が終わった。** ここだけがチェックマークを出す入口である。
                 display = .completed
@@ -181,6 +198,7 @@ public struct HUDPresenter: Sendable {
 
     private mutating func show(_ next: HUDDisplay) {
         holdUntil = nil
+        holdsIndefinitely = false
         pendingRecording = nil
         display = next
     }
@@ -203,62 +221,58 @@ public struct HUDPresenter: Sendable {
     // MARK: - 通知
 
     private mutating func applyNotice(_ notice: SessionNotice, at now: ContinuousClock.Instant) {
-        guard let announcement = HUDPresenter.announcement(for: notice) else { return }
+        // **文言も「出すか出さないか」も Core が持つ**（`SessionNoticeAnnouncement`）。
+        // ここがするのは、重さを HUD の見せ方（色・保持時間）へ写すことだけである。
+        guard let announcement = SessionNoticeAnnouncement(notice) else { return }
+        let severity = HUDPresenter.severity(for: announcement.weight)
 
         // **喪失の疑いだけは何を差し置いても出す**（R-9。回収を促す必要がある）。
-        if announcement.severity != .lost {
+        if severity != .lost {
             // 話している最中に割り込まない。
             if case .recording = display { return }
             // 既に「失われたかもしれない」を出しているなら上書きしない。
-            if case .message(let current) = display, current.severity == .lost, holdUntil != nil {
+            if case .message(let current) = display, current.severity == .lost,
+                holdUntil != nil || holdsIndefinitely
+            {
                 return
             }
         }
 
         pendingRecording = nil
-        display = .message(HUDMessage(text: announcement.text, severity: announcement.severity))
-        holdUntil = now + announcement.hold
+        display = .message(HUDMessage(text: announcement.summary, severity: severity))
+        if announcement.isPersistent {
+            // **時間で畳まない**（`SessionNoticeAnnouncement.isPersistent`）。
+            // 読み落とすとクリップボードに在る生テキストへ辿り着けない。
+            holdUntil = nil
+            holdsIndefinitely = true
+        } else {
+            holdUntil = now + HUDPresenter.hold(for: announcement.weight, timing: timing)
+            holdsIndefinitely = false
+        }
     }
 
-    struct Announcement: Equatable {
-        let text: String
-        let severity: HUDSeverity
-        let hold: Duration
-    }
-
-    /// **どの通知を出し、どれを黙って捨てるか。**
+    /// Core の重さを HUD の色へ。
     ///
-    /// - `.refinementApplied` は**出さない。** 欄の文字が整ったこと自体が結果であり、
-    ///   毎回「反映しました」と言うのは通知のためだけの通知になる。
-    /// - **`.refinementNotApplied(nil)` も出さない。** nil は「整形そのものが返らなかった」
-    ///   （打ち切り・利用不可・逸脱の検査に落ちた）であり、**これは珍しくない**——
-    ///   実測で 56 字の発話は整形が締め切りの内側で完了していても 10/10 で捨てられている
-    ///   （V-37）。毎回出すと、本当に重い `.textMayHaveBeenLost` が埋もれる。
-    /// - **`.refinementNotApplied(理由あり)` は出す。** こちらは「差し替えを断念した」で、
-    ///   詳細設計書 §7.4 が明示的に告げよと言っている側である。
-    static func announcement(for notice: SessionNotice) -> Announcement? {
-        switch notice {
-        case .refinementApplied:
-            return nil
-        case .refinementNotApplied(let reason):
-            guard reason != nil else { return nil }
-            return Announcement(
-                text: "整形を反映できませんでした（入力済みの文はそのままです）。",
-                severity: .warning, hold: .seconds(2))
-        case .textMayHaveBeenLost:
-            return Announcement(
-                text: "入力欄のテキストが失われた可能性があります。クリップボードから貼り直せます。",
-                severity: .lost, hold: .seconds(8))
-        case .undone:
-            return Announcement(text: "整形前へ戻しました。", severity: .info, hold: .milliseconds(1500))
-        case .undoUnavailable:
-            return Announcement(text: "戻せるものがありません。", severity: .info, hold: .milliseconds(1500))
-        case .undoDeclined:
-            return Announcement(
-                text: "戻せませんでした（入力欄の内容が変わっています）。", severity: .warning, hold: .seconds(2))
-        case .undoCopiedRawTextToClipboard:
-            return Announcement(
-                text: "整形前のテキストをクリップボードへ入れました。", severity: .info, hold: .milliseconds(2500))
+    /// **`.actionRequired` は `.info` にする。** クリップボードへの退避は縮退が
+    /// 正しく働いた結果であり、赤く出すと「発話を失った」と読まれる
+    /// （`SessionNoticeAnnouncement.isFailure` が偽であることと同じ判断）。
+    static func severity(for weight: SessionNoticeAnnouncement.Weight) -> HUDSeverity {
+        switch weight {
+        case .info, .actionRequired: .info
+        case .warning: .warning
+        case .lost: .lost
+        }
+    }
+
+    /// Core の重さを HUD の保持時間へ。**秒数は媒体の関心である。**
+    static func hold(for weight: SessionNoticeAnnouncement.Weight, timing: Timing) -> Duration {
+        switch weight {
+        case .info: timing.notice
+        case .warning: timing.failure
+        case .lost: timing.speechLost
+        // ここへは来ない（`.actionRequired` は `isPersistent` なので畳まない）。
+        // それでも値を返すのは、保持時間の表に穴を空けないためである。
+        case .actionRequired: timing.speechLost
         }
     }
 
@@ -275,17 +289,21 @@ public struct HUDPresenter: Sendable {
             // **期限を置かない。** いつ終わるか判らないものに数秒の期限を置くと、
             // 導入中なのに表示だけ消えて「押しても何も起きない」へ戻る。
             holdUntil = nil
+            holdsIndefinitely = true
         case .progress(let fraction):
             let percent = Int((fraction * 100).rounded())
             display = .message(
                 HUDMessage(text: "音声認識モデルを導入しています… \(percent) %", severity: .info))
             holdUntil = nil
+            holdsIndefinitely = true
         case .completed:
             display = .message(HUDMessage(text: "音声認識モデルの導入が完了しました。", severity: .info))
             holdUntil = now + .seconds(3)
+            holdsIndefinitely = false
         case .failed:
             display = .message(HUDMessage(text: "音声認識モデルを導入できませんでした。", severity: .warning))
             holdUntil = now + .seconds(5)
+            holdsIndefinitely = false
         }
         pendingRecording = nil
     }

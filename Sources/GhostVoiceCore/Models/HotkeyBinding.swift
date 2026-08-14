@@ -20,6 +20,37 @@ public enum HotkeyBindingError: Error, Equatable, Sendable {
     /// 「Undo に ⌥ を含めない」（§8.3）の保護が消える。
     case modifierOnlyKeyRequiresItsOwnModifier(
         keyCode: Int64, expected: HotkeyBinding.Modifiers, actual: HotkeyBinding.Modifiers)
+
+    /// **どの規則に触れたかを利用者の言葉で言う。**
+    ///
+    /// 文言を Core に置くのは `SessionFailureNotice` / `SessionNoticeAnnouncement` と
+    /// 同じ理由である——**設定画面と CLI（`settings.json` の手編集を案内する側）で
+    /// 別々に書き直されると必ず食い違う。** 媒体で変わらないところだけをここが持つ。
+    public var explanation: String {
+        switch self {
+        case .keyCodeOutOfRange(let keyCode):
+            return
+                "そのキー（コード \(keyCode)）は使えません。macOS の仮想キーコードは 0〜127 です。"
+        case .modifierOnlyKeyRequiresItsOwnModifier(_, let expected, _):
+            // **修飾キー単独のバインドでは、足した修飾キーは無視されて単独で発火する**
+            // （実測 / 詳細設計書 §2.3）。だから足させない。
+            return
+                "修飾キーだけを割り当てるときは、そのキー自身（\(expected.localizedNames)）以外の"
+                + "修飾キーを足せません。足しても押した瞬間に単独で発火します。"
+        }
+    }
+}
+
+extension HotkeyBinding.Modifiers {
+    /// 利用者へ見せる修飾キーの名前。**表示は 1 箇所からしか作らない。**
+    public var localizedNames: String {
+        var names: [String] = []
+        if contains(.control) { names.append("⌃") }
+        if contains(.option) { names.append("⌥") }
+        if contains(.shift) { names.append("⇧") }
+        if contains(.command) { names.append("⌘") }
+        return names.isEmpty ? "（無し）" : names.joined()
+    }
 }
 
 /// PTT / Undo に割り当てる打鍵。

@@ -34,16 +34,32 @@ public struct AppLaunchOptions: Sendable, Equatable {
     ///   `CGEvent.tapCreate` も触らないので、**TCC のダイアログが出る余地が無い。**
     public let hudRehearsalSeconds: Double?
 
+    /// 窓（設定・履歴）の素振りを何秒行うか。nil なら行わない。
+    ///
+    /// **製品の機能ではなく、フォーカスの受け渡しを測るための入口である**（`--window-check`）。
+    /// 受け入れ条件「窓を出した状態でフォーカスを奪わないことを実測して示す」と、
+    /// 未実測項目 V-43（窓を閉じてから前面が戻るまでの待ち方）/ V-44（`NSApp.hide(nil)` の効き）は、
+    /// **窓が実際に開いていないと 1 つも確かめられない。**
+    ///
+    /// 筋書きは「開かずに待つ → 設定を開く → 閉じて前面を返す → 履歴を開く →
+    /// 閉じて前面を返す（**再挿入の直前と同じ経路**）→ 終了」である。
+    ///
+    /// - Important: **`--shell-only` と同じくセッションを作らない。** マイクも
+    ///   `CGEvent.tapCreate` も触らないので、**TCC のダイアログが出る余地が無い。**
+    public let windowRehearsalSeconds: Double?
+
     /// 解釈できなかった引数。**黙って捨てない**（標準エラーへ出す）。
     public let unrecognized: [String]
 
     public init(
         startsSession: Bool, requestsPermissions: Bool, hudRehearsalSeconds: Double? = nil,
+        windowRehearsalSeconds: Double? = nil,
         unrecognized: [String] = []
     ) {
         self.startsSession = startsSession
         self.requestsPermissions = requestsPermissions
         self.hudRehearsalSeconds = hudRehearsalSeconds
+        self.windowRehearsalSeconds = windowRehearsalSeconds
         self.unrecognized = unrecognized
     }
 
@@ -52,11 +68,15 @@ public struct AppLaunchOptions: Sendable, Equatable {
     /// 素振りの既定の秒数。**筋書きを一巡できる長さ**（`HUDRehearsal.script` の総和は約 9 秒）。
     public static let defaultHUDRehearsalSeconds: Double = 12
 
+    /// 窓の素振りの既定の秒数。**4 つの区間を 3 秒ずつ測れる長さ。**
+    public static let defaultWindowRehearsalSeconds: Double = 12
+
     /// - Parameter arguments: `CommandLine.arguments` の先頭（実行ファイル名）を除いたもの。
     public static func parse(_ arguments: [String]) -> AppLaunchOptions {
         var startsSession = true
         var requestsPermissions = true
         var hudRehearsalSeconds: Double?
+        var windowRehearsalSeconds: Double?
         var unrecognized: [String] = []
 
         for argument in arguments {
@@ -84,6 +104,22 @@ public struct AppLaunchOptions: Sendable, Equatable {
                     unrecognized.append(other)
                     hudRehearsalSeconds = defaultHUDRehearsalSeconds
                 }
+            case "--window-check":
+                // **セッションを作らない。** マイクにもタップにも触れない（ダイアログが出ない）。
+                startsSession = false
+                requestsPermissions = false
+                windowRehearsalSeconds = defaultWindowRehearsalSeconds
+            case let other where other.hasPrefix("--window-check="):
+                startsSession = false
+                requestsPermissions = false
+                let value = Double(other.dropFirst("--window-check=".count))
+                // **読めない秒数を黙って既定へ倒さない**（`--hud-check` と同じ判断）。
+                if let value, value > 0 {
+                    windowRehearsalSeconds = value
+                } else {
+                    unrecognized.append(other)
+                    windowRehearsalSeconds = defaultWindowRehearsalSeconds
+                }
             case let other where other.hasPrefix("-psn_"):
                 // LaunchServices が付ける Process Serial Number。**誤りではない。**
                 continue
@@ -96,6 +132,7 @@ public struct AppLaunchOptions: Sendable, Equatable {
             startsSession: startsSession,
             requestsPermissions: requestsPermissions,
             hudRehearsalSeconds: hudRehearsalSeconds,
+            windowRehearsalSeconds: windowRehearsalSeconds,
             unrecognized: unrecognized)
     }
 }

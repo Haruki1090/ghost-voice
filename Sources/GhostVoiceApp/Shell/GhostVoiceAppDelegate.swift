@@ -90,7 +90,10 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
             history: history,
             vocabulary: vocabulary,
             permissions: permissions,
-            hotkeyFailure: hotkeyFailure)
+            hotkeyFailure: hotkeyFailure,
+            // **セッションが無ければ監視器も無い。** 設定画面は打鍵を捕まえられない旨を
+            // 利用者へ言う（黙って何も起きない形にしない）。
+            hotkey: runtime?.hotkeyControl)
         self.services = services
 
         // **ここが唯一の「画面を作ってよい」合図である。**
@@ -99,19 +102,37 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
         // メインキューへ積んだこのブロックは、イベントループが回り始めてから走る。
         DispatchQueue.main.async { [launchSequence, options] in
             launchSequence.enterRunLoop(services: services)
-            guard let seconds = options.hudRehearsalSeconds else { return }
-            guard
-                let rehearsing = launchSequence.surfaces.compactMap({ $0 as? any HUDRehearsing })
-                    .first
-            else {
-                AppDiagnostics.note("[--hud-check] 素振りできる画面がありません。")
-                NSApp.terminate(nil)
+
+            if let seconds = options.hudRehearsalSeconds {
+                guard
+                    let rehearsing = launchSequence.surfaces
+                        .compactMap({ $0 as? any HUDRehearsing }).first
+                else {
+                    AppDiagnostics.note("[--hud-check] 素振りできる画面がありません。")
+                    NSApp.terminate(nil)
+                    return
+                }
+                AppDiagnostics.note("[--hud-check] HUD の素振りを \(seconds) 秒行います。")
+                rehearsing.startRehearsal(seconds: seconds) {
+                    // **`exit` しない。** 終了は器の段取り（`applicationShouldTerminate`）を通す。
+                    NSApp.terminate(nil)
+                }
                 return
             }
-            AppDiagnostics.note("[--hud-check] HUD の素振りを \(seconds) 秒行います。")
-            rehearsing.startRehearsal(seconds: seconds) {
-                // **`exit` しない。** 終了は器の段取り（`applicationShouldTerminate`）を通す。
-                NSApp.terminate(nil)
+
+            if let seconds = options.windowRehearsalSeconds {
+                guard
+                    let rehearsing = launchSequence.surfaces
+                        .compactMap({ $0 as? any WindowRehearsing }).first
+                else {
+                    AppDiagnostics.note("[--window-check] 素振りできる画面がありません。")
+                    NSApp.terminate(nil)
+                    return
+                }
+                AppDiagnostics.note("[--window-check] 窓の素振りを \(seconds) 秒行います。")
+                rehearsing.startWindowRehearsal(seconds: seconds) {
+                    NSApp.terminate(nil)
+                }
             }
         }
     }

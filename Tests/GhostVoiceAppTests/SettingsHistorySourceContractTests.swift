@@ -152,16 +152,45 @@ struct SettingsHistorySourceContractTests {
 
     @Test("**Undo の 10 秒窓を画面側で持っていない**（`HistoryStore.undoWindow` が唯一の出どころ）")
     func undoWindowIsNotHardCoded() throws {
-        let url = TrackDSources.repoRoot.appendingPathComponent(
-            "Sources/GhostVoiceApp/Shell/History/UndoNarration.swift")
-        let lines = try TrackDSources.code(of: url)
+        // 文言そのものは **Core へ移した**（`SessionNoticeAnnouncement`。統括の裁定）。
+        // 唯一の出どころであることは Core 側の検査が固定している。
+        let core = TrackDSources.repoRoot.appendingPathComponent(
+            "Sources/GhostVoiceCore/Support/SessionNoticeAnnouncement.swift")
+        #expect(try TrackDSources.code(of: core).contains { $0.text.contains("HistoryStore.undoWindow") })
 
-        #expect(lines.contains { $0.text.contains("HistoryStore.undoWindow") })
-        // 文言の中に生の「10 秒」を書いていない。
-        for line in lines {
-            #expect(!line.text.contains("10 秒"), "\(line.line): \(line.text)")
-            #expect(!line.text.contains("10秒"), "\(line.line): \(line.text)")
+        // **画面側には秒数が 1 つも無い。** 片方だけ変えたときに嘘になる。
+        for file in TrackDSources.files {
+            for line in try TrackDSources.code(of: file) {
+                #expect(!line.text.contains("10 秒"), "\(file.lastPathComponent):\(line.line)")
+                #expect(!line.text.contains("10秒"), "\(file.lastPathComponent):\(line.line)")
+            }
         }
+    }
+
+    // MARK: - 命題 6b: 通知の文言を画面側で作り直していない
+
+    /// **`SessionNotice` の文言は Core に 1 箇所だけある**（統括の裁定「Core へ寄せる」）。
+    /// 以前は HUD と Undo の UI の 2 箇所にあり、CLI には 1 箇所も無かった。
+    @Test("**`SessionNotice` の文言を画面側で作っていない**")
+    func noticeWordingLivesInCoreOnly() throws {
+        let appRoot = TrackDSources.repoRoot.appendingPathComponent("Sources/GhostVoiceApp")
+        var violations: [String] = []
+        let enumerator = FileManager.default.enumerator(
+            at: appRoot, includingPropertiesForKeys: nil)
+        while let url = enumerator?.nextObject() as? URL {
+            guard url.pathExtension == "swift" else { continue }
+            for line in try TrackDSources.code(of: url) {
+                // Core の翻訳器を呼ぶ行は違反ではない。**自前で `SessionNotice` を
+                // `switch` して文言を作る形だけを見る。**
+                if line.text.contains("case .undoDeclined")
+                    || line.text.contains("case .undoCopiedRawTextToClipboard")
+                    || line.text.contains("case .undoUnavailable")
+                {
+                    violations.append("\(url.lastPathComponent):\(line.line)")
+                }
+            }
+        }
+        #expect(violations.isEmpty, "画面側に通知の文言がある: \(violations)")
     }
 
     // MARK: - 命題 7: 提示の仕方が doc コメントにある

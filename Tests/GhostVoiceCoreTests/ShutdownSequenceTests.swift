@@ -194,7 +194,13 @@ struct ShutdownSequenceTests {
 
     // MARK: - 門を持たない経路（`.app`）
 
-    /// `.app` は `stateUpdates` を消費しない（その 1 本は HUD が使う）ので門を持てない。
+    /// `.app` は `stateUpdates` を消費しないので門を持たない。
+    ///
+    /// **理由は「その 1 本を HUD が使うから」ではない**（分配器ができた時点でその説明は
+    /// 偽になった。HUD が読むのは `stateStream()` であり、`.app` では `stateUpdates` の
+    /// 読み手が 1 人も居ない）。**終了の判定に状態の列を使わない**という判断そのものが
+    /// 理由である——分配器は読み手が遅れると古いものから捨てるので `.idle` を
+    /// 取りこぼしうる（`SessionBroadcast` の注記）。
     /// **門が無くても待つ根拠は同じ `isBusy` である。**
     @Test("門が無くても、待機中ならすぐ畳んでよい")
     func alreadyIdleWithoutGate() async {

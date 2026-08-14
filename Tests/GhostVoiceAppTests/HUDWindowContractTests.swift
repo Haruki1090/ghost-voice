@@ -139,25 +139,51 @@ struct HUDWindowContractTests {
 
     /// **`makeKeyAndOrderFront` はキーウィンドウにしてしまう。**
     /// 使った瞬間にフォーカスを奪い、挿入先が壊れる。
-    @Test("makeKeyAndOrderFront をどこでも呼んでいない")
-    func neverMakesKeyAndOrdersFront() throws {
-        for file in try SourceScan.swiftFiles() {
+    ///
+    /// **唯一の例外が `AppWindow.swift`（設定・履歴）である。** あちらは
+    /// **利用者が能動的に開く窓**で、キー入力を受け取れなければ設定を打ち込めない
+    /// ——HUD とは要件が正反対である（`AppWindow` の doc の対比表）。
+    /// 例外を 1 つに閉じ込めておくことで、「フォーカスを奪う場所」を数えられる。
+    @Test("makeKeyAndOrderFront を呼ぶのは AppWindow.swift だけ")
+    func onlyOnePlaceMakesKeyAndOrdersFront() throws {
+        for file in try SourceScan.swiftFiles() where file.name != "AppWindow.swift" {
             let hits = SourceScan.codeLines(file.text).filter {
                 $0.contains("makeKeyAndOrderFront")
             }
             #expect(hits.isEmpty, "\(file.name) に makeKeyAndOrderFront がある: \(hits)")
         }
+        // **HUD 側には無い**（空集合に対して緑になっていないことの確認）。
+        let hud = try #require(
+            try SourceScan.swiftFiles().first { $0.name == "HUDPanel.swift" })
+        #expect(!SourceScan.codeLines(hud.text).contains { $0.contains("makeKeyAndOrderFront") })
     }
 
-    /// **window を作る場所を 1 箇所に閉じ込める。**
+    /// **window を作る場所を閉じ込める。**
     /// 増えると「`RunLoopEntry` を経由しない window」が生まれる余地ができる。
-    @Test("NSPanel / NSWindow を作るのは HUDPanel.swift だけ")
-    func onlyOnePlaceCreatesWindows() throws {
-        for file in try SourceScan.swiftFiles() where file.name != "HUDPanel.swift" {
+    ///
+    /// 2 箇所ある。**どちらも `RunLoopEntry` を要求する**ので、
+    /// `NSApp.run()` の前には作れない（下の検査が固定している）。
+    @Test("NSPanel / NSWindow を作るのは HUDPanel.swift と AppWindow.swift だけ")
+    func onlyTwoPlacesCreateWindows() throws {
+        let allowed = ["HUDPanel.swift", "AppWindow.swift"]
+        for file in try SourceScan.swiftFiles() where !allowed.contains(file.name) {
             let hits = SourceScan.codeLines(file.text).filter {
                 $0.contains("NSPanel(") || $0.contains("NSWindow(")
             }
             #expect(hits.isEmpty, "\(file.name) が window を作っている: \(hits)")
+        }
+    }
+
+    /// **鍵を要求していることを固定する。** 許した 2 箇所が鍵を捨てたら、
+    /// 「window は run() の後にしか作れない」という構造の保証が消える。
+    @Test("window を作る 2 箇所は、どちらも RunLoopEntry を要求している")
+    func windowFactoriesRequireTheRunLoopKey() throws {
+        for name in ["HUDPanel.swift", "AppWindow.swift"] {
+            let file = try #require(try SourceScan.swiftFiles().first { $0.name == name })
+            let hits = SourceScan.codeLines(file.text).filter {
+                $0.contains("_ entry: RunLoopEntry")
+            }
+            #expect(!hits.isEmpty, "\(name) が RunLoopEntry を要求していない")
         }
     }
 

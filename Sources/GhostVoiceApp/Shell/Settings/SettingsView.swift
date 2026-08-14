@@ -4,20 +4,23 @@ import SwiftUI
 /// 設定画面（FR-11）。
 ///
 /// **提示（どの窓・どのメニューから開くか）は `SettingsViewModel` の doc コメントに
-/// 書いてある。配線は統合時に行う。** この型は「描くこと」しか知らない。
+/// 書いてある。配線は `StatusMenuSurface` が行う。** この型は「描くこと」しか知らない。
 ///
-/// ## 打鍵の捕まえ方について
+/// ## 打鍵の捕まえ方（**2 本目の `CGEventTap` を立てない**）
 ///
-/// **ここには打鍵を捕まえる仕掛けを入れていない。** `NSEvent` のローカルモニタで
-/// 捕まえる形になるが、**PTT の既定が修飾キー単独（右 Option）なので `keyDown` では
-/// 捕まらず、`flagsChanged` を見る必要がある**（`HotkeyBinding.isModifierOnly` の注記）。
-/// これは `CGEventTap` を張っている `HotkeyMonitor` と**同じイベントを 2 箇所で
-/// 見ることになる**ため、実機で干渉しないことを確かめてから足すべきである
-/// （報告書に検証項目として起こしてある）。
+/// PTT の既定は修飾キー単独（右 Option）なので `keyDown` では捕まらず、
+/// `flagsChanged` を見る必要がある。**`NSEvent` のローカルモニタは採らない**——
+/// それでは `CGEventTap` と同じ打鍵を 2 箇所で見ることになり、
+/// **捕獲中に PTT が同時に発火する経路が残る。**
 ///
-/// それまでの間、キーの変更は次の 2 つで行える:
-/// - `settings.json` を手で編集する（**不正な組は読めなくなり、この画面が理由を出す**）
-/// - `SettingsViewModel.setHotkey(keyCode:modifiers:)` を呼ぶ配線を足す
+/// 代わりに、**既存の `HotkeyMonitor` を「捕獲モード」へ入れる**
+/// （`HotkeyMonitor.beginHotkeyCapture` / `HotkeyCaptureState`。統括の裁定）。
+/// 判定は 1 打鍵あたり実測 p50 0.75 μs で**全システムの打鍵に乗る**ので、
+/// 2 本目を立てると設定画面を開いていない間もずっと 2 倍を払うことになる。
+///
+/// **捕獲中は PTT も Undo も ESC の中断も発火しない。**
+/// キーの変更は `settings.json` の手編集でも従来どおり行える
+/// （**不正な組は読めなくなり、この画面が理由を出す**）。
 public struct SettingsView: View {
 
     @Bindable private var model: SettingsViewModel
@@ -29,6 +32,7 @@ public struct SettingsView: View {
     public var body: some View {
         Form {
             fileNoticeSection
+            hotkeyFailureSection
             hotkeySection
             recognitionSection
             refinementSection
@@ -73,16 +77,47 @@ public struct SettingsView: View {
         }
     }
 
+    // MARK: - キー監視が動いていないことの告知（HUD との棲み分け）
+
+    /// **HUD は 1 行で「気づかせる」、ここは全文で「直させる」**
+    /// （`SettingsViewModel.hotkeyFailure` の doc）。
+    @ViewBuilder
+    private var hotkeyFailureSection: some View {
+        if let failure = model.hotkeyFailure {
+            Section {
+                Text(AppPermissionGuidance.message(for: failure))
+                    .font(.callout)
+                    .textSelection(.enabled)
+                Text("この状態では、下のホットキーを変えても押しても反応しません。**打鍵の捕獲もできません。**")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Label("キー入力を監視できていません", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
     // MARK: - ホットキー
 
     private var hotkeySection: some View {
         Section("ホットキー") {
-            LabeledContent("PTT（押している間だけ録音）") {
-                Text(HotkeyLabel.text(for: model.draft.hotkey)).monospaced()
+            hotkeyRow("PTT（押している間だけ録音）", binding: model.draft.hotkey, field: .pushToTalk)
+            hotkeyRow("Undo（整形前へ戻す）", binding: model.draft.undoHotkey, field: .undo)
+
+            if let message = model.captureMessage {
+                Label(message, systemImage: "info.circle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
-            LabeledContent("Undo（整形前へ戻す）") {
-                Text(HotkeyLabel.text(for: model.draft.undoHotkey)).monospaced()
+            if model.capturingField != nil {
+                // **捕獲中であることを必ず出す。** 出さないと、PTT が発火しないぶん
+                // 利用者には「壊れた」としか見えない。
+                Text("いま打鍵を待っています。**この間は録音も Undo も起きません。** ESC で取りやめます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
+
             // **衝突の判定は `Settings.validateHotkeys()` の答えそのもの。**
             // 画面はここで条件を書き直していない。
             if model.hotkeyConflict != nil {
@@ -91,6 +126,22 @@ public struct SettingsView: View {
                     systemImage: "xmark.octagon.fill"
                 )
                 .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func hotkeyRow(
+        _ title: String, binding: HotkeyBinding, field: SettingsViewModel.HotkeyField
+    ) -> some View {
+        LabeledContent(title) {
+            HStack {
+                Text(HotkeyLabel.text(for: binding)).monospaced()
+                if model.capturingField == field {
+                    Button("取りやめる") { model.cancelCapture() }
+                } else {
+                    Button("変更…") { model.beginCapture(field) }
+                        .disabled(model.capturingField != nil)
+                }
             }
         }
     }
@@ -158,22 +209,34 @@ public struct SettingsView: View {
     private var vocabularySection: some View {
         Section("ユーザー辞書（\(model.vocabularyTerms.count) / \(VocabularyStore.maxTerms) 件）") {
             ForEach(Array(model.vocabularyTerms.enumerated()), id: \.offset) { index, term in
-                HStack {
-                    Text(term.canonical)
-                    if !term.misheard.isEmpty {
-                        Text("← " + term.misheard.joined(separator: " / "))
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        TextField(
+                            "正しい表記",
+                            text: Binding(
+                                get: { term.canonical },
+                                set: { model.setCanonical($0, at: index) })
+                        )
+                        Spacer()
+                        Button("削除", role: .destructive) { model.removeTerm(at: index) }
+                            .buttonStyle(.borderless)
                     }
-                    Spacer()
-                    Button("削除", role: .destructive) {
-                        model.vocabularyTerms.remove(at: index)
-                    }
-                    .buttonStyle(.borderless)
+                    // **誤認識表記を編集できることが FR-11 の要件である。**
+                    // ここが編集できないと、FR-6（誤認識の修正）に何も入力できない。
+                    TextField(
+                        "誤認識されやすい表記（\(MisheardListText.separator.trimmingCharacters(in: .whitespaces)) で区切る）",
+                        text: Binding(
+                            get: { model.misheardText(at: index) },
+                            set: { model.setMisheard($0, at: index) })
+                    )
+                    .font(.callout)
                 }
+                .padding(.vertical, 2)
             }
-            Button("項目を追加") {
-                model.vocabularyTerms.append(VocabularyTerm(canonical: ""))
-            }
+            Button("項目を追加") { model.addTerm() }
+            Text("正しい表記は整形プロンプトへ毎回注入されます。**誤認識表記は「この語をこう直せ」の手掛かり**であり、整形が頼まれた置換かどうかを判定する根拠にもなります（FR-6）。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

@@ -14,9 +14,17 @@ public enum ShutdownWaitOutcome: Sendable, Equatable {
 /// `state` を読みに行くのは actor への往復であり、その間に状態は進む。
 /// ここは唯一の消費者（CLI の `SessionNarration.consume`）が流し込んだものを見る。
 ///
-/// - Note: **門を持てるのは `stateUpdates` を消費している経路だけである。**
-///   `AsyncStream` の消費者は 1 つに限られるので、`.app` 側は門を持たない
-///   （その 1 本は HUD が使う）。門が無い経路は `isBusy` の照会だけで待つ。
+/// - Note: **門を持てるのは `stateUpdates` を消費している経路だけである**
+///   （`AsyncStream` の消費者は 1 つに限られる）。いまそれは CLI だけであり、
+///   **`.app` 側は門を持たない。** 門が無い経路は `isBusy` の照会だけで待つ。
+///
+///   **`.app` が門を持たない理由は「1 本を HUD が使っているから」ではない。**
+///   HUD が読むのは分配器（`DictationSession.stateStream()`。呼ぶたびに独立した
+///   ストリームを返す）であり、**`.app` では `stateUpdates` の読み手が 1 人も居ない。**
+///   空いてはいるが、**終了の判定に使ってはならない**——`stateUpdates` を読み始めると
+///   HUD と同じ状態を 2 系統で追うことになり、しかも**分配器の側は読み手が遅れると
+///   古いものから捨てる**（`SessionBroadcast` の注記）ので、どちらで待っても
+///   `.idle` を取りこぼしうる。**権威は状態機械の `isBusy` に置く**（下の `waitUntilIdle`）。
 public actor ShutdownGate {
 
     private var isIdle = true

@@ -141,6 +141,10 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     /// セッションが確定〜整形の処理中か（`setSessionBusy`）。
     /// **`isRecording` とは別の量である。** キーを離した後も真でありうる。
     private var isSessionBusy = false
+    /// 捕獲モードの受け取り手。**nil なら捕獲していない**（＝ hot path の分岐は nil 比較 1 つ）。
+    private var captureHandler: (@Sendable (HotkeyCaptureOutcome) -> Void)?
+    /// 捕獲モードの状態。**押している修飾キーを覚えるだけの純粋な値。**
+    private var captureState = HotkeyCaptureState()
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     /// タップが無効化され、張り直さないと決めた。以後ホットキーは反応しない。
@@ -325,6 +329,41 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.withLock { isUndoAvailable = available }
     }
 
+    // MARK: - 捕獲モード（FR-11）
+
+    /// いま捕獲モードか（`HotkeyMonitor` の契約）。
+    public var isCapturingHotkey: Bool {
+        lock.withLock { captureHandler != nil }
+    }
+
+    /// 打鍵の捕獲を始める（`HotkeyMonitor` の契約）。
+    ///
+    /// **タップは張り替えない。** 捕獲に要るイベント種別（`flagsChanged` と `keyDown`）は
+    /// **バインドに関わらず必ずマスクへ入っている**（`eventMask(for:)`）。
+    /// 張り替えると実測 40 ms 掛かるうえ、録音中なら巻き添えで `.interrupted` が要る。
+    ///
+    /// - Important: **2 本目の `CGEventTap` を立てない**ための口である（統括の裁定）。
+    public func beginHotkeyCapture(_ onEvent: @escaping @Sendable (HotkeyCaptureOutcome) -> Void) {
+        let wasRecording: Bool = lock.withLock {
+            captureHandler = onEvent
+            captureState = HotkeyCaptureState()
+            let recording = isRecording
+            // **捕獲中は PTT を見ないので、押しっぱなしの録音を終わらせられない。**
+            // ここで畳んでおかないと「録音中のまま二度と終わらない」状態が残る。
+            isRecording = false
+            return recording
+        }
+        if wasRecording { continuation.yield(.interrupted) }
+    }
+
+    /// 捕獲モードを閉じる（`HotkeyMonitor` の契約）。**決着は配らない。**
+    public func endHotkeyCapture() {
+        lock.withLock {
+            captureHandler = nil
+            captureState = HotkeyCaptureState()
+        }
+    }
+
     /// PTT のバインドを差し替える（`HotkeyMonitor` の契約。欠落 9 / 持ち越し項目 10）。
     ///
     /// **タップを張り替える。** 監視するイベント種別はバインドで変わる（修飾キー単独では
@@ -406,6 +445,10 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         // 止めた監視器が打鍵を奪い続けてはならない（タップは畳むので実効は無いが、
         // フラグを残すと「停止済みなのに Undo キーを抑止する」状態を表現してしまう）。
         isUndoAvailable = false
+        // **捕獲モードも畳む。** 残すと、止めた監視器が「捕獲中」を名乗り続ける
+        // （設定画面が「キーを押してください」を出したまま二度と決着しない）。
+        captureHandler = nil
+        captureState = HotkeyCaptureState()
         phase = .stopped
         lock.unlock()
 
@@ -445,6 +488,13 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
 
+        // **捕獲モードを先に見る。** ここで戻るので `HotkeyDecision.decide` を
+        // 一度も通らない＝**捕獲中に PTT も Undo も ESC の中断も発火しない。**
+        // hot path に増えたのは nil 比較 1 つだけである（2 本目のタップを立てない裁定）。
+        if case .consumed(let suppress) = handleCapture(type: type, keyCode: keyCode, flags: flags) {
+            return suppress ? nil : Unmanaged.passUnretained(event)
+        }
+
         lock.lock()
         let decision = HotkeyDecision.decide(
             type: type, keyCode: keyCode, flags: flags,
@@ -462,6 +512,40 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
 
         if let hotkeyEvent = decision.event { continuation.yield(hotkeyEvent) }
         return decision.suppress ? nil : Unmanaged.passUnretained(event)
+    }
+
+    /// 捕獲モードがそのイベントをどう扱ったか。
+    private enum CaptureDisposition {
+        /// 捕獲モードではない。**呼び出し側は通常の判定へ進む。**
+        case notCapturing
+        /// 捕獲モードが消費した。**通常の判定は通らない。**
+        case consumed(suppress: Bool)
+    }
+
+    /// 捕獲モードならこのイベントを消費する。
+    private func handleCapture(
+        type: CGEventType, keyCode: Int64, flags: CGEventFlags
+    ) -> CaptureDisposition {
+        let (outcome, suppress, handler): (
+            HotkeyCaptureOutcome?, Bool, (@Sendable (HotkeyCaptureOutcome) -> Void)?
+        ) = lock.withLock {
+            guard captureHandler != nil else { return (nil, false, nil) }
+            let result = captureState.consume(type: type, keyCode: keyCode, flags: flags)
+            switch result.outcome {
+            case .pending:
+                return (result.outcome, result.suppress, nil)
+            case .captured, .cancelled:
+                // **1 打鍵で閉じる。** 閉じ忘れで打鍵を食い続ける状態を構造で作らない。
+                let handler = captureHandler
+                captureHandler = nil
+                captureState = HotkeyCaptureState()
+                return (result.outcome, result.suppress, handler)
+            }
+        }
+        guard outcome != nil else { return .notCapturing }
+        // **ロックの外で配る。** 受け取り手が何をするかは監視器の関心ではない。
+        if let handler, let outcome { handler(outcome) }
+        return .consumed(suppress: suppress)
     }
 
     /// タップが無効化されたときの通知。**2 種類あり、意味が違う。**

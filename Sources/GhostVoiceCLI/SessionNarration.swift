@@ -35,6 +35,40 @@ public enum SessionNarration {
         await gate.streamFinished()
     }
 
+    /// 通知（`SessionNotice`）の列を読み切って端末へ出す（FR-7 の顛末）。
+    ///
+    /// **フェーズ 1 の CLI にはこれが無かった。** `SessionNotice` を 1 つも扱っておらず、
+    /// **`ghost-voice` から Undo を撃つと顛末が何も出なかった**——
+    /// フェーズ 1 で潰した「無言で失敗する」と同じ形である（統括の裁定）。
+    ///
+    /// - Note: `notices()` は**呼ぶたびに独立したストリームを返す**分配器なので、
+    ///   `stateUpdates`（単一消費者）と違って読み手が増えても壊れない。
+    public static func consumeNotices(
+        _ notices: AsyncStream<SessionNotice>, writer: any ConsoleWriting
+    ) async {
+        for await notice in notices {
+            if let text = line(for: notice) { writer.write(text) }
+        }
+    }
+
+    /// 通知 1 件を端末の行へ。
+    ///
+    /// **判断は Core が持つ**（`SessionNoticeAnnouncement`）。出すか出さないかも、
+    /// 何を言うかも、どれだけ重いかもあちらである。ここがやるのは端末向けの組み立て
+    /// （`**` での強調と改行）だけで、**HUD と食い違いようが無い。**
+    ///
+    /// - Returns: 出さない通知（整形の結末 2 つ）では nil。
+    public static func line(for notice: SessionNotice) -> String? {
+        guard let announcement = SessionNoticeAnnouncement(notice) else { return nil }
+        // **発話を失った疑いの回だけ強調する。** 毎回強調すると本当に失った回が埋もれる
+        // （`message(for:)` が `speechWasLost` に対して行っているのと同じ判断）。
+        let headline =
+            announcement.weight == .lost ? "**\(announcement.summary)**" : announcement.summary
+        var line = "[通知] " + headline + "\n"
+        if !announcement.detail.isEmpty { line += "       " + announcement.detail + "\n" }
+        return line
+    }
+
     /// - Parameter metrics: `.idle` のときだけ意味がある。**それ以外では nil を渡すこと。**
     ///   `DictationSession.latestMetrics` は次の発話が始まるまで前の値を保持するので、
     ///   録音中に読むと前の発話の値を今の発話のものとして出してしまう。
