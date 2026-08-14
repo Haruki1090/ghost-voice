@@ -470,6 +470,47 @@ struct DictationSessionTests {
         }
     }
 
+    /// **処理中に押下が先着していると、その後の ESC は処理中の発話には届かない。**
+    ///
+    /// `run()` は `.pressed` を受けた時点で `startRecording()` の頭
+    /// （`await completionTask?.value`）で止まるため、後続の `.cancelled` は
+    /// 処理が終わるまで配送されない。**これは既知の例外として正本に書いてある**
+    /// （基本設計書 §4）。
+    ///
+    /// ただし ESC が捨てられるわけではない。配送された時点では**次の発話が録音中**なので、
+    /// **そちらが中断される。** ユーザーは PTT を押し直して新しい発話を始めた後に ESC を
+    /// 押しており、「新しい方を止める」は読みとして妥当である。ここではその挙動を固定する。
+    @Test("処理中に押下が先着すると ESC は次の発話へ効く")
+    func cancelAfterQueuedPressAppliesToNextUtterance() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(
+                root: root,
+                refiner: SpyRefiner(result: "整形後テキストです", delay: .milliseconds(300)))
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.hotkey.emit(.released)
+            try await waitUntil("整形へ入る") { await rig.session.state == .refining }
+
+            // 処理中に押下 → その後 ESC。押下が先にループを掴む。
+            rig.hotkey.emit(.pressed)
+            rig.hotkey.emit(.cancelled)
+
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+            try await Task.sleep(for: .milliseconds(80))
+
+            // 1 発話目は完走する（ESC はこちらには届いていない）。
+            #expect(rig.inserter.inserted == ["整形後テキストです"])
+            // 2 発話目は中断された（挿入されていない・履歴は .notInserted）。
+            #expect(rig.transcriber.beginCount == 2, "2 発話目が始まっていない")
+            #expect(rig.history.entries.count == 2)
+            #expect(rig.history.entries.first?.insertionMethod == .notInserted)
+            #expect(await rig.session.state == .idle)
+        }
+    }
+
     /// **挿入を始めた後の ESC は手遅れとして扱い、完走させる。**
     ///
     /// ⌘V を送出した後に中断すると、クリップボードの復元だけが走って
@@ -776,14 +817,12 @@ struct DictationSessionTests {
 
             let sample = try #require(await rig.session.latestMetrics)
             #expect(sample.refineMs >= 100, "整形の所要が計測されていない（\(sample.refineMs) ms）")
-            // **`total == finalize + refine + insert` を書いてはならない。**
-            // `Metrics.Sample.total` はその式で定義されているので、同じ値から同じ式を
-            // 組み立てて比べるだけになり、決して落ちない。
-            //
-            // 代わりに丸めの規約を見る。`totalMs` は 3 区間を切り捨ててから足すのではなく
-            // 合計の実時間から丸めるので、**切り捨ての和以上**になる。
-            #expect(sample.totalMs >= sample.finalizeMs + sample.refineMs + sample.insertMs)
-            #expect(sample.totalMs <= sample.finalizeMs + sample.refineMs + sample.insertMs + 2)
+            // **`total` と `totalMs` の関係はここで表明しない。**
+            // `total` は `finalize + refine + insert` と**定義されている**ので、
+            // 同じ値から同じ式を組み立てて比べても決して落ちない。
+            // `totalMs` を切り捨ての和と比べる形（`>= 和` / `<= 和 + 2`）も同じで、
+            // **どちらも床関数の恒等式なのでどんな実装でも成り立つ。**
+            // 意味のある表明が見つからないので置かない（`refineMs >= 100` が実質を見ている）。
             #expect(sample.meetsTarget)
         }
     }

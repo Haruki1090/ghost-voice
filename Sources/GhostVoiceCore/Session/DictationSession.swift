@@ -116,7 +116,7 @@ public actor DictationSession {
     /// 待たずに暫定テキストで挿入する**（＝発話の一部を失う）。
     private var utterance = 0
 
-    /// 処理中に ESC が届いたか（基本設計書 §4「中断はどの状態からでも」）。
+    /// 処理中に ESC が届いたか（基本設計書 §4「中断は挿入が始まる前のどの状態からでも」）。
     private var isCancelRequested = false
 
     /// キー解放以降に確定を待っているか。**録音中の `.final` で先へ進んではならない**
@@ -273,8 +273,8 @@ public actor DictationSession {
         // 二重の押下は無視する。混在入力源では押下だけが繰り返し届きうる。
         //
         // **この guard が有効なのは `run()` が唯一の呼び出し元で、単一のイベントループから
-        // 直列に呼ぶからである。** 判定から `phase = .recording` までの間に `await` が
-        // 3 つあるので、複数の文脈からこれを呼ぶと 2 回通り抜けうる。
+        // 直列に呼ぶからである。** 判定から `phase = .recording` までの間に `await`
+        // （`drainFinalizeTask()`）が挟まるので、複数の文脈からこれを呼ぶと 2 回通り抜けうる。
         // 呼び出し元を増やすときは、ここに中間相（`.starting`）を置くこと。
         guard phase == .idle else { return }
 
