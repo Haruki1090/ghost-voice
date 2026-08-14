@@ -73,7 +73,7 @@ swift build -c release
 
 ```bash
 Scripts/make-app.sh                  # ビルド → .app の組み立て → 署名。.build/app/Ghost Voice.app ができる
-Scripts/make-app.sh --allow-adhoc    # 署名用の証明書が無い環境向け（**権限が保たれない**。下記）
+Scripts/make-app.sh --allow-adhoc    # 署名用の証明書が無い環境向け（**許可が保たれるかは未実測**。下記）
 Scripts/make-app.sh --help
 ```
 
@@ -92,6 +92,14 @@ Scripts/make-app.sh --help
 > **証明書の更新・失効・再発行、Xcode の更新は未実測。**
 > **そして「DR が同じなら許可が実際に残る」ことも、まだ確かめていない**（V-16）。
 > 証明書はキーチェーンにあるものが自動で使われる（`security find-identity -v -p codesigning`）。
+>
+> **`--allow-adhoc` について（2026-08-15 に記述を正した）。** 「ad-hoc の DR は cdhash 単体」は
+> **`codesign -s -` の既定**の話である。**`Scripts/make-app.sh --allow-adhoc` は
+> `-r='designated => identifier "…"'` を明示的に渡すので、生成される DR に cdhash は入らない**
+> （調査で作った検証バンドルで確認済み）。
+> **したがって「ad-hoc だからビルドのたびに必ず権限が外れる」とは言えない。**
+> **判っていないのは、tccd が明示された DR をそのまま許可レコードに使うかどうかである**——
+> ここは**未実測**で、V-33 として登録してある。**「必ず外れる」でも「外れない」でもない。**
 
 | 起動引数 | 内容 |
 |---|---|
@@ -327,7 +335,11 @@ log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"'
 履歴は `history.json`（`rawText` / `refinedText` / `insertionMethod` / `timestamp`）。
 **secure input（パスワード欄）が有効な間の発話は、整形も挿入も履歴もクリップボードも行わない。**
 
-## フェーズ 1 に入っていないもの
+## フェーズ 1 と フェーズ 2 の差分（CLI とアプリの違い）
+
+> **この節は「フェーズ 1 に何が無かったか」の記録である。**
+> **下に挙がっているものは、いずれもフェーズ 2 で実装済みである。**
+> 見出しだけを読むと逆に取れるので、節名を改めた（2026-08-15）。
 
 notch HUD（FR-2 / FR-3。**フェーズ 2 で実装した**）、Undo の実行（FR-7。**フェーズ 2 で実装した**）、
 設定 UI（FR-11。**フェーズ 2 で実装した**。打鍵の捕獲も辞書の誤認識表記の編集も含む）、
