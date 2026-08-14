@@ -459,6 +459,12 @@ public actor DictationSession {
 
         let finalize = ContinuousClock.now - releasedAt
         // 確定が来なかった場合だけ暫定テキストへ縮退する。空で捨てるよりは残す。
+        //
+        // **ここが V-12 の残存リスクの場所である**（詳細設計書 §13 / §10 の M2）。
+        // 上の待ちは「解放以降の**最初の**確定」で解け、`latestFinal` はここで
+        // `await` を挟まず同期的に読む。**その後に届いた確定は積まれても二度と読まれない。**
+        // 103 秒の発話でも解放後の確定は 1 件だった（V-12 実測）が、**否定はされていない。**
+        // 録音中に届く確定は落ちない（`apply` が積むだけで先へ進まない）。
         let raw = (latestFinal.isEmpty ? latestVolatile : latestFinal)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 

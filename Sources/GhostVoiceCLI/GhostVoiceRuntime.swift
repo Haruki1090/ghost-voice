@@ -29,7 +29,10 @@ public enum GhostVoiceRuntime {
         case .check:
             let status = currentPermissions()
             out.write(PermissionGuidance.report(status, storageRoot: StorageRoot.default))
-            // 権限が足りなければ非 0。**スクリプトから判定できるようにする。**
+            // **見るのは「PTT が動くか」＝マイクと入力監視だけ。**
+            // アクセシビリティが無くても 0 を返す（PTT は動くため）。V-3 はその状態では
+            // 意味を持たないので、**そのことは報告の本文が言う**（`report` の該当行）。
+            // スクリプトから判定できるように非 0 を返す。
             exit(status.microphoneAuthorized && status.listenEventAccess ? 0 : 1)
         case .requestPermissions:
             requestPermissions(out: out, err: err)

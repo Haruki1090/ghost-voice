@@ -87,7 +87,9 @@ extension SpeechDependentTests {
     ///
     /// Task 10 が観測した 20 発話は 3 秒の短文で、解放後の確定はいずれも 1 回だった。
     /// ここでは**区切りの多い 30 秒の発話**（会議の読み上げ）で同じことを見る。
-    /// > **既定の `swift test` では走らない。`GHOST_VOICE_V12_SECONDS=30` を付けると走る。**
+    /// > **既定の `swift test` では走らない。`GHOST_VOICE_V12_SECONDS=103` を付けると走る。**
+    /// > **値は 103（フィクスチャの全長）にすること。** 30 秒では確定が 1 件しか出ず、
+    /// > 取りこぼしの経路を 1 度も通らない（下の実測表）。
     /// >
     /// > 実時間で実認識を回すので**機体を飽和させる。** 既定へ入れて全体を回したところ、
     /// > 時間の閾値を持つ既存の検査が 2 件落ちた（実測 / 2026-08-14）:
@@ -101,7 +103,7 @@ extension SpeechDependentTests {
     /// > 既存の検査が守っているものを、新しい検査の都合で弱めることになる。
     @Suite(
         "V-12: 解放後の確定が 1 回とは限らないか",
-        .enabled("GHOST_VOICE_V12_SECONDS=<秒数> を付けると実行される") {
+        .enabled("GHOST_VOICE_V12_SECONDS=103 を付けると実行される（30 では危険な経路を通らない）") {
             ProcessInfo.processInfo.environment["GHOST_VOICE_V12_SECONDS"] != nil
         },
         .enabled("音声フィクスチャが要る") { SpeechFixtures.audioExists }
