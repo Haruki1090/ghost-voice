@@ -212,7 +212,13 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
     /// （`SystemPasteShortcutSender.canSend` に実測を書いた）。
     public func canInsert() -> Bool { sender.canSend }
 
-    public func tryInsert(_ text: String) async -> Bool {
+    /// - Important: **この経路は差し替えの錨を返さない**（常に `.inserted(anchor: nil)`）。
+    ///   `CGEvent.post` は `Void` を返し、貼り付いたかどうかも、どの範囲へ入ったかも
+    ///   判らない（詳細設計書 §6.3）。範囲を持てない相手を差し替えにいくのは、
+    ///   位置の算術だけを頼りに他アプリのテキストを書き換えることに等しい
+    ///   （設計 opus §2.2 の C-1）。**この経路の発話は差し替えも Undo もできない。
+    ///   代わりに生テキストがそのまま欄に残る。**
+    public func tryInsert(_ text: String) async -> InsertionAttempt {
         let board = pasteboard.pasteboard
         let saved = Self.snapshot(of: board)
 
@@ -220,7 +226,7 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
         guard board.setString(text, forType: .string) else {
             // テキストを載せられていない。ユーザーの内容だけ消して終わるのは損なので戻す。
             Self.restore(saved, to: board)
-            return false
+            return .failed
         }
 
         guard sender.send() else {
@@ -235,12 +241,12 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
             //
             // 本番でここへ来るのは `CGEvent` の**生成**に失敗した場合だけである。
             // TCC と secure input に由来する失敗は `canInsert()` が先に弾く。
-            return false
+            return .failed
         }
 
         try? await Task.sleep(for: restoreDelay)
         Self.restore(saved, to: board)
-        return true
+        return .inserted(anchor: nil)
     }
 
     /// 最後の砦。挿入が全滅したとき、発話をクリップボードへ残す。

@@ -30,11 +30,32 @@ public protocol PrimaryInserting: Sendable {
     /// 次の段のコストへ丸ごと上乗せされる。挿入の予算は NFR-P5 の 50 ms しかない。
     func canInsert() -> Bool
 
-    /// 挿入を試みる。成功したら true。
+    /// 挿入を試みる。
+    ///
+    /// **戻り値が `Bool` ではないのは、差し替え（FR-5(a) / FR-7）に「どのプロセスの・
+    /// どの要素の・どの範囲へ書いたか」が要るためである**（設計 codex §2.2 の表:
+    /// `Bool` では配送確認・pid・範囲・後から置換できるかを 1 つも表せない）。
+    /// 錨を返せない段は `.inserted(anchor: nil)` を返す。**挿入は成功している。**
     ///
     /// - Important: `canInsert()` が false を返した段でこれを呼んではならない。
     ///   AX 経路では対象外の要素への書き込みを意味する。
-    func tryInsert(_ text: String) async -> Bool
+    func tryInsert(_ text: String) async -> InsertionAttempt
+}
+
+/// 差し替えの錨まで返せる挿入の口。
+///
+/// **`TextInserting.insert(_:)` はここから導出する**（下の既定実装）。
+/// 2 つの経路を別々に実装すると、片方だけ直したときに挙動が割れる。
+public protocol AnchoringTextInserting: TextInserting {
+    /// テキストを挿入し、経路と**差し替えの錨**を返す。
+    func insertCapturingAnchor(_ text: String) async -> AnchoredInsertion
+}
+
+extension AnchoringTextInserting {
+    /// **錨を捨てるだけの薄い包み。** 挿入の手順は 1 つしかない。
+    public func insert(_ text: String) async -> InsertionOutcome {
+        await insertCapturingAnchor(text).outcome
+    }
 }
 
 /// 最後の砦。挿入が全滅したときに、発話をクリップボードへ残す。
@@ -77,10 +98,13 @@ public struct StubInserter: PrimaryInserting {
     public let calls = Calls()
     private let canInsertValue: Bool
     private let succeeds: Bool
+    private let anchor: ReplacementAnchor?
 
-    public init(canInsert: Bool, succeeds: Bool) {
+    /// - Parameter anchor: 成功時に返す差し替えの錨。既定は nil（＝差し替えられない段）。
+    public init(canInsert: Bool, succeeds: Bool, anchor: ReplacementAnchor? = nil) {
         self.canInsertValue = canInsert
         self.succeeds = succeeds
+        self.anchor = anchor
     }
 
     public func canInsert() -> Bool {
@@ -88,9 +112,9 @@ public struct StubInserter: PrimaryInserting {
         return canInsertValue
     }
 
-    public func tryInsert(_ text: String) async -> Bool {
+    public func tryInsert(_ text: String) async -> InsertionAttempt {
         calls.recordTryInsert(text)
-        return succeeds
+        return succeeds ? .inserted(anchor: anchor) : .failed
     }
 }
 
