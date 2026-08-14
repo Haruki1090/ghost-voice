@@ -15,6 +15,13 @@ public enum HotkeyEvent: Sendable, Equatable {
     /// > 以前はこれも `.cancelled` で運んでいた。**意図と事故が同じ列挙子に相乗りし、
     /// > 「決めないまま捨てる」になっていた**（フェーズ 1 の最終レビュー I-2）。
     case interrupted
+    /// **Undo キー（既定 ⌃⌘Z）が押された**（FR-7）。
+    ///
+    /// **「戻せる」ことの保証ではない。** 監視器はキーが押されたことしか知らない。
+    /// 戻せるかを決めるのは**メモリ上に生きている差し替えの錨**であり、それは
+    /// `DictationSession` の側にある（要件定義書 FR-7 の細目）。
+    /// 戻せない状態で押されたときは、セッションが何もしない。
+    case undoRequested
 }
 
 public protocol HotkeyMonitor: AnyObject, Sendable {
@@ -65,6 +72,37 @@ public protocol HotkeyMonitor: AnyObject, Sendable {
     ///   （V-4 の #6「録音していないときの ESC は下流へ届く」の趣旨）。
     ///   中断は届き、かつ ESC も通す。
     func setSessionBusy(_ busy: Bool)
+
+    /// いま監視している Undo のバインド（既定 ⌃⌘Z）。
+    ///
+    /// - Note: MainActor から同期で読んでよい（ロックを取るだけ）。
+    /// - Note: `currentBinding` と同じく **`Settings.undoHotkey` の写しではない。**
+    var currentUndoBinding: HotkeyBinding { get }
+
+    /// Undo のバインドを差し替える（FR-11）。
+    ///
+    /// - Important: **タップは張り替えない。** 監視するイベント種別は PTT のバインドだけで
+    ///   決まる（Undo は `keyDown` しか見ないので、既に必ずマスクに入っている）。
+    ///   したがって録音中に呼んでも `.interrupted` は起きない。
+    /// - Important: **MainActor から呼んでよい。** ロックを取るだけで I/O も AX も無い。
+    /// - Throws: `HotkeyError.stopped` — `stop()` 済み。
+    func rebindUndo(to binding: HotkeyBinding) throws
+
+    /// **いま Undo で戻せるものがあるか**をセッションが知らせる（FR-7）。
+    ///
+    /// **これは抑止のためだけにある。** 判定そのものは `DictationSession` が持つ
+    /// 錨で行う（監視器は「戻せるか」を知り得ない）。
+    ///
+    /// - Important: **真の間だけ Undo キーを抑止し、偽の間は下流アプリへ通す。**
+    ///   10 秒窓の外では Ghost Voice は何もしないので、そこで打鍵を奪うと
+    ///   **下流アプリの Undo / Redo が理由も無く効かなくなる。**
+    ///   逆に真の間に通すと、こちらが差し替えを戻すのと同時に**アプリ自身の Undo も
+    ///   走って二重に効く。** どちらも利用者から見て壊れているので、
+    ///   「戻せるときだけ奪う」以外に正しい選択が無い。
+    /// - Important: **hot path から見えるのはこのフラグの読み取りだけである。**
+    ///   打鍵ごとの判定コストは実測 p50 0.75 μs で、**これはシステム全体の打鍵に乗る**
+    ///   （詳細設計書 §2.5）。ここで問い合わせや計算を行ってはならない。
+    func setUndoAvailable(_ available: Bool)
 }
 
 /// タップを開けなかった瞬間の権限照会の答え。
@@ -116,13 +154,25 @@ public enum HotkeyDecision {
     /// - Returns: 発火するイベントと、そのキーイベントを抑止するか。
     /// - Parameter isSessionBusy: セッションが確定〜整形の処理中か（`setSessionBusy`）。
     ///   **録音中でなくても、この間の ESC は中断として扱う。**
+    /// - Parameter undoBinding: Undo のバインド（FR-7）。nil なら Undo を見ない。
+    /// - Parameter isUndoAvailable: いま戻せるものがあるか（`setUndoAvailable`）。
+    ///   **抑止するかどうかだけを決める。** 偽でも `.undoRequested` は流す——
+    ///   戻せるかの最終判定はセッションが錨で行うので、フラグを門にすると
+    ///   フラグとセッションがずれた瞬間に打鍵が消える。
+    ///
+    /// - Important: **1 打鍵につきこの関数が 1 回走るだけである**（実測 p50 0.75 μs /
+    ///   詳細設計書 §2.5）。Undo のためにタップをもう 1 本立てると、
+    ///   **システム全体の打鍵に乗る費用が単純に 2 倍になる。**
+    ///   だから判定はこの 1 本の中で行う。
     public static func decide(
         type: CGEventType,
         keyCode: Int64,
         flags: CGEventFlags,
         binding: HotkeyBinding,
         isRecording: Bool,
-        isSessionBusy: Bool = false
+        isSessionBusy: Bool = false,
+        undoBinding: HotkeyBinding? = nil,
+        isUndoAvailable: Bool = false
     ) -> (event: HotkeyEvent?, suppress: Bool) {
 
         // **バインドを先に見る。** ESC を PTT に割り当てたユーザーから
@@ -146,7 +196,37 @@ public enum HotkeyDecision {
             return (nil, false)
         }
 
+        // **ESC より後に見る。** Undo を ESC に割り当てた設定では中断を優先する——
+        // 中断は「これを挿入するな」であり、取り違えると発話が挿入先へ入ってしまう。
+        // 一方 Undo が効かないことの害は「戻せない」だけである。
+        if let undoBinding, keyCode == undoBinding.keyCode {
+            return undo(type: type, flags: flags, binding: undoBinding, isAvailable: isUndoAvailable)
+        }
+
         return (nil, false)
+    }
+
+    /// Undo キーの判定（FR-7）。
+    ///
+    /// **押下だけを見る。** 解放は見ない——Undo は 1 回の押下で完結する操作であり、
+    /// keyUp を見に行くと**修飾キー単独の PTT でもタップのマスクへ `keyUp` を足す**
+    /// ことになって、システム全体の打鍵の配送量が倍になる（詳細設計書 §2.1）。
+    ///
+    /// **抑止は「戻せるときだけ」である**（`HotkeyMonitor.setUndoAvailable` の注記）。
+    ///
+    /// - Note: **抑止した押下に対応する keyUp は下流アプリへ届く**（マスクに `keyUp` が
+    ///   入っていないので抑止しようが無い）。文字キーの単独の keyUp を意味づける
+    ///   アプリは稀なので、**タップの配送量を倍にしてまで塞ぐ価値は無い**と判断した。
+    ///   実アプリでの影響は未実測（検証項目 V-33）。
+    private static func undo(
+        type: CGEventType, flags: CGEventFlags, binding: HotkeyBinding, isAvailable: Bool
+    ) -> (event: HotkeyEvent?, suppress: Bool) {
+        // 修飾キー単独を Undo に割り当てることは `HotkeyBinding` が既に禁じているが、
+        // ここでも `flagsChanged` は見ない（押下と解放を区別できないため）。
+        guard type == .keyDown else { return (nil, false) }
+        // 修飾キーが揃っていなければ、ユーザーはただ文字を打っている。**必ず通す。**
+        guard flags.contains(binding.modifiers.cgEventFlags) else { return (nil, false) }
+        return (.undoRequested, isAvailable)
     }
 
     private static func pushToTalk(
@@ -311,9 +391,16 @@ public final class StubHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     private var binding: HotkeyBinding
     private var rebindCalls: [HotkeyBinding] = []
     private var isStopped = false
+    private var undoBinding: HotkeyBinding
+    private var undoRebindCalls: [HotkeyBinding] = []
+    private var undoAvailableCalls: [Bool] = []
 
-    public init(binding: HotkeyBinding = .rightOption) {
+    public init(
+        binding: HotkeyBinding = .rightOption,
+        undoBinding: HotkeyBinding = .controlCommandZ
+    ) {
         self.binding = binding
+        self.undoBinding = undoBinding
         (events, continuation) = AsyncStream<HotkeyEvent>.makeStream()
     }
 
@@ -343,5 +430,26 @@ public final class StubHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
 
     public func setSessionBusy(_ busy: Bool) {
         lock.withLock { busyCalls.append(busy) }
+    }
+
+    public var currentUndoBinding: HotkeyBinding { lock.withLock { undoBinding } }
+
+    /// `rebindUndo` の呼ばれ方。
+    public var undoRebindings: [HotkeyBinding] { lock.withLock { undoRebindCalls } }
+
+    public func rebindUndo(to newBinding: HotkeyBinding) throws {
+        try lock.withLock {
+            guard !isStopped else { throw HotkeyError.stopped }
+            undoBinding = newBinding
+            undoRebindCalls.append(newBinding)
+        }
+    }
+
+    /// `setUndoAvailable` の呼ばれ方。**「戻せる窓」が開いて閉じたかを見る。**
+    public var undoAvailabilityCalls: [Bool] { lock.withLock { undoAvailableCalls } }
+    public var isUndoAvailable: Bool { lock.withLock { undoAvailableCalls.last ?? false } }
+
+    public func setUndoAvailable(_ available: Bool) {
+        lock.withLock { undoAvailableCalls.append(available) }
     }
 }

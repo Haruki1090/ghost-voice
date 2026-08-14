@@ -181,6 +181,39 @@ public final class HistoryStore: @unchecked Sendable {
         }
     }
 
+    /// **既に書いた項目へ、後から整形結果を入れる**（FR-5(a) の (a) 分岐）。
+    ///
+    /// (a) の分岐は 1 発話につき 2 回書く。挿入直後の `append(rawText:refinedText: nil)` と、
+    /// 整形が返ってからのこれである。**順序が要件になっている**——詳細設計書 §8.3 は
+    /// 「履歴は内容変更より先に確保する。raw と refined の両方が履歴にある状態で
+    /// 初めて手順 3 へ進む。書けなければ差し替えを始めない」と定める。
+    /// **差し替えの途中で発話が判らなくなる経路（R-9）に対して、履歴が 1 番目の受けである。**
+    ///
+    /// - Important: **`append` と同じく同期のファイル I/O を行う。MainActor から
+    ///   呼んではならない。** ここは `DictationSession` から呼ばれる口である。
+    /// - Important: **`rawText` は変えない。** 変えられるのは `refinedText` だけで、
+    ///   これは「後から届いた整形結果を足す」以外の用途を持たせないためである
+    ///   （履歴の書き換え口を広げると、FR-9 の画面から発話そのものを改変できてしまう）。
+    /// - Returns: 更新したか。**見つからなければ何も書かず、通知もしない。**
+    ///   古い発話が上限で押し出された後に差し替えが成功した場合がこれに当たる。
+    @discardableResult
+    public func update(id: HistoryEntry.ID, refinedText: String) throws -> Bool {
+        var updated = false
+        try mutate { entries in
+            guard let index = entries.firstIndex(where: { $0.id == id }) else { return false }
+            let old = entries[index]
+            guard old.refinedText != refinedText else { return false }
+            entries[index] = HistoryEntry(
+                id: old.id, timestamp: old.timestamp, rawText: old.rawText,
+                refinedText: refinedText, localeIdentifier: old.localeIdentifier,
+                insertionMethod: old.insertionMethod
+            )
+            updated = true
+            return true
+        }
+        return updated
+    }
+
     /// 履歴を 1 件消す（FR-9 の履歴画面から）。
     ///
     /// - Important: **MainActor から `await` してよい。** 同期のファイル I/O を含むが、
@@ -294,13 +327,17 @@ public final class HistoryStore: @unchecked Sendable {
         }
     }
 
-    /// 直近の「整形して挿入し、かつ猶予時間内」の履歴。
+    /// 直近の「差し替えできる経路で整形挿入し、かつ猶予時間内」の履歴。
     ///
     /// - Important: **これは Undo の門ではない**（要件定義書 FR-7 の細目 / 詳細設計書 §8.3）。
     ///   自動で戻せるのは**差し替えできる経路で挿入した発話**だけで、その門は
-    ///   **メモリ上に生きている差し替えハンドル**である。ハンドルは AX 経路でしか作られないので、
-    ///   `.pasteboard` / `.clipboardOnly` の発話をここが拾っても戻せない。
-    ///   この述語が残るのは履歴 UI（FR-9）が「直近の整形済み発話」を拾うためである。
+    ///   **メモリ上に生きている `ReplacementAnchor`** である。この述語が残るのは
+    ///   履歴 UI（FR-9）が「直近の整形済み発話」を拾うためである。
+    ///
+    /// - Important: **挿入経路も見る**（持ち越し項目 16。`HistoryEntry.isAutomaticUndoCandidate`）。
+    ///   `refinedText != nil` と猶予だけを見ていた頃は、**`.clipboardOnly`——どこにも
+    ///   挿入していない発話——がここに載っていた。** そこへ Undo を撃つと、
+    ///   挿入していないテキストを消そうとして**別の何かを消す。**
     ///
     /// 直近が条件を満たさないときに 1 つ前まで遡ることはしない。Undo が戻すのは
     /// 直前に挿入した文字列であって、それ以外を書き換えるとユーザーが見ていない
@@ -310,7 +347,7 @@ public final class HistoryStore: @unchecked Sendable {
     /// あるので、未来の日時を許すとその履歴が恒久的に Undo 対象で居座る。
     public func undoCandidate(now: Date = Date()) -> HistoryEntry? {
         guard let latest = entries.first,
-              latest.refinedText != nil,
+              latest.isAutomaticUndoCandidate,
               (0...Self.undoWindow).contains(now.timeIntervalSince(latest.timestamp))
         else { return nil }
         return latest

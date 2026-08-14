@@ -8,6 +8,22 @@ public enum SettingsError: Error, Equatable {
     case hotkeyConflict
 }
 
+/// 整形結果をいつ反映するか（要件定義書 §2.8.6 / FR-5 の細目）。
+///
+/// **`beforeInsert` は「フェーズ 1 の挙動」そのものである。** 差し替えの体感が
+/// 悪かった場合（リスク R-10）、この 1 つを戻せば製品はフェーズ 1 と同じに動く。
+public enum RefinementApplyMode: String, Codable, Sendable, Equatable, CaseIterable {
+    /// **生テキストを先に挿入し、整形が返ってから同じ範囲を差し替える**（FR-5(a)）。
+    ///
+    /// 差し替えが成立しない挿入先では自動的に `beforeInsert` と同じ経路へ落ちる
+    /// （`AnchoringTextInserting.canCaptureAnchor()` が挿入の前に判定する）。
+    case afterInsert
+    /// **常に整形を待ってから挿入する**（FR-5(b) / フェーズ 1 の挙動）。
+    ///
+    /// 打ち切りは `refinementTimeoutMs`。超えたら生テキストを挿入する。
+    case beforeInsert
+}
+
 public struct Settings: Codable, Sendable, Equatable {
     public var hotkey: HotkeyBinding
     public var undoHotkey: HotkeyBinding
@@ -16,6 +32,10 @@ public struct Settings: Codable, Sendable, Equatable {
     public var refinementEnabled: Bool
     public var refinementTimeoutMs: Int
     public var historyLimit: Int
+    /// 整形結果の反映方式（フェーズ 2 / 要件定義書 §2.8.6）。
+    public var refinementApplyMode: RefinementApplyMode
+    /// 差し替えの打ち切り（NFR-P6b）。詳細は `revisionDeadline`。
+    public var revisionDeadlineMs: Int
 
     public init(
         hotkey: HotkeyBinding = .rightOption,
@@ -24,7 +44,9 @@ public struct Settings: Codable, Sendable, Equatable {
         transcriberKind: TranscriberKind = .dictation,
         refinementEnabled: Bool = true,
         refinementTimeoutMs: Int = 750,
-        historyLimit: Int = 50
+        historyLimit: Int = 50,
+        refinementApplyMode: RefinementApplyMode = .afterInsert,
+        revisionDeadlineMs: Int = 3_000
     ) {
         self.hotkey = hotkey
         self.undoHotkey = undoHotkey
@@ -33,6 +55,8 @@ public struct Settings: Codable, Sendable, Equatable {
         self.refinementEnabled = refinementEnabled
         self.refinementTimeoutMs = refinementTimeoutMs
         self.historyLimit = historyLimit
+        self.refinementApplyMode = refinementApplyMode
+        self.revisionDeadlineMs = revisionDeadlineMs
     }
 
     public static let `default` = Settings()
@@ -40,6 +64,7 @@ public struct Settings: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case hotkey, undoHotkey, localeIdentifier, transcriberKind
         case refinementEnabled, refinementTimeoutMs, historyLimit
+        case refinementApplyMode, revisionDeadlineMs
     }
 
     /// **手編集した `settings.json` もここを通る。**
@@ -60,6 +85,22 @@ public struct Settings: Codable, Sendable, Equatable {
         self.refinementEnabled = try container.decode(Bool.self, forKey: .refinementEnabled)
         self.refinementTimeoutMs = try container.decode(Int.self, forKey: .refinementTimeoutMs)
         self.historyLimit = try container.decode(Int.self, forKey: .historyLimit)
+        // **この 2 つだけ `decodeIfPresent` である。理由は「部分的に読めた」を許すためではない。**
+        //
+        // フェーズ 1 が書いた `settings.json` には、この 2 キーが構造上存在しない。
+        // 上の 7 つと同じく `decode` にすると、**フェーズ 1 から更新した利用者の
+        // 設定ファイルが丸ごと「読めなかった」になり、PTT キーもロケールも既定へ戻る。**
+        // 欠けているのは「壊れているから」ではなく「そのスキーマには無かったから」であり、
+        // フェーズ 1 の最終レビュー I-4 が退けた `decodeIfPresent` 化（**既にある**キーを
+        // 任意にして部分復元を許すこと）とは別の話である。
+        //
+        // **新しいキーを足すたびにここへ足してよいわけではない。** 足してよいのは
+        // 「省略時の意味が既定値と一致し、省略が利用者の意図と読める」キーだけである。
+        self.refinementApplyMode =
+            try container.decodeIfPresent(RefinementApplyMode.self, forKey: .refinementApplyMode)
+            ?? .afterInsert
+        self.revisionDeadlineMs =
+            try container.decodeIfPresent(Int.self, forKey: .revisionDeadlineMs) ?? 3_000
         try validateHotkeys()
     }
 
@@ -113,4 +154,19 @@ public struct Settings: Codable, Sendable, Equatable {
     /// **予算の引き直しは配線トラックで (a)/(b) の実分布を見てから行う**）。**この値を上げてよいのは、上げたぶんだけ
     /// (b) の分岐で NFR-P6a を破ると判ったうえでのときだけ**である。
     public var refinementTimeout: Duration { .milliseconds(refinementTimeoutMs) }
+
+    /// 差し替え（FR-5(a)）の打ち切り。**NFR-P6b の「打ち切り 3 秒」がこれである。**
+    ///
+    /// **`refinementTimeout` とは効く場所が違う。** あちらは (b) の分岐——整形を待って
+    /// から挿入する経路——の打ち切りで、**そこでは超過が NFR-P6a（テキストが出るまで
+    /// 1 秒）を直接食う。** こちらは (a) の分岐の打ち切りで、**生テキストは既に欄にある。**
+    /// 超えたときの縮退は「整形が反映されないまま終わる」であり、発話は失われない。
+    /// だから (b) より大きい値を置ける。
+    ///
+    /// **既定 3000 ms は推定値である**（要件定義書 NFR-P6b）。由来は
+    /// 「3 秒の発話で M3 中央値 355〜364 ms」という実測に**出力長への比例という
+    /// LLM 一般の性質【推測】**を当てた外挿（121 字 ≒ 2.4 秒）＋ 約 25 % の余裕であり、
+    /// **直接の実測ではない。** 上限の本来の決め手は「利用者が続きを打ち始めるまでの
+    /// 時間」で、それは未実測である（検証項目 V-25 / V-29）。
+    public var revisionDeadline: Duration { .milliseconds(revisionDeadlineMs) }
 }

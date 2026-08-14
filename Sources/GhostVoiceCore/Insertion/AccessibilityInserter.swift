@@ -139,6 +139,27 @@ public struct AccessibilityInserter: PrimaryInserting {
         return accessibility.isSelectedTextSettable(element)
     }
 
+    /// **挿入の前に「後から差し替えられる見込みか」を答える**（FR-5(a) の分岐判定）。
+    ///
+    /// `canInsert()` の 4 条件に **C-5 の片割れ（`kAXSelectedTextRange` が settable か）**
+    /// を足したもの。錨を作るのに要るのはこの 1 つだけで、残りの条件
+    /// （キャレット位置が読めるか・読み戻しが一致するか）は**書いてみないと判らない。**
+    /// したがって**真は「見込み」であり、偽は確実である。**
+    ///
+    /// - Important: **AX の往復が `canInsert()` のぶんと重複する**（役割・settable の
+    ///   問い合わせを 2 度行う）。往復は実測 0.1〜5.5 ms で、(a) の分岐ではこの費用が
+    ///   NFR-P6a の予算に乗る。**重複を消すには判定結果を持ち回る形にする必要があり、
+    ///   その持ち回りはフォーカスが動いた瞬間に嘘になる**ので採らない。
+    ///   実測は未取得（検証項目 V-28）。
+    /// - Note: `capturesReplacementAnchor: false` で作った挿入器は常に false を返す。
+    ///   差し替えを切った構成では (a) の分岐へ載せない、という意味になる。
+    public func canCaptureAnchor() -> Bool {
+        guard capturesReplacementAnchor, canInsert(),
+              let element = accessibility.focusedElement()
+        else { return false }
+        return accessibility.isSelectedTextRangeSettable(element)
+    }
+
     public func tryInsert(_ text: String) async -> InsertionAttempt {
         // `canInsert()` とは別にフォーカスを取り直す。その隙にフォーカスが動きうるので、
         // 自プロセス判定はここでも掛ける。

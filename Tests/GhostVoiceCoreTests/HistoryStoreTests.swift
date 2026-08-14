@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import Synchronization
 @testable import GhostVoiceCore
 
 /// 変更通知を記録する。
@@ -64,11 +65,12 @@ struct HistoryStoreTests {
     private func makeEntry(
         raw: String = "生テキスト",
         refined: String? = "整形後テキスト",
-        at date: Date = Date()
+        at date: Date = Date(),
+        method: InsertionMethod = .ax
     ) -> HistoryEntry {
         HistoryEntry(
             id: UUID(), timestamp: date, rawText: raw, refinedText: refined,
-            localeIdentifier: "ja-JP", insertionMethod: .ax
+            localeIdentifier: "ja-JP", insertionMethod: method
         )
     }
 
@@ -272,7 +274,7 @@ struct HistoryStoreTests {
     }
 
     /// 猶予ちょうどは受け付けること。これが無いと `<=` と `<` の取り違えを見逃す。
-    @Test("ちょうど 10 秒前の履歴は Undo 対象になる")
+    @Test("ちょうど 10 秒前の履歴は undoCandidate に載る")
     func undoCandidateAtWindowBoundary() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -283,7 +285,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("10 秒を超えた履歴は Undo 対象にならない")
+    @Test("10 秒を超えた履歴は undoCandidate に載らない")
     func undoCandidateExpires() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -294,7 +296,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("整形していない履歴は Undo 対象にならない")
+    @Test("整形していない履歴は undoCandidate に載らない")
     func undoCandidateRequiresRefinement() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -307,7 +309,7 @@ struct HistoryStoreTests {
 
     /// 下限は 0 を含むこと。挿入直後に Undo を押した場合、記録時刻と現在時刻は
     /// ほぼ同じになる。上限側の境界テストと対になる。
-    @Test("記録時刻ちょうどの履歴は Undo 対象になる")
+    @Test("記録時刻ちょうどの履歴は undoCandidate に載る")
     func undoCandidateAtSameInstant() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -320,7 +322,7 @@ struct HistoryStoreTests {
 
     /// `history.json` は手編集でき、システムクロックが巻き戻ることもある。猶予に
     /// 下限が無いと、未来の日時を持つ履歴がいつまでも Undo 対象になり続ける。
-    @Test("未来の日時を持つ履歴は Undo 対象にならない")
+    @Test("未来の日時を持つ履歴は undoCandidate に載らない")
     func undoCandidateRejectsFutureTimestamp() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -331,7 +333,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("履歴が空なら Undo 対象は無い")
+    @Test("履歴が空なら undoCandidate は無い")
     func undoCandidateWithoutEntries() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -341,7 +343,7 @@ struct HistoryStoreTests {
 
     /// Undo が戻すのは直前に挿入した文字列だけ。直近が対象外のときに 1 つ前まで
     /// 遡ると、ユーザーが見ていない箇所の文字列を書き換えることになる。
-    @Test("直近が整形なしなら、さらに前の整形済み履歴は Undo 対象にならない")
+    @Test("直近が整形なしなら、さらに前の整形済み履歴は undoCandidate に載らない")
     func undoCandidateDoesNotLookPastUnrefinedLatest() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -353,7 +355,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("直近が猶予切れなら、さらに前の新しい履歴は Undo 対象にならない")
+    @Test("直近が猶予切れなら、さらに前の新しい履歴は undoCandidate に載らない")
     func undoCandidateDoesNotLookPastExpiredLatest() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -362,6 +364,111 @@ struct HistoryStoreTests {
             try store.append(makeEntry(raw: "直近の発話", at: now.addingTimeInterval(-30)))
 
             #expect(store.undoCandidate(now: now) == nil)
+        }
+    }
+
+    /// **持ち越し項目 16。挿入経路を見ないと、挿入していない発話まで候補になる。**
+    ///
+    /// とくに `.clipboardOnly` は**どこにも挿入していない。**
+    /// そこへ Undo を撃つと、挿入していないテキストを消そうとして**別の何かを消す。**
+    @Test(
+        "挿入していない経路の履歴は undoCandidate に載らない",
+        arguments: [InsertionMethod.pasteboard, .clipboardOnly, .notInserted]
+    )
+    func undoCandidateExcludesNonReplaceableMethods(method: InsertionMethod) throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let now = Date()
+            try store.append(makeEntry(at: now, method: method))
+
+            #expect(store.undoCandidate(now: now) == nil, "\(method) が候補になっている")
+        }
+    }
+
+    @Test("差し替えできる経路（.ax）の履歴だけが undoCandidate に載る")
+    func undoCandidateAcceptsTheAXMethod() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let now = Date()
+            try store.append(makeEntry(at: now, method: .ax))
+
+            #expect(store.undoCandidate(now: now) != nil)
+        }
+    }
+
+    // MARK: - update（FR-5(a) が整形結果を後から入れる）
+
+    @Test("後から整形結果を入れられる")
+    func updatesRefinedTextLater() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let entry = makeEntry(raw: "生テキスト", refined: nil)
+            try store.append(entry)
+
+            #expect(try store.update(id: entry.id, refinedText: "整形後"))
+            #expect(store.entries.first?.refinedText == "整形後")
+            #expect(store.entries.first?.rawText == "生テキスト", "生テキストを変えてはならない")
+            #expect(store.entries.first?.id == entry.id, "別の項目になっている")
+        }
+    }
+
+    @Test("更新はファイルにも反映される")
+    func updatePersists() throws {
+        try withTempRoot { root in
+            let entry = makeEntry(refined: nil)
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(entry)
+            try store.update(id: entry.id, refinedText: "整形後")
+
+            let reloaded = HistoryStore(rootURL: root, limit: 50)
+            #expect(reloaded.entries.first?.refinedText == "整形後")
+        }
+    }
+
+    /// 上限で押し出された後に差し替えが成功した場合。**何も書かず false を返す。**
+    @Test("存在しない id の更新は何も変えず false を返す")
+    func updateOfAMissingEntryChangesNothing() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(makeEntry(refined: nil))
+
+            #expect(try store.update(id: UUID(), refinedText: "整形後") == false)
+            #expect(store.entries.first?.refinedText == nil)
+        }
+    }
+
+    @Test("更新も購読者へ届く")
+    func updateNotifiesObservers() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let entry = makeEntry(refined: nil)
+            try store.append(entry)
+
+            let received = Mutex<[[HistoryEntry]]>([])
+            let subscription = store.observe { snapshot in
+                received.withLock { $0.append(snapshot) }
+            }
+            defer { subscription.cancel() }
+
+            try store.update(id: entry.id, refinedText: "整形後")
+            #expect(received.withLock { $0.count } == 1)
+            #expect(received.withLock { $0.first?.first?.refinedText } == "整形後")
+        }
+    }
+
+    @Test("同じ整形結果での更新は通知しない")
+    func updateWithTheSameValueIsANoOp() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let entry = makeEntry(refined: "整形後")
+            try store.append(entry)
+
+            let received = Mutex<Int>(0)
+            let subscription = store.observe { _ in received.withLock { $0 += 1 } }
+            defer { subscription.cancel() }
+
+            #expect(try store.update(id: entry.id, refinedText: "整形後") == false)
+            #expect(received.withLock { $0 } == 0)
         }
     }
 
@@ -505,7 +612,7 @@ struct HistoryStoreTests {
 
             #expect(store.entries.isEmpty)
             #expect(HistoryStore(rootURL: root, limit: 50).entries.isEmpty)
-            #expect(store.undoCandidate() == nil, "消したのに Undo 対象が残っている")
+            #expect(store.undoCandidate() == nil, "消したのに undoCandidate が残っている")
         }
     }
 

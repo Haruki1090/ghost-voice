@@ -46,12 +46,31 @@ public struct HistoryEntry: Codable, Sendable, Equatable, Identifiable {
     ///   本当の門は**メモリ上に生きている `ReplacementAnchor`** である（設計 opus §3.2）。
     ///   錨は `.ax` 経路の挿入でしか作られず、ディスクへ持ち越されないので、
     ///   アプリを再起動した後の履歴から自動 Undo が撃たれることはない。
-    ///   `HistoryStore.undoCandidate` はこの値も見ること（**別トラック担当**）。
+    ///   `HistoryStore.undoCandidate` もこの値を見る（配線トラックで接続済み）。
     public var isAutomaticUndoCandidate: Bool {
         guard refinedText != nil else { return false }
         switch insertionMethod {
         case .ax: return true
         case .pasteboard, .clipboardOnly, .notInserted: return false
+        }
+    }
+
+    /// **自動では戻せないが、生テキストをクリップボードへ取り出せる発話か**
+    /// （要件定義書 FR-7 の細目 3 行目 / UC-3 の縮退）。
+    ///
+    /// `isAutomaticUndoCandidate` と**ちょうど裏返しの経路**を拾う。整形結果が入って
+    /// いるのに範囲を持てなかった発話——`.pasteboard` と `.clipboardOnly`——がこれで、
+    /// FR-7 は「戻せる」を満たせないと認めたうえで**クリップボードへ逃がす**と定めている。
+    ///
+    /// - Important: **`.notInserted` は含まない。** 中断された発話は挿入されておらず、
+    ///   `refinedText` も入らない（`DictationSession.finishCancelled`）。
+    /// - Note: **クリップボードを奪うのは利用者の明示操作のときだけ**という前提に
+    ///   立っている（Undo キーを押した瞬間にしか使わない）。
+    public var isManualUndoFallbackCandidate: Bool {
+        guard refinedText != nil else { return false }
+        switch insertionMethod {
+        case .pasteboard, .clipboardOnly: return true
+        case .ax, .notInserted: return false
         }
     }
 }

@@ -112,6 +112,10 @@ public enum SessionNarration {
             return "[整形中]\n"
         case .inserting:
             return "[挿入中]\n"
+        case .revising:
+            // **控えめに出す**（基本設計書 §8.2）。挿入は既に終わっており、
+            // 利用者は次の作業へ移っている。**断念しても生テキストは欄に残る。**
+            return "[整形を反映中]\n"
         case .failed(let failure):
             return "[エラー] \(message(for: failure))\n"
         }

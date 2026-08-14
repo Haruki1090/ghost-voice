@@ -8,10 +8,16 @@ public enum Metrics {
     /// - Important: **要件定義書 §2.8.6 の裁定で、この 1 秒が守る対象が変わった。**
     ///   守るのは「整形済みテキスト」ではなく「まず使えるテキスト」である。
     ///   **差し替えできる挿入先では、生テキストを先に挿入するので整形（M3）がこの予算に入らない。**
-    ///   下の `Sample.total` / `meetsTarget` は現在も `M2 + M3 + M4` を返す——
-    ///   これは**整形を待ってから挿入する分岐（(b)）の値**であり、
-    ///   **差し替えの分岐を実装する時点で、この 2 つの定義も直す必要がある**（詳細設計書 §10）。
+    ///   `Sample.total` はその区別を `waitedForRefinementBeforeInsert` で行う。
     public static let totalBudget: Duration = .milliseconds(1_000)
+
+    /// NFR-P6b の**目標**。発話終了 → 整形結果が反映されるまで。
+    ///
+    /// - Important: **推定値である**（要件定義書 NFR-P6b）。3 秒の発話での M3 実測に
+    ///   出力長への比例【推測】を当てた外挿であって、直接の実測ではない。
+    ///   打ち切り（既定 3 秒）は `Settings.revisionDeadline` が持つ。
+    ///   **超過の縮退は「生テキストのまま」であり、発話は失われない。**
+    public static let revisionBudget: Duration = .milliseconds(2_000)
 
     /// 1 発話ぶんの計測値。
     ///
@@ -49,32 +55,77 @@ public enum Metrics {
         /// 0 でない発話は音の一部が欠けている。
         public let droppedBuffers: Int
 
-        /// M5a: キー解放 → 挿入完了（**整形を待ってから挿入する分岐の値**）。
+        /// **整形を挿入の前に待ったか。** これが `total` の定義を決める。
         ///
-        /// - Important: **生テキストを先に挿入する分岐（要件定義書 FR-5(a)）では、
-        ///   この和は M5a ではない**——そこでは整形が挿入の後ろにあるので、
-        ///   M5a は `finalize + insert` になり、整形の反映は別の値（M6）で測る。
-        ///   **既存の M5 実測（398 / 411 ms）と並べて比べないこと**（詳細設計書 §10）。
-        public var total: Duration { finalize + refine + insert }
+        /// - `true` … (b) の分岐（`refinementApplyMode == .beforeInsert`、または
+        ///   差し替えできない挿入先）。整形はクリティカルパスの上にある。
+        /// - `false` … (a) の分岐（FR-5(a)）。**整形は挿入と並行に走るので、
+        ///   テキストが現れるまでの時間には入らない。**
+        ///
+        /// 既定は `true`——フェーズ 1 の呼び出し側（と既存の計測）はすべて (b) だからである。
+        public let waitedForRefinementBeforeInsert: Bool
+
+        /// M6: キー解放 → **差し替え完了**（NFR-P6b）。差し替えを行わなかったら nil。
+        ///
+        /// **nil は失敗ではない。** 差し替えできない挿入先・整形が無効・整形が返らなかった・
+        /// 差し替えを断念した、のいずれでも nil になる。どの場合も生テキストは欄にある。
+        public let revision: Duration?
+
+        /// M5a: キー解放 → **テキストが挿入先に現れる**まで。**NFR-P6a の判定はこれで行う。**
+        ///
+        /// - Important: **(a) と (b) で足す区間が違う。**
+        ///   (b) は `M2 + M3 + M4`、(a) は `M2 + M4`（整形は挿入の後ろにある）。
+        ///   **既存の M5 実測（398 / 411 ms）は (b) の値なので、(a) の値と並べて
+        ///   比べないこと**（詳細設計書 §10）。
+        public var total: Duration {
+            waitedForRefinementBeforeInsert ? finalize + refine + insert : finalize + insert
+        }
 
         public var finalizeMs: Int { Metrics.milliseconds(finalize) }
         public var refineMs: Int { Metrics.milliseconds(refine) }
         public var insertMs: Int { Metrics.milliseconds(insert) }
+        /// M6 のミリ秒。差し替えを行わなかったら nil。
+        public var revisionMs: Int? { revision.map(Metrics.milliseconds) }
 
         /// **3 つのミリ秒の和ではなく、合計の実時間から丸める。**
         /// 各区間を切り捨ててから足すと、合計が最大 3 ms 過少に出る。
         public var totalMs: Int { Metrics.milliseconds(total) }
 
-        /// NFR-P6a（1 秒以内）を満たしたか。**`total` と同じ留保が掛かる。**
+        /// NFR-P6a（1 秒以内）を満たしたか。**`total` と同じ区別が掛かる。**
         public var meetsTarget: Bool { total <= Metrics.totalBudget }
 
-        public init(finalize: Duration, refine: Duration, insert: Duration, droppedBuffers: Int = 0) {
+        /// NFR-P6b（目標 2 秒）を満たしたか。**差し替えを行わなかったら nil。**
+        ///
+        /// **nil を「未達」と数えてはならない。** 差し替えできない挿入先では
+        /// そもそもこの要件の対象外である（要件定義書 NFR-P6b は「差し替え可能経路のみ」）。
+        public var meetsRevisionTarget: Bool? {
+            revision.map { $0 <= Metrics.revisionBudget }
+        }
+
+        public init(
+            finalize: Duration, refine: Duration, insert: Duration, droppedBuffers: Int = 0,
+            waitedForRefinementBeforeInsert: Bool = true, revision: Duration? = nil
+        ) {
             self.finalize = finalize
             self.refine = refine
             self.insert = insert
             self.droppedBuffers = droppedBuffers
+            self.waitedForRefinementBeforeInsert = waitedForRefinementBeforeInsert
+            self.revision = revision
         }
 
+        /// 差し替えが終わった時点の値を作る。
+        ///
+        /// **(a) の分岐では M3（整形）が挿入より後に確定する。** 挿入の直後に作った
+        /// 標本は `refine: .zero` を持っており、整形が返ってから本当の値が入る。
+        /// **M2 / M4 は動かさない**——挿入までの区間は既に確定している。
+        func rewriting(refine: Duration, revision: Duration) -> Sample {
+            Sample(
+                finalize: finalize, refine: refine, insert: insert,
+                droppedBuffers: droppedBuffers,
+                waitedForRefinementBeforeInsert: waitedForRefinementBeforeInsert,
+                revision: revision)
+        }
     }
 
     static func milliseconds(_ duration: Duration) -> Int {

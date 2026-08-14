@@ -131,6 +131,11 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     /// 監視している PTT のバインド。**`rebind(to:)` で差し替わる**ので、
     /// 読むときは必ずロックの中で読むこと（`handle` は既にそうしている）。
     private var binding: HotkeyBinding
+    /// 監視している Undo のバインド（FR-7）。**タップのマスクには影響しない**
+    /// （`keyDown` しか見ないので、既に必ず入っている）。
+    private var undoBinding: HotkeyBinding
+    /// いま Undo で戻せるものがあるか（`setUndoAvailable`）。**抑止の可否だけを決める。**
+    private var isUndoAvailable = false
     private var phase: Phase = .idle
     private var isRecording = false
     /// セッションが確定〜整形の処理中か（`setSessionBusy`）。
@@ -162,12 +167,14 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
 
     public init(
         binding: HotkeyBinding,
+        undoBinding: HotkeyBinding = .controlCommandZ,
         listenAccessProbe: @escaping @Sendable () -> Bool = { CGPreflightListenEventAccess() },
         accessibilityProbe: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
         tapController: any EventTapControlling = SystemEventTapController(),
         runLoop: CFRunLoop = CFRunLoopGetMain()
     ) {
         self.binding = binding
+        self.undoBinding = undoBinding
         self.listenAccessProbe = listenAccessProbe
         self.accessibilityProbe = accessibilityProbe
         self.tapController = tapController
@@ -294,6 +301,30 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.withLock { isSessionBusy = busy }
     }
 
+    /// いま監視している Undo のバインド（`HotkeyMonitor` の契約）。
+    public var currentUndoBinding: HotkeyBinding {
+        lock.withLock { undoBinding }
+    }
+
+    /// Undo のバインドを差し替える（`HotkeyMonitor` の契約）。
+    ///
+    /// **`rebind(to:)` と違ってタップを張り替えない。** Undo は `keyDown` しか見ず、
+    /// それは PTT のバインドに関わらず常にマスクへ入っているためである
+    /// （`eventMask(for:)`）。したがって録音を巻き添えにしない。
+    public func rebindUndo(to newBinding: HotkeyBinding) throws {
+        try lock.withLock {
+            guard phase != .stopped else { throw HotkeyError.stopped }
+            undoBinding = newBinding
+        }
+    }
+
+    /// 戻せるものがあるかを知らせる（`HotkeyMonitor` の契約）。
+    ///
+    /// **hot path から見えるのはこのフラグの読み取りだけ**（`setSessionBusy` と同じ理由）。
+    public func setUndoAvailable(_ available: Bool) {
+        lock.withLock { isUndoAvailable = available }
+    }
+
     /// PTT のバインドを差し替える（`HotkeyMonitor` の契約。欠落 9 / 持ち越し項目 10）。
     ///
     /// **タップを張り替える。** 監視するイベント種別はバインドで変わる（修飾キー単独では
@@ -372,6 +403,9 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         runLoopSource = nil
         isRecording = false
         isSessionBusy = false
+        // 止めた監視器が打鍵を奪い続けてはならない（タップは畳むので実効は無いが、
+        // フラグを残すと「停止済みなのに Undo キーを抑止する」状態を表現してしまう）。
+        isUndoAvailable = false
         phase = .stopped
         lock.unlock()
 
@@ -414,12 +448,15 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.lock()
         let decision = HotkeyDecision.decide(
             type: type, keyCode: keyCode, flags: flags,
-            binding: binding, isRecording: isRecording, isSessionBusy: isSessionBusy
+            binding: binding, isRecording: isRecording, isSessionBusy: isSessionBusy,
+            undoBinding: undoBinding, isUndoAvailable: isUndoAvailable
         )
         switch decision.event {
         case .pressed: isRecording = true
         case .released, .cancelled, .interrupted: isRecording = false
-        case nil: break
+        // **Undo は録音状態を動かさない。** 録音中に Undo キーを押しても、
+        // 進行中の発話は続く（戻す対象は「直前に差し替えた発話」である）。
+        case .undoRequested, nil: break
         }
         lock.unlock()
 

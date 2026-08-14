@@ -9,8 +9,53 @@ public enum SessionState: Sendable, Equatable {
     case finalizing
     case refining
     case inserting
+    /// **挿入済みの生テキストを整形結果へ差し替えている**（FR-5(a) / 基本設計書 §4）。
+    ///
+    /// **差し替えできる挿入先でのみ通る。** `.inserting` → `.idle` の**後**に
+    /// `.revising` → `.idle` が続く形になる（`.idle` を挟むのは、その時点で
+    /// 次の PTT を受け付けるためである。差し替えは「忙しい」に数えない）。
+    ///
+    /// - Important: **表示は控えめにすること**（基本設計書 §8.2）。挿入は既に終わって
+    ///   おり、利用者は次の作業へ移っている。**断念しても生テキストは欄に残る。**
+    /// - Note: **FR-7 の Undo もこの状態を通る。** 欄を書き換えているという意味は同じで、
+    ///   向き（生 → 整形／整形 → 生）だけが違う（要件定義書 §2.8.6 の裁定 3）。
+    case revising
     /// 失敗。**この直後に必ず `.idle` が続く。** どれだけ表示するかは UI 側が決める。
     case failed(SessionFailure)
+}
+
+/// **利用者へ告げるが、発話の失敗ではないこと。**
+///
+/// `SessionFailure` と分けてあるのは意味が違うためである。`SessionFailure` は
+/// 「その発話が縮退した」ことを表すが、ここに並ぶのは**発話が既に挿入先にある状態での
+/// 出来事**である（差し替えが効いた／効かなかった／戻した／戻せなかった）。
+/// 混ぜると、HUD が「失敗」として出すべきものとそうでないものを区別できなくなる。
+///
+/// - Important: **文言も発話も持たせない。** 通知に発話やその一部を載せると、
+///   通知センターやログへ発話が漏れる経路が生まれる（`ReplacementNotice` と同じ規律）。
+public enum SessionNotice: Sendable, Equatable {
+    /// 整形結果を挿入済みのテキストへ反映した（FR-5(a) が効いた）。
+    case refinementApplied
+    /// **整形結果を反映できなかった。生テキストが欄にある。**
+    ///
+    /// - Parameter reason: 断念の理由。nil は「整形そのものが返らなかった」
+    ///   （打ち切り・利用不可・逸脱の検査に落ちた）。
+    ///   **どの理由でも欄の内容は変えていない。**
+    case refinementNotApplied(ReplacementDecline?)
+    /// **差し替えの途中で欄の内容が判らなくなった**（R-9）。
+    /// 差し替えようとした文字列はクリップボードにある。**これだけは重い。**
+    case textMayHaveBeenLost
+    /// Undo で整形前の生テキストへ戻した（FR-7）。
+    case undone
+    /// **戻せるものが無かった。** 10 秒窓の外・差し替えていない・そもそも挿入していない。
+    case undoUnavailable
+    /// Undo を試したが断念した（利用者が編集した・別のアプリへ移った等）。**何も書き換えていない。**
+    case undoDeclined(ReplacementDecline)
+    /// **自動では戻せない経路だったので、生テキストをクリップボードへ取り出した**
+    /// （FR-7 の細目 3 行目 / UC-3 の縮退）。
+    ///
+    /// クリップボードを奪ってよいのは、これが**利用者の明示操作**だからである。
+    case undoCopiedRawTextToClipboard
 }
 
 /// 縮退した理由。**文字列ではなく型で持つ。**
@@ -37,6 +82,18 @@ public enum SessionFailure: Sendable, Equatable {
     case historyUnavailable(insertedElsewhere: Bool)
 }
 
+/// セッションの操作そのものが受け付けられなかった。
+///
+/// **`SessionFailure`（発話が縮退した理由）とは別である。** こちらは
+/// 「いま呼んではいけない口を呼んだ」ことを呼び出し側へ返す。
+public enum DictationSessionError: Error, Equatable, Sendable {
+    /// 発話を抱えている最中だった（録音中・確定〜挿入の処理中）。
+    ///
+    /// **待って呼び直すのは呼び出し側の判断である。** ここで待つと、
+    /// 設定画面が発話 1 回ぶん（実測 400〜800 ms）固まる。
+    case busy
+}
+
 /// PTT 1 回ぶんの流れを統括する状態機械。
 ///
 /// ## 原則
@@ -47,10 +104,18 @@ public enum SessionFailure: Sendable, Equatable {
 /// > そのときは整形も挿入も履歴もクリップボードへの残置も行わない。ユーザーが
 /// > パスワードを入力しているためで、**「発話を失っている」と見て残置を足してはならない。**
 ///
-/// ## 消費者はそれぞれ 1 つに限る
+/// ## 状態を購読する 2 つの口（**新しい購読者は `stateStream()` を使うこと**）
 ///
-/// `stateUpdates` は `AsyncStream` なので、複数の `next()` を同時に待つと異常終了する。
-/// また `run()` はプロセスにつき 1 回だけ呼ぶこと（ホットキーのイベント列も単一消費者）。
+/// | 口 | 消費者 | MainActor から |
+/// |---|---|---|
+/// | `stateUpdates` | **1 つだけ。** 複数の `next()` を同時に待つと異常終了する | 取得は `await` 無しでできる |
+/// | `stateStream()` | **何人でも。** 呼ぶたびに独立したストリームを返す | **呼んでよい**（`nonisolated`） |
+///
+/// `stateUpdates` はフェーズ 1 からの口で、CLI が使っている。**HUD・終了待ち・履歴一覧が
+/// 同時に状態を要る**フェーズ 2 では足りないので、分配する口を足した（調査 A-3 の欠落 1）。
+/// **同じものが両方へ流れる。**
+///
+/// `run()` はプロセスにつき 1 回だけ呼ぶこと（ホットキーのイベント列も単一消費者）。
 ///
 /// ## メインのランループが要る
 ///
@@ -84,8 +149,15 @@ public actor DictationSession {
     private let hotkey: any HotkeyMonitor
     private let audio: any AudioCapturing
     private let transcriber: any Transcribing
-    private let refiner: any Refining
+    private nonisolated let refiner: any Refining
     private let inserter: any TextInserting
+    /// 挿入器が錨まで返せる場合の同じもの。**(a) の分岐はこれが無いと成立しない。**
+    private let anchoringInserter: (any AnchoringTextInserting)?
+    /// 差し替え器。**挿入器と同じ世代・同じクリップボードで組まれたもの**
+    /// （`CompositeInserter.systemStack`）。nil なら常に (b) の分岐で動く。
+    private let replacer: TextReplacer?
+    /// 自動で戻せない発話の生テキストを取り出す先（FR-7 の細目 3 行目）。
+    private let clipboard: (any ClipboardLeaving)?
     private let history: HistoryStore
     private let vocabulary: VocabularyStore
     private let isSecureInputEnabled: @Sendable () -> Bool
@@ -94,7 +166,24 @@ public actor DictationSession {
     private let finalizeDeadline: Duration
 
     private let stateContinuation: AsyncStream<SessionState>.Continuation
+    /// 状態の**単一消費者**の口（フェーズ 1 からのもの。CLI が使う）。
+    ///
+    /// - Important: **複数の `next()` を同時に待つと異常終了する。**
+    ///   2 人目からは `stateStream()` を使うこと。
     public nonisolated let stateUpdates: AsyncStream<SessionState>
+
+    /// 状態の分配器。`stateStream()` が配る。
+    private nonisolated let stateBroadcast = SessionBroadcast<SessionState>()
+    /// マイク音量の分配器。`levelStream()` が配る。
+    private nonisolated let levelBroadcast = SessionBroadcast<Float>()
+    /// 通知の分配器。`notices()` が配る。
+    private nonisolated let noticeBroadcast = SessionBroadcast<SessionNotice>()
+    /// モデル導入の分配器。`assetInstallationEvents()` が配る。
+    private nonisolated let assetBroadcast = SessionBroadcast<AssetInstallationEvent>()
+    /// `audio.level`（単一消費者）を 1 人で読み、分配器へ流す係。
+    private var levelTask: Task<Void, Never>?
+    /// `transcriber.assetInstallation`（単一消費者）を 1 人で読み、分配器へ流す係。
+    private var assetTask: Task<Void, Never>?
 
     public private(set) var state: SessionState = .idle
     public private(set) var latestMetrics: Metrics.Sample?
@@ -148,6 +237,27 @@ public actor DictationSession {
     /// 処理中に ESC が届いたか（基本設計書 §4「中断は挿入が始まる前のどの状態からでも」）。
     private var isCancelRequested = false
 
+    // MARK: - 保留中の差し替えと Undo（FR-5(a) / FR-7）
+
+    /// 整形の完了を待って差し替えを撃つタスク。**`isBusy` には数えない**（設計 opus §3.3）。
+    ///
+    /// 捨てても生テキストは欄にあるので、いつ捨てても「何も書き換えていない」状態で終わる。
+    private var pendingRevision: Task<Void, Never>?
+    /// 保留中の差し替えに対して ESC が届いたか。
+    ///
+    /// **書き込みが 1 回も起きていない段階でのみ効く**（基本設計書 §4）。
+    /// 差し替えが始まった後の ESC は受け付けない——範囲を選んだ直後に止めると選択だけが残る。
+    private var isRevisionCancelled = false
+    /// **Undo で戻せる場所。これが FR-7 の門である**（履歴ではない）。
+    ///
+    /// 錨は `.ax` 経路の挿入でしか作られず、`replace` が成功したときにだけ
+    /// `previousText` を持つ。**挿入していない発話へ Undo を撃つ経路は型として存在しない。**
+    private var undoAnchor: ReplacementAnchor?
+    /// 上の錨が有効な期限。**差し替えが成功した時刻から 10 秒**（詳細設計書 §8.3。
+    /// 挿入時刻からではない——(a) では挿入と差し替えの間に最大 NFR-P6b ぶんの隔たりがある）。
+    private var undoExpiry: ContinuousClock.Instant?
+    private var undoExpiryTask: Task<Void, Never>?
+
     /// 確定テキストが出そろったか。**「最初の確定が届いたか」ではない。**
     ///
     /// キー解放後に届く確定は **1 件とは限らない**（V-12。実機の肉声で再現した）。
@@ -166,6 +276,39 @@ public actor DictationSession {
     private var isFinalSettled = false
     private var finalWaiters: [CheckedContinuation<Void, Never>] = []
 
+    /// **差し替え（FR-5(a) / FR-7）まで含めた本番の組み立て。**
+    ///
+    /// `CompositeInserter.systemStack(...)` が返す組をそのまま渡すこと。
+    /// **挿入器と差し替え器を別々に作って渡してはならない**——世代を共有しないと
+    /// 差し替えが一度も効かず、クリップボードを共有しないと喪失時の退避先が
+    /// 誰にも見えない場所になる（`InsertionStack` の注記。どちらも黙って壊れる）。
+    public init(
+        settings: SettingsStore,
+        hotkey: any HotkeyMonitor,
+        audio: any AudioCapturing,
+        transcriber: any Transcribing,
+        refiner: any Refining,
+        insertion: InsertionStack,
+        history: HistoryStore,
+        vocabulary: VocabularyStore,
+        isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() },
+        postEventAuthorization: PostEventAuthorization = .shared,
+        maxRecordingDuration: Duration = DictationSession.defaultMaxRecordingDuration,
+        finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline
+    ) {
+        self.init(
+            settings: settings, hotkey: hotkey, audio: audio, transcriber: transcriber,
+            refiner: refiner, inserter: insertion.inserter, replacer: insertion.replacer,
+            clipboard: insertion.clipboard, history: history, vocabulary: vocabulary,
+            isSecureInputEnabled: isSecureInputEnabled,
+            postEventAuthorization: postEventAuthorization,
+            maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline)
+    }
+
+    /// - Parameter replacer: 差し替え器。**nil なら常に (b) の分岐**——整形を待ってから
+    ///   挿入する、フェーズ 1 と同じ経路で動く（`refinementApplyMode` の設定によらない）。
+    /// - Parameter clipboard: 自動で戻せない発話の生テキストを取り出す先（FR-7 の細目）。
+    ///   **`replacer` と同じクリップボードを渡すこと。**
     public init(
         settings: SettingsStore,
         hotkey: any HotkeyMonitor,
@@ -173,6 +316,8 @@ public actor DictationSession {
         transcriber: any Transcribing,
         refiner: any Refining,
         inserter: any TextInserting,
+        replacer: TextReplacer? = nil,
+        clipboard: (any ClipboardLeaving)? = nil,
         history: HistoryStore,
         vocabulary: VocabularyStore,
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() },
@@ -186,6 +331,9 @@ public actor DictationSession {
         self.transcriber = transcriber
         self.refiner = refiner
         self.inserter = inserter
+        self.anchoringInserter = inserter as? any AnchoringTextInserting
+        self.replacer = replacer
+        self.clipboard = clipboard
         self.history = history
         self.vocabulary = vocabulary
         self.isSecureInputEnabled = isSecureInputEnabled
@@ -203,6 +351,74 @@ public actor DictationSession {
         )
     }
 
+    // MARK: - UI から使う口（調査 `core-api-and-hud.md` の A-3）
+
+    /// **状態を購読する。呼ぶたびに独立したストリームを返す**（欠落 1）。
+    ///
+    /// - Important: **単一消費者ではない。** HUD・終了待ち・履歴一覧が同時に持ってよい。
+    ///   ただし**1 本を 2 箇所で読み回さないこと**（`AsyncStream` の制約は 1 本ごとに掛かる）。
+    /// - Important: **MainActor から呼んでよい**（`nonisolated`。ロックを取るだけ）。
+    /// - Important: **取りこぼしの防止装置ではない。** 読み手が遅れると古い暫定表示から
+    ///   捨てる。**終了の判定にこれを使わないこと**——終了は actor 側の `isBusy` を見る。
+    /// - Note: `run()` が戻ると終端する。**`run()` の後に呼ぶと即座に終端したものが返る。**
+    public nonisolated func stateStream() -> AsyncStream<SessionState> {
+        stateBroadcast.stream()
+    }
+
+    /// **マイク音量（RMS）を購読する**（欠落 3。HUD の録音インジケータ）。
+    ///
+    /// `AudioCapturing.level` は単一消費者なので、**セッションが 1 人で読んで配り直す。**
+    /// 読み始めるのは `warmUp()`（＝`run()` の頭）である。
+    ///
+    /// - Important: **単一消費者ではない**（`stateStream()` と同じ）。
+    /// - Important: **MainActor から呼んでよい**（`nonisolated`）。
+    /// - Important: **値は録音中にしか流れない。** タップが外れているあいだは何も来ない
+    ///   （「無音の 0」も来ない）ので、UI は状態（`.recording`）の側で表示を畳むこと。
+    /// - Note: 遅れた読み手には**最新の 1 件だけ**を渡す。音量は積み上げても意味が無い。
+    public nonisolated func levelStream() -> AsyncStream<Float> {
+        levelBroadcast.stream(bufferingPolicy: .bufferingNewest(1))
+    }
+
+    /// **利用者へ告げること（差し替え・Undo の顛末）を購読する。**
+    ///
+    /// `SessionState` と分けてあるのは、ここに並ぶのが**発話が既に挿入先にある状態での
+    /// 出来事**だからである（`SessionNotice`）。
+    ///
+    /// - Important: **単一消費者ではない。MainActor から呼んでよい。**
+    /// - Important: **取りこぼしうる**（分配器の既定は最新 32 件）。
+    ///   ただし `.textMayHaveBeenLost` を落とさないよう、購読側は速く抜けること。
+    public nonisolated func notices() -> AsyncStream<SessionNotice> {
+        noticeBroadcast.stream()
+    }
+
+    /// **モデル導入の進捗を購読する**（欠落 5。HUD / 権限案内）。
+    ///
+    /// フェーズ 1 は「導入が始まった」の 1 回きりしか出せず、**数分掛かる導入のあいだ
+    /// 利用者には「押しても何も起きない」としか見えなかった。**
+    ///
+    /// - Important: **単一消費者ではない。MainActor から呼んでよい。**
+    /// - Important: **導入済みの環境では 1 件も流れない**（`prepare` が即座に戻る）。
+    ///   「進捗が来ないこと」を異常と判定しないこと。
+    public nonisolated func assetInstallationEvents() -> AsyncStream<AssetInstallationEvent> {
+        assetBroadcast.stream()
+    }
+
+    /// **LLM 整形が使えるか**（欠落 4。Apple Intelligence 無効時の「整形なし」バッジ）。
+    ///
+    /// - Important: **MainActor から同期で読んでよい**（`nonisolated`。actor を跨がない）。
+    /// - Note: **設定の `refinementEnabled` とは別の量である。** こちらは環境の能力、
+    ///   あちらは利用者の意思。両方が真のときだけ整形が走る。
+    public nonisolated var isRefinementAvailable: Bool { refiner.isAvailable }
+
+    /// **いま Undo で戻せるものがあるか**（FR-7。UI の「戻す」ボタンの活性）。
+    ///
+    /// - Important: **actor 隔離なので `await` が要る。** SwiftUI の `body` から
+    ///   直接読めない。`SessionMirror` が MainActor 側の写しを持つ。
+    public var canUndo: Bool {
+        guard let undoExpiry else { return pendingRevision != nil }
+        return ContinuousClock.now <= undoExpiry
+    }
+
     // MARK: - 起動
 
     /// 起動時のウォームアップ。実測でコールド 1.9〜3.3 秒 / ウォーム 0.4 秒の差がある。
@@ -216,6 +432,15 @@ public actor DictationSession {
     public func warmUp() async {
         // 【Task 8 申し送り】初回コスト（実測 16.7 ms / 23.8 ms）を最初の挿入から外す。
         refreshPermissions()
+
+        // **単一消費者の口を、1 人で読んで配り直す。** ここで読み始めないと
+        // HUD は音量も導入の進捗も受け取れない（調査 A-3 の欠落 3 / 5）。
+        startFanOut()
+
+        // 監視器へ Undo のバインドを反映する（設定ファイルが正）。
+        // **失敗しても起動は続ける。** ここで諦めると PTT ごと使えなくなり、
+        // 失うものが「Undo が効かない」から「ディクテーションが動かない」へ跳ね上がる。
+        try? hotkey.rebindUndo(to: settings.settings.undoHotkey)
 
         do {
             try audio.prepare()
@@ -239,6 +464,27 @@ public actor DictationSession {
 
         let refiner = self.refiner
         Task.detached(priority: .utility) { await refiner.prewarm() }
+    }
+
+    /// 単一消費者のストリームを 1 人で読み、分配器へ流す係を立てる。
+    ///
+    /// **2 回呼んでも 2 人にならない**（既に居れば何もしない）。2 人で読むと
+    /// `AsyncStream` の制約に触れて異常終了する。
+    private func startFanOut() {
+        if levelTask == nil {
+            let levels = audio.level
+            let broadcast = levelBroadcast
+            levelTask = Task {
+                for await level in levels { broadcast.yield(level) }
+            }
+        }
+        if assetTask == nil {
+            let events = transcriber.assetInstallation
+            let broadcast = assetBroadcast
+            assetTask = Task {
+                for await event in events { broadcast.yield(event) }
+            }
+        }
     }
 
     /// 解析器を 1 つ作って畳む捨て往復。**起動後の最初の発話の頭を落とさないために要る。**
@@ -279,15 +525,37 @@ public actor DictationSession {
         }
     }
 
-    /// ロケールや認識種別を変えたときに呼ぶ。
+    /// ロケールや認識種別を変えたときに呼ぶ（欠落 11）。
     ///
     /// **自動で再試行しないための入口である。** 失敗はそのまま投げるので、
     /// 呼び出し側（設定画面）がユーザーへ見せ、再試行の回数を人の操作の回数に縛る。
     ///
-    /// - Important: **録音中に呼んではならない。** 進行中の発話の解析器を作り直す
-    ///   ことになる。設定画面から呼ぶ想定なので、`state == .idle` を確かめること。
+    /// - Important: **発話を抱えている間は `DictationSessionError.busy` を投げる。**
+    ///   フェーズ 1 は「録音中に呼ぶな」という約束を呼び出し側へ押し付けていたが、
+    ///   **守られたかを確かめる手段が呼び出し側にも無い**——`state` を読んでから
+    ///   これを呼ぶまでの間に PTT が押されうるためである。**判定は actor の中でしか
+    ///   安全に置けない**ので、ここで見る。
+    /// - Important: **`isBusy`（`phase`）を見る。`state` ではない。**
+    ///   `phase` が立ってから最初の `emit` までに窓があり、そこで `state` を見ると
+    ///   「待機中だ」と誤る（`isBusy` の注記）。
+    /// - Important: **MainActor から `await` してよい。** ただしモデルの導入を伴うと
+    ///   数分戻らない（進捗は `assetInstallationEvents()` で見る）。
+    /// - Throws: `DictationSessionError.busy` — 発話の最中。
+    ///   `TranscriptionError.*` — 準備そのものの失敗。
     public func prepareTranscriber(locale: Locale, kind: TranscriberKind) async throws {
+        guard phase == .idle else { throw DictationSessionError.busy }
         try await transcriber.prepare(locale: locale, kind: kind)
+    }
+
+    /// Undo のバインドを監視器へ反映する（FR-11。設定画面から）。
+    ///
+    /// **`SettingsStore` の保存とは別の操作である。** 保存しただけでは監視器は
+    /// 古いキーを見ている（`HotkeyMonitor.currentUndoBinding` の注記）。
+    ///
+    /// - Important: **MainActor から `await` してよい。** タップは張り替えないので
+    ///   録音中に呼んでも発話を巻き添えにしない。
+    public func rebindUndoHotkey(to binding: HotkeyBinding) throws {
+        try hotkey.rebindUndo(to: binding)
     }
 
     /// キー送出の権限を照会し直す。**起動時と権限フロー通過時に呼ぶ。**
@@ -321,11 +589,24 @@ public actor DictationSession {
             // キー解放を受け取れなくなっただけなので、最大録音時間の満了と同じく
             // **確定として扱い、そこまでの発話を届ける。** 利用者は喋っていたのだから。
             case .interrupted: stopRecording(cancelled: false)
+            case .undoRequested: performUndo()
             }
         }
         await completionTask?.value
         completionTask = nil
+        // **保留中の差し替えは見届けない。** 捨てても生テキストは欄にあり、
+        // 待つと終了が最大 NFR-P6b（既定 3 秒）延びる（設計 opus §3.3）。
+        pendingRevision?.cancel()
+        pendingRevision = nil
+        levelTask?.cancel()
+        levelTask = nil
+        assetTask?.cancel()
+        assetTask = nil
         stateContinuation.finish()
+        stateBroadcast.finish()
+        levelBroadcast.finish()
+        noticeBroadcast.finish()
+        assetBroadcast.finish()
     }
 
     /// ESC（`.cancelled`）を受けたときの分岐。**どの状態から押されたかで意味が変わる。**
@@ -345,7 +626,10 @@ public actor DictationSession {
         switch phase {
         case .recording: stopRecording(cancelled: true)
         case .processing: isCancelRequested = true
-        case .idle: break
+        // **保留中の差し替えに対する ESC は「取りやめる」として効く**（基本設計書 §4）。
+        // 書き込みが 1 回も起きていないので、これは完全に安全な取消しである。
+        // 保留が無ければ何も起きない（従来どおり）。
+        case .idle: cancelPendingRevision()
         }
     }
 
@@ -587,14 +871,31 @@ public actor DictationSession {
             return
         }
 
-        // --- 整形（失敗・超過時は生テキストへ縮退）
-        emit(.refining)
+        // --- 整形を**起動する**。待つかどうかは経路が決める（要件定義書 FR-5 の細目）。
+        //
+        // **経路判定より先に起動する。** 判定（`canCaptureAnchor()`）は AX の往復を
+        // 数回伴うので、後から起動すると (b) の分岐でその往復ぶん整形の開始が遅れ、
+        // **余裕 1 ms しかない (b) の予算（199 + 750 + 50 = 999 ms）を直接食う。**
         let refineStart = ContinuousClock.now
-        let refined: String? = current.refinementEnabled
-            ? await refiner.refine(
-                raw, locale: current.locale, terms: vocabulary.terms,
-                timeout: current.refinementTimeout)
-            : nil
+        let refinement = startRefinement(raw: raw, settings: current)
+
+        // --- 経路判定（要件定義書 FR-5 の細目 / §2.8.6 の C-1〜C-7）
+        //
+        // **挿入してからでは遅い。** 生テキストを入れた後に「錨が取れなかった」と
+        // 判っても (b) へは戻れない——整形結果を入れる手段が差し替えしか無いためである。
+        if current.refinementApplyMode == .afterInsert, refinement != nil,
+            let anchoringInserter, replacer != nil, anchoringInserter.canCaptureAnchor()
+        {
+            await insertRawThenRevise(
+                raw: raw, refinement: refinement, inserter: anchoringInserter,
+                settings: current, releasedAt: releasedAt, finalize: finalize,
+                refineStart: refineStart)
+            return
+        }
+
+        // --- (b) 差し替えできない挿入先。**整形を待ってから挿入する**（フェーズ 1 と同じ）。
+        emit(.refining)
+        let refined = await Self.awaitRefinement(refinement, within: current.refinementTimeout)
         let refine = ContinuousClock.now - refineStart
 
         // 整形は実測で 350〜750 ms 掛かる。**その間に押された ESC はまだ間に合う。**
@@ -624,9 +925,14 @@ public actor DictationSession {
             return
         }
 
+        // **挿入したので、前の発話の錨はもう戻せる場所を指していない**（世代が進んでいる）。
+        clearUndoTarget()
+
         latestMetrics = Metrics.Sample(
             finalize: finalize, refine: refine, insert: insert,
-            droppedBuffers: audio.droppedBufferCount - droppedAtStart
+            droppedBuffers: audio.droppedBufferCount - droppedAtStart,
+            // **(b) の分岐なので整形はクリティカルパスの上にある。**
+            waitedForRefinementBeforeInsert: true
         )
 
         // --- 履歴はクリティカルパスの外で書く（同期 I/O。詳細設計書 §8.2）
@@ -644,6 +950,329 @@ public actor DictationSession {
         }
 
         finishIdle()
+    }
+
+    // MARK: - (a) 生テキストを先に挿入し、整形は後から差し替える（FR-5(a)）
+
+    /// 整形を起動する。**待たない。** 打ち切りは経路で決まる。
+    ///
+    /// **`Task.detached` にしてある。** 呼び出し元（`completionTask`）は終了時に
+    /// 畳まれることがあり、キャンセルを継承すると `withTimeout` が常に nil を返して
+    /// **整形が必ず縮退する**（`stopRecording` の注記にある実測済みの罠と同じ形）。
+    ///
+    /// - Parameter settings: 発話の頭で 1 度だけ写し取った設定。
+    ///   **打ち切りは (a) なら `revisionDeadline`、(b) なら `refinementTimeout`。**
+    ///   (a) を選んだのに錨が取れず (b) へ落ちた場合は、待つ側が短い方で打ち切る
+    ///   （`awaitRefinement(_:within:)`）。
+    private func startRefinement(raw: String, settings: Settings) -> Task<String?, Never>? {
+        guard settings.refinementEnabled else { return nil }
+        let refiner = self.refiner
+        let terms = vocabulary.terms
+        let locale = settings.locale
+        let timeout =
+            settings.refinementApplyMode == .afterInsert
+            ? settings.revisionDeadline : settings.refinementTimeout
+        return Task.detached(priority: .userInitiated) {
+            await refiner.refine(raw, locale: locale, terms: terms, timeout: timeout)
+        }
+    }
+
+    /// 整形の完了を待つ。**締め切りを過ぎたら待つのをやめる。**
+    ///
+    /// `withTimeout` と同じ形。**打ち切った作業の完了は待たない**——待つと、
+    /// 打ち切りに応じない生成のあいだユーザーへの文字入力が止まる（`Refining` の注記）。
+    private static func awaitRefinement(
+        _ task: Task<String?, Never>?, within deadline: Duration
+    ) async -> String? {
+        guard let task else { return nil }
+        let (stream, continuation) = AsyncStream<String?>.makeStream()
+        let waiter = Task {
+            continuation.yield(await task.value)
+            continuation.finish()
+        }
+        let timer = Task {
+            try? await Task.sleep(for: deadline)
+            continuation.yield(nil)
+            continuation.finish()
+        }
+        defer {
+            waiter.cancel()
+            timer.cancel()
+            // 待ちはしないが cancel は送る。止められる生成なら止めて計算資源を返す。
+            task.cancel()
+        }
+        var results = stream.makeAsyncIterator()
+        return await results.next() ?? nil
+    }
+
+    /// **(a) の分岐。生テキストを直ちに挿入し、整形は後から差し替える。**
+    ///
+    /// ここを抜けた時点で `phase` は `.idle` であり、**次の PTT を受け付ける。**
+    /// 差し替えは「忙しい」に数えない（設計 opus §3.3）——捨てても生テキストは欄にある。
+    ///
+    /// - Important: **`.refining` を通らない。** したがって中断（ESC）が効くのは
+    ///   `recording` / `finalizing` の 2 状態と、**保留中の差し替え**である
+    ///   （基本設計書 §4）。
+    private func insertRawThenRevise(
+        raw: String,
+        refinement: Task<String?, Never>?,
+        inserter: any AnchoringTextInserting,
+        settings: Settings,
+        releasedAt: ContinuousClock.Instant,
+        finalize: Duration,
+        refineStart: ContinuousClock.Instant
+    ) async {
+        emit(.inserting)
+        let insertStart = ContinuousClock.now
+        let inserted = await inserter.insertCapturingAnchor(raw)
+        let insert = ContinuousClock.now - insertStart
+
+        // 挿入の直前に secure input が有効化された場合（(b) と同じ扱い）。
+        guard inserted.outcome != .refusedSecureInput else {
+            refinement?.cancel()
+            fail(.refusedSecureInput)
+            return
+        }
+
+        clearUndoTarget()
+
+        latestMetrics = Metrics.Sample(
+            finalize: finalize, refine: .zero, insert: insert,
+            droppedBuffers: audio.droppedBufferCount - droppedAtStart,
+            // **整形はこの後ろにある。** 足すと NFR-P6a の判定が (b) の意味になる。
+            waitedForRefinementBeforeInsert: false
+        )
+
+        // **履歴は挿入の直後に書く**（整形はまだ届いていないので `refinedText` は nil）。
+        // 差し替えが成功したら同じ id を更新する（詳細設計書 §8.3）。
+        guard let method = inserted.outcome.recordableMethod else {
+            refinement?.cancel()
+            finishIdle()
+            return
+        }
+        let entry = HistoryEntry(
+            rawText: raw, refinedText: nil,
+            localeIdentifier: settings.localeIdentifier, insertionMethod: method
+        )
+        guard record(entry) else {
+            refinement?.cancel()
+            fail(.historyUnavailable(insertedElsewhere: true))
+            return
+        }
+
+        guard let anchor = inserted.anchor else {
+            // **事前判定は「見込み」であって保証ではない**（`canCaptureAnchor()`）。
+            // 錨が取れなかったので整形は反映できない。**生テキストは欄にある**——
+            // (b) の分岐で整形が打ち切られたときとまったく同じ結末である。
+            refinement?.cancel()
+            notify(.refinementNotApplied(nil))
+            finishIdle()
+            return
+        }
+
+        beginPendingRevision(
+            anchor: anchor, entryID: entry.id, refinement: refinement,
+            settings: settings, releasedAt: releasedAt, refineStart: refineStart)
+    }
+
+    /// 保留中の差し替えを立てて、待機へ戻る。
+    ///
+    /// - Important: **`hotkey.setSessionBusy(true)` を保ったまま `.idle` にする。**
+    ///   保留中の差し替えに対する ESC を受け取るために要る——`HotkeyDecision` は
+    ///   録音中でも処理中でもない ESC を下流アプリのものとして扱うので、
+    ///   ここで降ろすと**「差し替えを取りやめる」という安全な取消しが到達不能になる。**
+    ///   抑止はしないので下流アプリの ESC は生きたままである。
+    private func beginPendingRevision(
+        anchor: ReplacementAnchor,
+        entryID: HistoryEntry.ID,
+        refinement: Task<String?, Never>?,
+        settings: Settings,
+        releasedAt: ContinuousClock.Instant,
+        refineStart: ContinuousClock.Instant
+    ) {
+        isRevisionCancelled = false
+        let utterance = self.utterance
+        finishIdle(keepingSessionBusy: true)
+
+        pendingRevision = Task { [weak self] in
+            let refined = await Self.awaitRefinement(
+                refinement, within: settings.revisionDeadline)
+            await self?.applyRevision(
+                refined, anchor: anchor, entryID: entryID, utterance: utterance,
+                releasedAt: releasedAt, refineStart: refineStart)
+        }
+    }
+
+    /// 整形が返った（あるいは打ち切られた）。**ここが唯一、欄を後から書き換える場所である。**
+    ///
+    /// - Important: **`replacer.replace` は同期で、AX の往復を 5〜6 回行う。**
+    ///   actor の上で同期に走らせているのは意図である——**その間に挿入が割り込めない**
+    ///   ことが、世代の照合と実際の書き込みのあいだに窓を作らないための保証になる。
+    ///   代償は、この数 ms〜数十 ms のあいだに PTT が押されると `startRecording` が
+    ///   待たされること（NFR-P1 の 50 ms の予算を食う）。**所要は未実測**（検証項目 V-27）。
+    private func applyRevision(
+        _ refined: String?,
+        anchor: ReplacementAnchor,
+        entryID: HistoryEntry.ID,
+        utterance: Int,
+        releasedAt: ContinuousClock.Instant,
+        refineStart: ContinuousClock.Instant
+    ) {
+        pendingRevision = nil
+        // **この発話がまだ「直近」か。** 次の発話が始まっていたら、状態も計測値も
+        // そちらのものなので触らない（差し替えそのものは撃ってよい——欄を触るのは
+        // 挿入だけで、`TextReplacer` が世代と要素を照合する）。
+        let isCurrent = (utterance == self.utterance)
+        let canShowState = isCurrent && phase == .idle
+        defer {
+            if canShowState {
+                hotkey.setSessionBusy(false)
+                emit(.idle)
+            }
+        }
+
+        guard !isRevisionCancelled else {
+            notify(.refinementNotApplied(nil))
+            return
+        }
+        guard let refined, let replacer else {
+            // 整形が返らなかった（打ち切り・利用不可・逸脱の検査に落ちた）。**生テキストのまま。**
+            notify(.refinementNotApplied(nil))
+            return
+        }
+
+        // **履歴を先に確保する**（詳細設計書 §8.3）。raw と refined の両方が履歴に
+        // ある状態で初めて欄を触る。**書けなければ差し替えを始めない**——
+        // 差し替えの途中で発話が判らなくなったとき（R-9）、履歴が 1 番目の受けである。
+        do {
+            try history.update(id: entryID, refinedText: refined)
+        } catch {
+            notify(.refinementNotApplied(nil))
+            if canShowState { emit(.failed(.historyUnavailable(insertedElsewhere: true))) }
+            return
+        }
+
+        if canShowState { emit(.revising) }
+        let result = replacer.replace(anchor, with: refined)
+        let revision = ContinuousClock.now - releasedAt
+        if isCurrent {
+            latestMetrics = latestMetrics?.rewriting(
+                refine: ContinuousClock.now - refineStart, revision: revision)
+        }
+
+        switch result {
+        case .replaced(let newAnchor):
+            setUndoTarget(newAnchor)
+            notify(.refinementApplied)
+        case .declined(let reason):
+            notify(.refinementNotApplied(reason))
+        case .silentlyIgnored:
+            // AX は成功を返したが何も入らなかった（R-4）。**害は無い。生テキストが欄にある。**
+            notify(.refinementNotApplied(nil))
+        case .lost:
+            // **この設計で唯一、発話が欄から消えうる行**（R-9）。
+            // 履歴・クリップボード・告知・以後の締め出しの 4 重で受けてある。
+            notify(.textMayHaveBeenLost)
+        }
+    }
+
+    /// 保留中の差し替えを取りやめる（ESC / FR-7 の 1 行目）。
+    ///
+    /// **書き込みは 1 回も起きていないので、これは完全に安全な取消しである。**
+    private func cancelPendingRevision() {
+        guard pendingRevision != nil else { return }
+        isRevisionCancelled = true
+    }
+
+    // MARK: - Undo（FR-7）
+
+    /// 差し替えが成功した。**ここから 10 秒だけ戻せる。**
+    private func setUndoTarget(_ anchor: ReplacementAnchor) {
+        undoAnchor = anchor
+        let expiry = ContinuousClock.now + .seconds(HistoryStore.undoWindow)
+        undoExpiry = expiry
+        hotkey.setUndoAvailable(true)
+        undoExpiryTask?.cancel()
+        undoExpiryTask = Task { [weak self] in
+            try? await Task.sleep(until: expiry, clock: .continuous)
+            guard !Task.isCancelled else { return }
+            await self?.expireUndoTarget(at: expiry)
+        }
+    }
+
+    /// 窓が閉じた。**打鍵を奪うのをやめる**（`setUndoAvailable` の注記）。
+    private func expireUndoTarget(at expiry: ContinuousClock.Instant) {
+        guard undoExpiry == expiry else { return }
+        clearUndoTarget()
+    }
+
+    private func clearUndoTarget() {
+        undoExpiryTask?.cancel()
+        undoExpiryTask = nil
+        undoExpiry = nil
+        guard undoAnchor != nil else { return }
+        undoAnchor = nil
+        hotkey.setUndoAvailable(false)
+    }
+
+    /// **Undo キーが押された**（FR-7）。
+    ///
+    /// 門はここにある錨であって履歴ではない。錨は `.ax` 経路の挿入と、その上で
+    /// 成功した差し替えからしか作られないので、**`.clipboardOnly` の発話へ
+    /// Undo を撃つ経路は型として存在しない。**
+    ///
+    /// - Important: **`replace` と同じ原始操作を逆向きに使うだけである。**
+    ///   したがって secure input 中は同じ判定で拒否される（`TextReplacer.replace`）。
+    private func performUndo() {
+        // 差し替えがまだ保留中なら、**取りやめるだけ。何も書き換えない**（FR-7 の 1 行目）。
+        if pendingRevision != nil, undoAnchor == nil {
+            cancelPendingRevision()
+            notify(.undone)
+            return
+        }
+
+        guard let replacer, let anchor = undoAnchor, let expiry = undoExpiry,
+            ContinuousClock.now <= expiry
+        else {
+            offerRawTextToClipboard()
+            return
+        }
+
+        // **一度きり。** 戻した後にもう一度撃つと、戻した先をさらに書き換えることになる。
+        clearUndoTarget()
+
+        let canShowState = (phase == .idle)
+        if canShowState { emit(.revising) }
+        let result = replacer.undo(anchor)
+        if canShowState { emit(.idle) }
+
+        switch result {
+        case .replaced:
+            notify(.undone)
+        case .declined(let reason):
+            notify(.undoDeclined(reason))
+        case .silentlyIgnored:
+            notify(.undoDeclined(.textWriteFailed))
+        case .lost:
+            notify(.textMayHaveBeenLost)
+        }
+    }
+
+    /// 自動で戻せない場合の縮退（要件定義書 FR-7 の細目 3 行目 / UC-3）。
+    ///
+    /// **差し替えできない経路で挿入した直近の発話に限り、生テキストをクリップボードへ置く。**
+    /// クリップボードを奪ってよいのは、これが**利用者の明示操作**だからである。
+    /// 該当が無ければ何もしない（「戻せません」を告げるだけ）。
+    private func offerRawTextToClipboard() {
+        guard let clipboard, let latest = history.entries.first,
+            latest.isManualUndoFallbackCandidate,
+            (0...HistoryStore.undoWindow).contains(Date().timeIntervalSince(latest.timestamp))
+        else {
+            notify(.undoUnavailable)
+            return
+        }
+        clipboard.leave(latest.rawText)
+        notify(.undoCopiedRawTextToClipboard)
     }
 
     /// 中断された発話の後始末。
@@ -676,13 +1305,17 @@ public actor DictationSession {
     private func record(
         raw: String, refined: String?, locale: String, method: InsertionMethod
     ) -> Bool {
+        record(
+            HistoryEntry(
+                rawText: raw, refinedText: refined,
+                localeIdentifier: locale, insertionMethod: method
+            ))
+    }
+
+    /// - Returns: 書けたか。**握り潰してはならない**（上の注記）。
+    private func record(_ entry: HistoryEntry) -> Bool {
         do {
-            try history.append(
-                HistoryEntry(
-                    rawText: raw, refinedText: refined,
-                    localeIdentifier: locale, insertionMethod: method
-                )
-            )
+            try history.append(entry)
             return true
         } catch {
             return false
@@ -768,9 +1401,12 @@ public actor DictationSession {
     }
 
     /// 発話 1 回ぶんの後始末をして待機へ戻す。
-    private func finishIdle() {
+    ///
+    /// - Parameter keepingSessionBusy: 保留中の差し替えがあるので、ESC を届かせ続けるか
+    ///   （`beginPendingRevision` の注記）。**降ろすのは差し替えが片付いてからである。**
+    private func finishIdle(keepingSessionBusy: Bool = false) {
         // 処理は終わった。以後の ESC は下流アプリのものである。
-        hotkey.setSessionBusy(false)
+        if !keepingSessionBusy { hotkey.setSessionBusy(false) }
         maxDurationTask?.cancel()
         maxDurationTask = nil
         finalDeadlineTask?.cancel()
@@ -784,5 +1420,10 @@ public actor DictationSession {
     private func emit(_ state: SessionState) {
         self.state = state
         stateContinuation.yield(state)
+        stateBroadcast.yield(state)
+    }
+
+    private func notify(_ notice: SessionNotice) {
+        noticeBroadcast.yield(notice)
     }
 }

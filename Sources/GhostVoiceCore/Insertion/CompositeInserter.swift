@@ -54,6 +54,21 @@ public struct CompositeInserter: AnchoringTextInserting {
         self.isSecureInputEnabled = isSecureInputEnabled
     }
 
+    /// **挿入の前に、この発話を (a) の分岐（生テキスト先行挿入）へ載せてよいかを答える。**
+    ///
+    /// 一段目が錨を作れる見込みのときだけ真になる。**二段目（Pasteboard 経路）は
+    /// 常に偽である**——貼り付いたことすら確認できず、範囲も持てない（設計 opus §2.2 の C-1）。
+    ///
+    /// - Important: **secure input 中は偽を返す。** 有効なら挿入そのものを拒否するので、
+    ///   (a) の分岐へ載せる意味が無い。**判定は実測 0.000 ms なので毎回呼んでよい。**
+    /// - Important: **副作用を持たない。** とくに世代（`InsertionEpoch`）を進めない——
+    ///   進めるのは実際に挿入するときだけである（進めると、この判定を呼ぶだけで
+    ///   前の発話の保留中の差し替えが消える）。
+    public func canCaptureAnchor() -> Bool {
+        guard !isSecureInputEnabled() else { return false }
+        return primary.canCaptureAnchor()
+    }
+
     /// テキストを挿入し、経路と**差し替えの錨**を返す。
     ///
     /// - Important: **呼ばれた時点で、前の発話の差し替えは失効する**（世代が進む）。
@@ -156,10 +171,19 @@ public struct CompositeInserter: AnchoringTextInserting {
 public struct InsertionStack: Sendable {
     public let inserter: CompositeInserter
     public let replacer: TextReplacer
+    /// **この組が使っているクリップボードそのもの。**
+    ///
+    /// 自動で戻せない発話の生テキストを取り出す先（要件定義書 FR-7 の細目 3 行目）が要る。
+    /// **別の `NSPasteboard` を掴んだものを渡してはならない**——取り出したテキストが
+    /// 利用者には見えない場所へ行く（`TextReplacer.init` の注記と同じ理由）。
+    public let clipboard: any ClipboardLeaving
 
-    public init(inserter: CompositeInserter, replacer: TextReplacer) {
+    public init(
+        inserter: CompositeInserter, replacer: TextReplacer, clipboard: any ClipboardLeaving
+    ) {
         self.inserter = inserter
         self.replacer = replacer
+        self.clipboard = clipboard
     }
 }
 
@@ -201,6 +225,7 @@ extension CompositeInserter {
             epoch: epoch,
             isSecureInputEnabled: isSecureInputEnabled
         )
-        return InsertionStack(inserter: inserter, replacer: replacer)
+        return InsertionStack(
+            inserter: inserter, replacer: replacer, clipboard: pasteboardInserter)
     }
 }

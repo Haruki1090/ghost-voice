@@ -1061,6 +1061,7 @@ struct DictationSessionTests {
         case .finalizing: "finalizing"
         case .refining: "refining"
         case .inserting: "inserting"
+        case .revising: "revising"
         case .failed: "failed"
         }
     }
