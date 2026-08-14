@@ -91,7 +91,30 @@ public enum Shutdown {
     ) async {
         writer.write("\n[終了] 進行中の発話を待っています…\n")
 
-        if await gate.waitUntilIdle(within: grace) == .timedOut {
+        // **門は状態機械より 1 手遅れる。**
+        //
+        // 門が拾うのは `stateUpdates` の列で、状態機械の `state` はそれより先に変わる。
+        // **押下の直後に終了要求が来ると、門はまだ「待機」に見える**——そこで
+        // `stopHotkey()` へ進むと、キー解放が二度と届かず**その発話が丸ごと消える。**
+        // （実測: 負荷を掛けて `swift test` を回すと `shutdownWaitsForKeyRelease` が
+        // 実際に落ちた。門だけを見ていたときの窓である。）
+        //
+        // したがって**権威は状態機械に置く。** 門は「速く起きるための道具」として使い、
+        // 起きたあとに状態機械へ確認する。どちらも猶予の中で打ち切る。
+        let deadline = ContinuousClock.now + grace
+        var settled = false
+        while ContinuousClock.now < deadline {
+            if await gate.waitUntilIdle(within: .milliseconds(100)) == .idle,
+                await finalState() == .idle
+            {
+                settled = true
+                break
+            }
+            // 門が既に待機を指しているのに状態機械が処理中の場合、上の待ちは即座に
+            // 戻る。空回りを避けるために少しだけ眠る（終了処理でしか通らない経路）。
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        if !settled {
             writer.write("[終了] \(grace) 待っても待機へ戻りませんでした。打ち切ります。\n")
         }
 

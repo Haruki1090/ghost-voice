@@ -5,6 +5,17 @@ import Testing
 @testable import GhostVoiceCLI
 @testable import GhostVoiceCore
 
+/// クロージャをまたいで読み書きする旗。
+final class MutableFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool
+    init(_ value: Bool) { stored = value }
+    var value: Bool {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
 /// 書き出された文字列を溜める。
 final class CollectingWriter: ConsoleWriting, @unchecked Sendable {
     private let chunks = Mutex<[String]>([])
@@ -97,6 +108,14 @@ struct CLIShutdownTests {
         }
         continuation.yield(.recording(volatileText: "あ"))
         continuation.yield(.finalizing)
+
+        // **門へ配っていることを、終わらせる前に確かめる。** ここを見ないと
+        // 「状態を門へ流さない」実装でも通る（列の終端だけで門が開くため）。
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(
+            await gate.waitUntilIdle(within: .milliseconds(50)) == .timedOut,
+            "処理中の状態が門へ届いていない")
+
         continuation.finish()
         await loop.value
 
@@ -167,7 +186,54 @@ struct CLIShutdownTests {
             },
             writer: writer)
 
-        #expect(order.calls == ["idle", "stop", "awaitRun.start", "awaitRun.end", "finalState"])
+        // **完全一致では固定できない。** 待ちの間に状態機械へ確認する
+        // （門は 1 手遅れるため。`Shutdown` の注記）ので `finalState` は複数回呼ばれる。
+        // 固定したいのは**順序の不変条件**である。
+        let calls = order.calls
+        let idle = try #require(calls.firstIndex(of: "idle"), "待機を観測していない")
+        let stop = try #require(calls.firstIndex(of: "stop"), "監視を止めていない")
+        let runStart = try #require(calls.firstIndex(of: "awaitRun.start"), "run() を見届けていない")
+        let runEnd = try #require(calls.firstIndex(of: "awaitRun.end"))
+
+        #expect(idle < stop, "待機へ戻る前に監視を止めている（押しっぱなしの解放が届かない）")
+        #expect(stop < runStart, "監視を止める前に run() を待っている")
+        #expect(runStart < runEnd)
+        #expect(calls.last == "finalState", "見届けた後に最終状態を見ていない")
+    }
+
+    /// **門は状態機械より 1 手遅れる。**
+    ///
+    /// 押下の直後に終了要求が来ると、門はまだ「待機」を指している（`.recording` が
+    /// まだ配送されていない）。そこで監視を止めると、**キー解放が二度と届かず発話が消える。**
+    /// 負荷を掛けた `swift test` で `shutdownWaitsForKeyRelease` が実際に落ちて判った窓。
+    @Test("門が待機を指していても、状態機械が処理中なら止めない")
+    func waitsWhenGateLagsBehindTheStateMachine() async {
+        let gate = ShutdownGate()  // 何も観測していない＝待機を指す
+        let writer = CollectingWriter()
+        // `Atomic` は ~Copyable でクロージャ内の `#expect` に載せられない。参照型を使う。
+        let busy = MutableFlag(true)
+        let stopped = MutableFlag(false)
+
+        // 少し遅れて発話が終わる（＝状態機械が待機へ戻る）
+        let release = Task {
+            try? await Task.sleep(for: .milliseconds(200))
+            busy.value = false
+        }
+        defer { release.cancel() }
+
+        await Shutdown.perform(
+            gate: gate, grace: .seconds(5),
+            stopHotkey: {
+                // **止める瞬間に、状態機械はもう待機でなければならない。**
+                #expect(!busy.value, "処理中に監視を止めた（発話が失われる）")
+                stopped.value = true
+            },
+            awaitRun: {},
+            finalState: { busy.value ? .recording(volatileText: "") : .idle },
+            writer: writer)
+
+        #expect(stopped.value)
+        #expect(!writer.text.contains("打ち切ります"), "待てるのに打ち切っている")
     }
 
     // MARK: - 本物の状態機械を通した終了

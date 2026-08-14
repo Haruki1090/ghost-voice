@@ -520,7 +520,13 @@ struct DictationSessionTests {
             rig.hotkey.emit(.pressed)
             try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
             rig.hotkey.emit(.cancelled)
-            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+            // **状態機械ではなく「集めた列」を待つ。** `state` は列より先に変わるので、
+            // `state == .idle` で待つと、まだ配送されていない `.failed` を見落とす
+            // （負荷を掛けた実行で実際に落ちた）。
+            try await waitUntil("失敗が記録される") {
+                await log.states.contains { if case .failed = $0 { return true } else { return false } }
+            }
+            try await waitUntil("待機へ戻る") { await log.states.last == .idle }
 
             let states = await log.states
             #expect(
@@ -548,7 +554,9 @@ struct DictationSessionTests {
             rig.hotkey.emit(.pressed)
             try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
             rig.hotkey.emit(.released)
-            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+            try await waitUntil("失敗が記録される") {
+                await log.states.contains { if case .failed = $0 { return true } else { return false } }
+            }
 
             #expect(rig.inserter.inserted == ["整形後テキストです"], "挿入自体は成功しているはず")
             let states = await log.states
@@ -573,7 +581,9 @@ struct DictationSessionTests {
             rig.hotkey.emit(.pressed)
             try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
             rig.hotkey.emit(.released)
-            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+            // 列の側で待つ（`.idle` が配送されるまで待たないと、まだ来ていない
+            // `.failed` を「無かった」と読む）。
+            try await waitUntil("待機が配送される") { await log.states.last == .idle }
 
             let states = await log.states
             #expect(!states.contains { if case .failed = $0 { return true } else { return false } })
