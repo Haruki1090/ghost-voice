@@ -151,7 +151,8 @@ public enum HotkeyDecision {
     ///   汎用マスクで押下とみなす。ここで解放と誤判定すると、そういう入力源では
     ///   PTT が押した瞬間に切れて**まったく使えなくなる**（デバイスビットに頼る
     ///   実装の失敗は、取りこぼしより重い方へ倒れる）。
-    ///   実キーボードがこのビットを立てることは V-4（Task 11）で確認する。
+    ///   実キーボードがこのビットを立てることは V-4 で確認する
+    ///   （**権限を付与した利用者が実施する**。README の手順の #3）。
     private static func isModifierDown(
         keyCode: Int64, flags: CGEventFlags, binding: HotkeyBinding
     ) -> Bool {

@@ -62,6 +62,11 @@
    (SpeechAnalyzer)   (SystemLanguageModel)   (AXUIElement)
 ```
 
+**上図の最上段（NotchHUD / 設定 / 権限案内）はフェーズ 2 である。**
+フェーズ 1 の表示層は CLI（`GhostVoiceCLI` ターゲット + `ghost-voice` 実行ファイル）で、
+録音・確定・整形・挿入の各状態と 1 発話ぶんの計測値を標準エラーへ出す。
+権限の案内（FR-10）も CLI が行う（詳細設計書 §9）。**`DictationSession` より下は共通である。**
+
 ---
 
 ## 3. モジュール定義

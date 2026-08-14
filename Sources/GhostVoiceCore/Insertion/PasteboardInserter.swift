@@ -172,7 +172,7 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
     ///    相手のランループ待ちが上乗せされる。
     ///
     /// つまり実測 35 ms は**下限**であり、120 ms はそれに対する約 3.4 倍の余裕である。
-    /// 実アプリでの妥当性は V-3（Task 11）で確かめる。
+    /// 実アプリでの妥当性は V-3 で確かめる（**権限を付与した利用者が実施する**。README の手順）。
     ///
     /// なお、この待ち時間は NFR-P5（テキスト挿入 50 ms 以内）には数えない。
     /// 挿入はテキストが貼り付いた時点で完了しており、復元はその後始末である。
@@ -268,7 +268,7 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
     ///   **提供元が別プロセスの場合（他アプリのファイル約束など）は未検証。**
     ///   そこでは実体化が相手プロセスとの往復になり、遅延や失敗がありうる。
     ///   主スレッドで退避する形へ移すことも考えられるが、主スレッドが塞がっていると
-    ///   今度は挿入そのものが止まる。実アプリでの挙動を見てから決める（V-3 / Task 11）。
+    ///   今度は挿入そのものが止まる。実アプリでの挙動を見てから決める（V-3。利用者が実施）。
     private static func snapshot(of pasteboard: NSPasteboard) -> Snapshot {
         pasteboard.pasteboardItems?.map { item in
             var stored: [NSPasteboard.PasteboardType: Data] = [:]
