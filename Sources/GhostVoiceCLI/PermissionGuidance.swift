@@ -1,40 +1,11 @@
 import Foundation
 import GhostVoiceCore
 
-/// いま照会できる権限の一式。
-///
-/// **実 API を呼ぶのは `GhostVoiceRuntime` 側。** ここは値だけを受け取って文章にする
-/// （機体の権限状態に左右されずに検査できるようにするため）。
-public struct PermissionStatus: Sendable, Equatable {
-    /// `AVCaptureDevice.authorizationStatus(for: .audio)` の名前。
-    public let microphoneStatus: String
-    public let microphoneAuthorized: Bool
-    /// `AXIsProcessTrusted()`（アクセシビリティ）。
-    public let accessibilityTrusted: Bool
-    /// `CGPreflightListenEventAccess()`（入力監視）。
-    public let listenEventAccess: Bool
-    /// `CGPreflightPostEventAccess()`（⌘V の送出。アクセシビリティで与えられる）。
-    public let postEventAccess: Bool
-    public let secureInputEnabled: Bool
-
-    public init(
-        microphoneStatus: String,
-        microphoneAuthorized: Bool,
-        accessibilityTrusted: Bool,
-        listenEventAccess: Bool,
-        postEventAccess: Bool,
-        secureInputEnabled: Bool
-    ) {
-        self.microphoneStatus = microphoneStatus
-        self.microphoneAuthorized = microphoneAuthorized
-        self.accessibilityTrusted = accessibilityTrusted
-        self.listenEventAccess = listenEventAccess
-        self.postEventAccess = postEventAccess
-        self.secureInputEnabled = secureInputEnabled
-    }
-}
-
 /// 権限まわりの文言。
+///
+/// **照会の一式（`PermissionStatus`）は `GhostVoiceCore` にある。**
+/// ここは値を受け取って文章にするだけで、実 API は 1 つも呼ばない
+/// （機体の権限状態に左右されずに検査できるようにするため）。
 ///
 /// **許可の対象は `ghost-voice` のバイナリではない。**
 /// 素の実行ファイルの TCC は責任プロセス（起動元のターミナルアプリ）に紐づく。

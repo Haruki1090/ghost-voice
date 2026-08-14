@@ -58,17 +58,27 @@ ghost-voice/
 │   │   └── SessionMirror.swift        MainActor から同期で読める状態の写し（欠落 2）
 │   └── Support/
 │       ├── Metrics.swift              性能計測点
-│       └── SessionFailureNotice.swift 縮退の理由 → 媒体に依らない表示材料（§8.5）
-│                                      **Models/ は「JSON になる値」だけを置く場所なので、
-│                                       永続化しない派生型はここに置く**
-│                                      （権限の保持は Insertion/PasteboardInserter.swift の
-│                                       PostEventAuthorization。独立した Permissions.swift は無い）
+│       ├── SessionFailureNotice.swift 縮退の理由 → 媒体に依らない表示材料（§8.5）
+│       │                              **Models/ は「JSON になる値」だけを置く場所なので、
+│       │                               永続化しない派生型はここに置く**
+│       ├── ShutdownSequence.swift     終了の待ち合わせと段取り（発話を落とさない順序）。
+│       │                              **CLI と .app がここを共有する。**
+│       │                               ShutdownWaitOutcome / ShutdownGate /
+│       │                               ShutdownAnnouncement（文言）/ Shutdown（段取り）
+│       └── PermissionInquiry.swift    権限の照会。**4 つの TCC サービスと API の
+│                                       対応表はここ 1 枚だけ**（基本設計書 §10）。
+│                                       PermissionStatus / PermissionProbes /
+│                                       PermissionRequests
+│                                      （挿入時の権限の保持は
+│                                       Insertion/PasteboardInserter.swift の
+│                                       PostEventAuthorization。照会の実 API 呼び出しと
+│                                       キャッシュは別の関心である）
 ├── Sources/GhostVoiceCLI/             CLI の中身（**検査対象**）
 │   ├── CommandLineOptions.swift       引数の解釈
 │   ├── SessionNarration.swift         状態 → 表示行。stateUpdates の唯一の消費者
-│   ├── PermissionGuidance.swift       権限の案内と --check の報告
-│   ├── Shutdown.swift                 終了の待ち合わせ（発話を落とさない順序）
-│   ├── ConsoleOutput.swift            出力先の差し替え口
+│   ├── PermissionGuidance.swift       権限の案内と --check の報告（**文言だけ。照会はしない**）
+│   ├── ConsoleOutput.swift            出力先の差し替え口と、終了の文言の端末向けの体裁
+│   │                                  （**文言そのものは Core の ShutdownAnnouncement**）
 │   └── GhostVoiceRuntime.swift        本物の依存を繋いで回すだけ
 ├── Sources/ghost-voice/main.swift     GhostVoiceRuntime.main() を呼ぶだけ
 ├── Tests/
@@ -77,10 +87,18 @@ ghost-voice/
 │       ├── Support/                   CER・フィクスチャ読み込み
 │       └── ...
 ├── Sources/GhostVoiceApp/             フェーズ 2 のアプリ（**Xcode プロジェクトは作らない**）
-│   ├── GhostVoiceApp.swift            薄い @main。中身は下の UI 群へ
-│   ├── UI/NotchHUD/
-│   ├── UI/Settings/
-│   └── UI/Permission/
+│   ├── Main/main.swift                薄い @main。中身は Shell/ へ
+│   ├── Shell/                         器（**検査対象**）
+│   │   ├── GhostVoiceAppDelegate.swift 起動と終了の順序。**終了は素通ししない**（§8.10）
+│   │   ├── AppSessionRuntime.swift    常駐セッションの持ち主。終了は Core の段取りを通す
+│   │   ├── AppPermissions.swift       許可の**要求**と設定ペインを開くこと
+│   │   │                              （**照会は Core の PermissionInquiry**）
+│   │   ├── AppPermissionGuidance.swift 権限の案内（許可の相手は Ghost Voice 自身）
+│   │   ├── AppLaunchOptions.swift / AppDiagnostics.swift / AppSurface.swift /
+│   │   └── LaunchSequence.swift       run() が回り始めた後にだけ画面を作る（§8.9）
+│   ├── UI/NotchHUD/                   **未着手**
+│   ├── UI/Settings/                   **未着手**
+│   └── UI/Permission/                 **未着手**
 ├── Resources/                         フェーズ 2
 │   ├── Info.plist                     テンプレート（基本設計書 §10）
 │   └── GhostVoice.entitlements
@@ -1430,7 +1448,7 @@ notch 非搭載の内蔵ディスプレイの実測（該当機が手元に無�
 **フェーズ 2 のアプリではここを `NSApp.run()` に置き換える。**
 
 - `CGEventTapHotkeyMonitor` はソースを `CFRunLoopGetMain()` の `.commonModes` へ足す。`NSApp.run()` はメインの CFRunLoop を回すので**届くはず**だが、**未実測（V-19）。** タップ生成が入力監視の権限ダイアログを誘発しうるため調査では確かめていない。**フェーズ 2 の最初の検証項目にする。**
-- **`NSApp.terminate(_:)` を素通しさせてはならない。** ⌘V 送出後・クリップボード復元前に落ちると発話が失われる（§6.3）。`applicationShouldTerminate` で `.terminateLater` を返し、`Shutdown.perform` を通してから `exit(0)` する。
+- **`NSApp.terminate(_:)` を素通しさせてはならない。** ⌘V 送出後・クリップボード復元前に落ちると発話が失われる（§6.3）。`applicationShouldTerminate` で `.terminateLater` を返し、**CLI と共通の `GhostVoiceCore.Shutdown.perform`**（Support/ShutdownSequence.swift）を通してから返事をする。**アプリ側に 2 つ目の段取りを書かないこと**——2 箇所にあると必ずずれ、両方とも自分のテストでは緑になる。
 - `.accessory`（= `LSUIElement`）のまま `NSPanel` の生成・`orderFrontRegardless()`・layer 25/26 への配置がすべて成立することは実測済みである。
 
 **未実測**: 全 Space での表示（`.canJoinAllSpaces`）と他アプリのフルスクリーン上での表示（`.fullScreenAuxiliary`）、Mission Control / Stage Manager 下での挙動（V-21）。
@@ -1725,11 +1743,20 @@ public enum PermissionKind: Sendable {
 }
 
 public protocol PermissionChecking: Sendable {
-    func status(of kind: PermissionKind) -> PermissionStatus
-    func request(_ kind: PermissionKind) async -> PermissionStatus
+    func status(of kind: PermissionKind) -> PermissionKindStatus
+    func request(_ kind: PermissionKind) async -> PermissionKindStatus
     func openSystemSettings(for kind: PermissionKind)
 }
 ```
+
+> **これは種類ごとに問う形の素描であり、実装はこの形を採っていない。**
+> 実装は一式をまとめて照会する `GhostVoiceCore.PermissionInquiry.current() -> PermissionStatus` である
+> （Support/PermissionInquiry.swift）。**実 API を名指しで呼ぶのはそこ 1 箇所だけ**にしてある——
+> 下の対応表を 2 つ持つと、「どれか 1 つを他の判定に流用してはならない」という規律が
+> **片側だけ守られている状態**を作れてしまい、値が一致する機体では気付けない。
+> 差し替え口（`PermissionProbes`）を通して、4 つを 1 つずつ落とす検査で固定している
+> （`PermissionInquiryTests`）。案内の文言だけが CLI（ターミナルアプリが許可の相手）と
+> `.app`（Ghost Voice 自身が相手）で分かれる。
 
 | 権限 | 判定 | 要求 |
 |---|---|---|
@@ -2560,4 +2587,4 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-31 | **実マイク・肉声での M2（現行定義: キー解放 → 結果ストリームの終端）と NFR-P3** | 利用者が実施（V-3 / V-4 と同じ機会） | **未実施。** 代役（フィクスチャ音声の実時間再生）での実測は 中央値 75.9 ms（低負荷）／ 82.5 ms（負荷下）、最大 155.1 ms（§10）。**保守的な上限 199 ms は NFR-P3（200 ms）の 1 ms 手前**だが、これは別々の計測の最悪値を足した値で、同時に起こることは確認していない。**121 字級の長い肉声で、暫定表示の末尾と挿入テキストの末尾が一致することを併せて見る**（V-12 の修正が実機で効いているかの確認）。手順は README の「V-3 / V-4 の実施手順」の 3 と同じ |
 | V-32 | **起動直後に押した場合の M1a**（捨て往復の残りを待つ経路） | 利用者が実施（V-9 と同じ機会。`GHOST_VOICE_MIC_TESTS=1`） | **未実施。** 起動時の捨て往復は `finalizeTask` の枠に入れてあり、**起動直後の押下だけが `drainFinalizeTask()` でその残りを待つ**（§10）。捨て往復の各要素は測ってある（`begin()` 中央値 37.2 ms（低負荷）／ 158.5 ms（負荷下）、入力ゼロの `finish()` 中央値 0.33 / 0.73 ms）が、**M1a の計測区間（キー押下 → タップ武装）には実マイクが要る**ため、起動直後に押した実際の M1a は未計測である |
 | V-33 | **ad-hoc 署名 + DR 固定（`-r='designated => identifier "…"'`）でも許可が残るか** | OSS 公開の前（証明書を持たない人の経路） | **未実施。** tccd が与えた DR をそのまま許可レコードの csreq に使うのか、独自に cdhash を含む要件を組み立てるのかが判っていない（`TCC.db` はフルディスクアクセスが無く読めない）。**残らないなら `--allow-adhoc` の警告文を「開発中の一時的な手段」に書き換える** |
-| V-34 | **発話の途中の終了要求（⌘Q / SIGTERM）で発話が失われないか（`.app` 版）** | V-19 の後 | **未実施。** `applicationShouldTerminate` は `.terminateLater` を返し、`AppTermination.waitUntilIdle` が待機へ戻るまで待ってからホットキーを止める（CLI の `Shutdown.perform` と同じ順序）。**器だけの起動（`--shell-only`）では発話が無いのでこの経路を通らない。** 実発話で確認が要る |
+| V-34 | **発話の途中の終了要求（⌘Q / SIGTERM）で発話が失われないか（`.app` 版）** | V-19 の後 | **未実施。** `applicationShouldTerminate` は `.terminateLater` を返し、`GhostVoiceCore.Shutdown.perform` が待機へ戻るまで待ってからホットキーを止める（**CLI と同じ 1 つの実装**。門を持たない分、待つ根拠は `isBusy` だけ）。**器だけの起動（`--shell-only`）では発話が無いのでこの経路を通らない。** 実発話で確認が要る |

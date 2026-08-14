@@ -1,7 +1,4 @@
-import AVFoundation
-import ApplicationServices
-import Carbon.HIToolbox
-import CoreGraphics
+import CoreFoundation
 import Foundation
 import GhostVoiceCore
 import Synchronization
@@ -49,26 +46,11 @@ public enum GhostVoiceRuntime {
 
     // MARK: - 権限
 
+    /// **照会そのものは持たない。** 4 つの API と TCC サービスの対応表は
+    /// `GhostVoiceCore.PermissionProbes.system` に 1 枚だけ置いてある
+    /// （2 実装あると「どれか 1 つを他の判定に流用してはならない」が片側だけ守られる）。
     static func currentPermissions() -> PermissionStatus {
-        let microphone = AVCaptureDevice.authorizationStatus(for: .audio)
-        return PermissionStatus(
-            microphoneStatus: name(of: microphone),
-            microphoneAuthorized: microphone == .authorized,
-            accessibilityTrusted: AXIsProcessTrusted(),
-            listenEventAccess: CGPreflightListenEventAccess(),
-            postEventAccess: CGPreflightPostEventAccess(),
-            secureInputEnabled: IsSecureEventInputEnabled()
-        )
-    }
-
-    private static func name(of status: AVAuthorizationStatus) -> String {
-        switch status {
-        case .notDetermined: "未確認"
-        case .restricted: "制限"
-        case .denied: "拒否"
-        case .authorized: "許可"
-        @unknown default: "不明(\(status.rawValue))"
-        }
+        PermissionInquiry.current()
     }
 
     /// 許可を求める。**ダイアログが出る。人が押さないと先へ進まない。**
@@ -78,13 +60,19 @@ public enum GhostVoiceRuntime {
     private static func requestPermissions(out: any ConsoleWriting, err: any ConsoleWriting) {
         out.write("許可を求めます。ダイアログが出たら「許可」または「システム設定を開く」を選んでください。\n\n")
 
-        let microphone = AVCaptureDevice.authorizationStatus(for: .audio)
+        // **照会も要求も、API を名指しするのは Core の 1 箇所だけである**
+        // （`PermissionProbes.system` / `PermissionRequests.system`）。
+        // ここが持つのは**求め方の作法**——人の応答を待ち、結果を印字することだけ。
+        let probes = PermissionProbes.system
+        let requests = PermissionRequests.system
+
+        let microphone = probes.microphoneAuthorization()
         if microphone == .notDetermined {
             out.write("マイク: 許可を求めています…\n")
             // **待ちに上限を置く。** 応答が返らない環境で黙って止まらないようにする。
             let semaphore = DispatchSemaphore(value: 0)
             let granted = Mutex<Bool>(false)
-            AVCaptureDevice.requestAccess(for: .audio) { allowed in
+            requests.microphone { allowed in
                 granted.withLock { $0 = allowed }
                 semaphore.signal()
             }
@@ -94,19 +82,18 @@ public enum GhostVoiceRuntime {
                 out.write("マイク: \(granted.withLock { $0 } ? "許可されました" : "拒否されました")\n")
             }
         } else {
-            out.write("マイク: \(name(of: microphone))（求め直しは不要）\n")
+            out.write("マイク: \(PermissionInquiry.name(of: microphone))（求め直しは不要）\n")
         }
 
-        if !CGPreflightListenEventAccess() {
+        // **要求の直前に、その 1 つだけを照会する。** まとめて先に取ると、
+        // マイクの応答を待っている間（最大 60 秒）に値が古くなる。
+        if !probes.listenEventAccess() {
             out.write("入力監視: 許可を求めています（一覧に載ります）…\n")
-            _ = CGRequestListenEventAccess()
+            _ = requests.listenEvent()
         }
-        if !AXIsProcessTrusted() {
+        if !probes.accessibilityTrusted() {
             out.write("アクセシビリティ: 許可を求めています（一覧に載ります）…\n")
-            // `kAXTrustedCheckOptionPrompt` は `var` 宣言なので Swift 6 の並行性検査を
-            // 通らない（計画書のコードはここで固まる）。値は `"AXTrustedCheckOptionPrompt"`。
-            let options = ["AXTrustedCheckOptionPrompt": true]
-            _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+            _ = requests.accessibilityPrompt()
         }
 
         out.write(
@@ -145,8 +132,8 @@ public enum GhostVoiceRuntime {
     ///
     /// **音声はどこへも保存しない**（FR-12 / NFR-V2）。数えるのはバッファ数とフレーム数だけ。
     private static func micCheck(out: any ConsoleWriting, err: any ConsoleWriting) -> Int32 {
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
-        out.write("マイクの許可: \(name(of: status))\n")
+        let status = PermissionProbes.system.microphoneAuthorization()
+        out.write("マイクの許可: \(PermissionInquiry.name(of: status))\n")
         out.write("バンドル: \(Bundle.main.bundleIdentifier ?? "無し（素の実行ファイル）")\n")
 
         let capture = EngineAudioCapture()
@@ -313,13 +300,18 @@ public enum GhostVoiceRuntime {
                 // **`CFRunLoopRun()` の後にも `exit()` を置いてはならない。**
                 // 下の while ループがその理由（`stopHotkey` は自分でランループの
                 // ソースを外すので、そこが 2 つ目の出口になりかける）。
+                // 段取りは **Core に 1 つだけある**（`GhostVoiceCore.Shutdown`）。
+                // ここが渡すのは本物の依存と、端末向けの出力先だけである。
                 await Shutdown.perform(
                     gate: gate,
+                    // 門が待機を指しているのに状態機械が処理中のときだけ効く間隔。
+                    // **フェーズ 1 の CLI の刻みをそのまま持ってきている。**
+                    poll: .milliseconds(20),
                     stopHotkey: { monitor.stop() },
                     awaitRun: { await run.value },
                     // **`state` ではなく `isBusy`**（押下から最初の emit までの窓を含めるため）
                     isBusy: { await session.isBusy },
-                    writer: err)
+                    announce: { err.announce($0) })
                 await narration.value
                 exit(0)
             }

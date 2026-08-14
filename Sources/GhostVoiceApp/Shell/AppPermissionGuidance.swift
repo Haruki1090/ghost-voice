@@ -21,8 +21,8 @@ public enum AppPermissionGuidance {
 
     /// 4 項目の状態と、足りないものの直し方。
     ///
-    /// - Parameter status: `AppPermissions.current()` の結果（**照会のみ**）。
-    public static func report(_ status: AppPermissionStatus) -> String {
+    /// - Parameter status: `PermissionInquiry.current()` の結果（**照会のみ**）。
+    public static func report(_ status: PermissionStatus) -> String {
         var lines = [
             "\(appName): 権限の状態",
             "",

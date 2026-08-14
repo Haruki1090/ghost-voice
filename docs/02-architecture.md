@@ -649,6 +649,10 @@ FR-3 は物理的に満たせないので、要件定義書 §4.3 の「notch �
 > `AXUIElement` 系 API は `kTCCServiceAccessibility`、`CGEvent.post` は `kTCCServicePostEvent`、`CGEvent.tapCreate`（ホットキー）は `kTCCServiceListenEvent` という**それぞれ別の TCC サービス**を使う。前 2 つは「システム設定 > プライバシーとセキュリティ > アクセシビリティ」に、`kTCCServiceListenEvent` は「入力監視」に表示されるが、内部的にはいずれも別枠である。二段構えの挿入（§5.2）は前 2 つを、ホットキー監視は 3 つ目を必要とする。
 >
 > **どれか 1 つを他の判定に流用してはならない。** 片方だけ許可された状態は原理的にありうるため、値が一致する機体では取り違えに気付けない（詳細設計書 §2.2 / §6.2）。
+>
+> **したがって照会の実装は 1 つだけにする。** サービスと API の対応表は
+> `Sources/GhostVoiceCore/Support/PermissionInquiry.swift` の `PermissionProbes.system` にだけ置き、
+> CLI も `.app` もそこを通す。**2 実装あると、この規律が片方だけ守られている状態を作れてしまう。**
 
 ---
 

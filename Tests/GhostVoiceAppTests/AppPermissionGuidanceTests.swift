@@ -9,8 +9,8 @@ struct AppPermissionGuidanceTests {
     private func status(
         microphone: Bool = true, accessibility: Bool = true, listen: Bool = true,
         post: Bool = true, secureInput: Bool = false, bundleIdentifier: String? = "com.example.GhostVoice"
-    ) -> AppPermissionStatus {
-        AppPermissionStatus(
+    ) -> PermissionStatus {
+        PermissionStatus(
             microphoneStatus: microphone ? "許可" : "未確認",
             microphoneAuthorized: microphone,
             accessibilityTrusted: accessibility,
