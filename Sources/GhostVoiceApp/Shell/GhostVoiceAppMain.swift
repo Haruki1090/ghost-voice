@@ -10,10 +10,14 @@ import AppKit
 /// ビュー更新・アニメーション・イベント処理は `NSApplication` のイベントループに依存する。
 ///
 /// **`CGEventTap` は `CFRunLoopGetMain()` の `.commonModes` に載る**
-/// （`CGEventTapHotkeyMonitor.swift`）。`NSApp.run()` はメインの CFRunLoop を回すので
-/// 両立するはずだが、**これは実測されていない**（タップ生成は入力監視の権限を要するため、
-/// 権限の無い環境では確かめられない）。**詳細設計書 §13 の V-19 として登録してある。**
-/// 実施手順は README の「フェーズ 2: `.app` の権限移行」にある。
+/// （`CGEventTapHotkeyMonitor.swift`）。**`NSApp.run()` の下でも `.commonModes` のソースが
+/// 処理されることは実測した**（2026-08-14。タップと同じ形の `CFMachPort` 由来ソースを含む
+/// 4 系統、登録の前後、メニュー追跡中・モーダル中・バンドル内。詳細設計書 §7.2）。
+///
+/// **ただしタップ固有の振る舞いは依然として未実測である**（`CGEvent.tapCreate` は
+/// 入力監視の権限ダイアログを誘発するので呼んでいない）。キーイベントが実際に配送されるか、
+/// `return nil` による抑止が効くかは**詳細設計書 §13 の V-19 として残っている。**
+/// 実施手順は README の「フェーズ 2: `Ghost Voice.app` への移行」にある。
 @MainActor
 public enum GhostVoiceAppMain {
 

@@ -6,9 +6,13 @@ import GhostVoiceCore
 /// ## `stateUpdates` をここでは読まない
 ///
 /// `DictationSession.stateUpdates` は `AsyncStream` であり、**消費者は 1 つに限る**
-/// （複数の `next()` を同時に待つと異常終了する）。その 1 本は HUD が使う。
-/// **器がここで読んでしまうと HUD が読めなくなる**ので、器は読まない。
+/// （複数の `next()` を同時に待つと異常終了する）。**器はこれを読まない。**
 /// 終了の待ち合わせも `isBusy` の照会だけで済ませてある（`GhostVoiceCore.Shutdown`）。
+///
+/// - Note: **HUD もこれを読まない。** HUD が使うのは分配器の側（`stateStream()`）で、
+///   そちらは呼ぶたびに独立したストリームを返すので何人が読んでもよい。
+///   したがって `.app` では `stateUpdates` の読み手が 1 人も居ない
+///   （バッファは最新 32 件で頭打ちになるだけで、溜まり続けることは無い）。
 @MainActor
 public final class AppSessionRuntime {
 
@@ -78,7 +82,14 @@ public final class AppSessionRuntime {
     /// 文言も CLI と共有する——**2 箇所にあると必ずずれ、両方とも自分のテストでは緑になる。**
     ///
     /// - Note: **門（`ShutdownGate`）は渡さない。** 門は `stateUpdates` を消費している
-    ///   経路だけが持てるが、その 1 本は HUD が使う。ここは `isBusy` の照会だけで待つ。
+    ///   経路だけが持てる。ここは `isBusy` の照会だけで待つ。
+    ///
+    ///   **`.app` では `stateUpdates` を誰も読んでいない。** HUD が使うのは分配器の側
+    ///   （`stateStream()`。呼ぶたびに独立したストリームを返す）である——
+    ///   **「その 1 本は HUD が使う」という以前の説明は、分配器ができる前のものであり誤りになった。**
+    ///   門を持てる経路が空いていることになるが、**ここでは持たない**：終了の判定に
+    ///   分配器を使ってはならない（読み手が遅れると古いものから捨てるので、
+    ///   `.idle` を取りこぼしうる。`SessionBroadcast` の注記）。
     public func shutdown(grace: Duration = Shutdown.defaultGrace) async {
         guard !isShuttingDown else { return }
         isShuttingDown = true

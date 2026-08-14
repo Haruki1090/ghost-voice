@@ -22,21 +22,41 @@ public struct AppLaunchOptions: Sendable, Equatable {
     /// `app-bundle.md` §5.1）。したがって既定は `true` である。
     public let requestsPermissions: Bool
 
+    /// HUD の素振りを何秒行うか。nil なら行わない。
+    ///
+    /// **製品の機能ではなく、目視で確かめるための入口である**（`--hud-check`）。
+    /// 未実測項目 V-20（切り欠きに画素があるか）/ V-21（全 Space・フルスクリーン）/
+    /// V-22（クラムシェル）は、**HUD が出ていないと確かめられない**が、
+    /// 実際に出すには本来マイクとキー監視の許可が要る。この入口はどちらも触らずに
+    /// 全種類の表示を一巡させる。**終わると自分で終了する。**
+    ///
+    /// - Important: **`--shell-only` と同じくセッションを作らない。** マイクも
+    ///   `CGEvent.tapCreate` も触らないので、**TCC のダイアログが出る余地が無い。**
+    public let hudRehearsalSeconds: Double?
+
     /// 解釈できなかった引数。**黙って捨てない**（標準エラーへ出す）。
     public let unrecognized: [String]
 
-    public init(startsSession: Bool, requestsPermissions: Bool, unrecognized: [String] = []) {
+    public init(
+        startsSession: Bool, requestsPermissions: Bool, hudRehearsalSeconds: Double? = nil,
+        unrecognized: [String] = []
+    ) {
         self.startsSession = startsSession
         self.requestsPermissions = requestsPermissions
+        self.hudRehearsalSeconds = hudRehearsalSeconds
         self.unrecognized = unrecognized
     }
 
     public static let `default` = AppLaunchOptions(startsSession: true, requestsPermissions: true)
 
+    /// 素振りの既定の秒数。**筋書きを一巡できる長さ**（`HUDRehearsal.script` の総和は約 9 秒）。
+    public static let defaultHUDRehearsalSeconds: Double = 12
+
     /// - Parameter arguments: `CommandLine.arguments` の先頭（実行ファイル名）を除いたもの。
     public static func parse(_ arguments: [String]) -> AppLaunchOptions {
         var startsSession = true
         var requestsPermissions = true
+        var hudRehearsalSeconds: Double?
         var unrecognized: [String] = []
 
         for argument in arguments {
@@ -47,6 +67,23 @@ public struct AppLaunchOptions: Sendable, Equatable {
                 requestsPermissions = false
             case "--no-permission-prompts":
                 requestsPermissions = false
+            case "--hud-check":
+                // **セッションを作らない。** マイクにもタップにも触れない（ダイアログが出ない）。
+                startsSession = false
+                requestsPermissions = false
+                hudRehearsalSeconds = defaultHUDRehearsalSeconds
+            case let other where other.hasPrefix("--hud-check="):
+                startsSession = false
+                requestsPermissions = false
+                let value = Double(other.dropFirst("--hud-check=".count))
+                // **読めない秒数を黙って既定へ倒さない。** 「12 秒のつもりが 1.2 秒だった」
+                // のような取り違えは、目視の検証では気づけない。
+                if let value, value > 0 {
+                    hudRehearsalSeconds = value
+                } else {
+                    unrecognized.append(other)
+                    hudRehearsalSeconds = defaultHUDRehearsalSeconds
+                }
             case let other where other.hasPrefix("-psn_"):
                 // LaunchServices が付ける Process Serial Number。**誤りではない。**
                 continue
@@ -58,6 +95,7 @@ public struct AppLaunchOptions: Sendable, Equatable {
         return AppLaunchOptions(
             startsSession: startsSession,
             requestsPermissions: requestsPermissions,
+            hudRehearsalSeconds: hudRehearsalSeconds,
             unrecognized: unrecognized)
     }
 }

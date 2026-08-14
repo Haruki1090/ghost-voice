@@ -53,7 +53,7 @@ struct AppShutdownTests {
         #expect(ShutdownAnnouncement.utteranceLost.text.contains("挿入されませんでした"))
     }
 
-    /// アプリは `stateUpdates` を消費しない（その 1 本は HUD が使う）ので門を持てない。
+    /// アプリは `stateUpdates` を消費しない（**HUD は分配器の `stateStream()` を使う**）ので門を持たない。
     /// **その経路でも「待つ → 止める → 見届ける」は変わらない。**
     @Test("門を持たない経路でも、待ってから止め、run() を見届ける")
     func appPathFollowsTheOrder() async throws {

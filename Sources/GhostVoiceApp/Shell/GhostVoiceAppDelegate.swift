@@ -97,8 +97,22 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
         // `applicationDidFinishLaunching` の中で作らないのは、そこがまだ
         // `NSApplication.run()` の `finishLaunching` の途中だからである。
         // メインキューへ積んだこのブロックは、イベントループが回り始めてから走る。
-        DispatchQueue.main.async { [launchSequence] in
+        DispatchQueue.main.async { [launchSequence, options] in
             launchSequence.enterRunLoop(services: services)
+            guard let seconds = options.hudRehearsalSeconds else { return }
+            guard
+                let rehearsing = launchSequence.surfaces.compactMap({ $0 as? any HUDRehearsing })
+                    .first
+            else {
+                AppDiagnostics.note("[--hud-check] 素振りできる画面がありません。")
+                NSApp.terminate(nil)
+                return
+            }
+            AppDiagnostics.note("[--hud-check] HUD の素振りを \(seconds) 秒行います。")
+            rehearsing.startRehearsal(seconds: seconds) {
+                // **`exit` しない。** 終了は器の段取り（`applicationShouldTerminate`）を通す。
+                NSApp.terminate(nil)
+            }
         }
     }
 

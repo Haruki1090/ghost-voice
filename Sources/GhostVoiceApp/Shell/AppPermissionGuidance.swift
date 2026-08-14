@@ -116,6 +116,23 @@ public enum AppPermissionGuidance {
         }
     }
 
+    /// キー監視を開始できなかったことを **1 行**で言う（HUD の帯用）。
+    ///
+    /// **`message(for:)` は HUD に載らない**——複数行で、システム設定のパスまで含む。
+    /// HUD の帯は実測 221 pt の切り欠きを基準にした狭い場所であり、
+    /// 載せられるのは「何が起きたか」と「どこを見ればよいか」だけである
+    /// （`SessionFailureNotice` が `summary` と `detail` を分けているのと同じ理由）。
+    public static func summary(for error: HotkeyError) -> String {
+        switch error {
+        case .eventTapNotPermitted:
+            "キー入力を監視できません。\(settingsPath) > 入力監視 で \(appName) を有効にしてください。"
+        case .tapDisabledAtStart:
+            "キー入力の監視を開始できませんでした（他の入力系ツールと競合している可能性）。"
+        case .alreadyRunning, .stopped:
+            "キー入力の監視を開始できませんでした（内部の誤り）。"
+        }
+    }
+
     /// フェーズ 1（CLI）からの移行手順。
     ///
     /// **4 つとも付け直しになる。** これは避けられない（`app-bundle.md` §5.1 / §7）。

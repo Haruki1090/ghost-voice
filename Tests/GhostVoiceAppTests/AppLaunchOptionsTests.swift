@@ -44,4 +44,41 @@ struct AppLaunchOptionsTests {
         #expect(options.unrecognized == ["--nonsense"])
         #expect(!options.startsSession)
     }
+
+    /// **`--hud-check` も TCC に触れないことが要点である。**
+    /// HUD の目視確認（V-20 / V-21 / V-22）は、権限を付ける前でも行えなければならない——
+    /// 権限が要るなら「HUD が出ないのは権限のせいか実装のせいか」が切り分けられなくなる。
+    @Test("--hud-check はセッションを作らず、権限も要求しない")
+    func hudCheckTouchesNothing() {
+        let options = AppLaunchOptions.parse(["--hud-check"])
+        #expect(!options.startsSession)
+        #expect(!options.requestsPermissions)
+        #expect(options.hudRehearsalSeconds == AppLaunchOptions.defaultHUDRehearsalSeconds)
+        #expect(options.unrecognized.isEmpty)
+    }
+
+    @Test("--hud-check=秒 で長さを指定できる")
+    func hudCheckWithSeconds() {
+        let options = AppLaunchOptions.parse(["--hud-check=30"])
+        #expect(options.hudRehearsalSeconds == 30)
+        #expect(!options.startsSession)
+    }
+
+    /// **読めない秒数を黙って既定へ倒さない。**
+    /// 「30 秒のつもりが 12 秒だった」という取り違えは、目視の検証では気づけない。
+    @Test("--hud-check= の値が読めなければ誤りとして報告する")
+    func hudCheckWithBadSeconds() {
+        let options = AppLaunchOptions.parse(["--hud-check=abc"])
+        #expect(options.unrecognized == ["--hud-check=abc"])
+        #expect(options.hudRehearsalSeconds == AppLaunchOptions.defaultHUDRehearsalSeconds)
+
+        let negative = AppLaunchOptions.parse(["--hud-check=-3"])
+        #expect(negative.unrecognized == ["--hud-check=-3"])
+    }
+
+    @Test("既定では素振りをしない")
+    func noRehearsalByDefault() {
+        #expect(AppLaunchOptions.parse([]).hudRehearsalSeconds == nil)
+        #expect(AppLaunchOptions.parse(["--shell-only"]).hudRehearsalSeconds == nil)
+    }
 }
