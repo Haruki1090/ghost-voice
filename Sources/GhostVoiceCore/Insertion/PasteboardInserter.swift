@@ -197,20 +197,60 @@ public struct PasteboardInserter: PrimaryInserting, ClipboardLeaving {
     private let pasteboard: PasteboardBox
     private let sender: any PasteShortcutSending
     private let restoreDelay: Duration
+    private let ownProcessIdentifier: pid_t
+    private let frontmostProcessIdentifier: @Sendable () -> pid_t?
 
+    /// - Parameters:
+    ///   - ownProcessIdentifier: 自分のプロセス。**最前面がこれなら適用外にする**（下記）。
+    ///   - frontmostProcessIdentifier: 最前面のプロセス。既定は実 API
+    ///     （`CGWindowListCopyWindowInfo`。画面収録の許可は要らず、ウィンドウ名も読まない）。
     public init(
         pasteboard: NSPasteboard = .general,
         sender: any PasteShortcutSending = SystemPasteShortcutSender(),
-        restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay
+        restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
+        ownProcessIdentifier: pid_t = getpid(),
+        frontmostProcessIdentifier: @escaping @Sendable () -> pid_t? = {
+            SystemAccessibility.frontmostProcessIdentifier()
+        }
     ) {
         self.pasteboard = PasteboardBox(pasteboard: pasteboard)
         self.sender = sender
         self.restoreDelay = restoreDelay
+        self.ownProcessIdentifier = ownProcessIdentifier
+        self.frontmostProcessIdentifier = frontmostProcessIdentifier
     }
 
     /// **常に true ではない。** ⌘V を届けられなければ、この経路は何も達成しない
     /// （`SystemPasteShortcutSender.canSend` に実測を書いた）。
-    public func canInsert() -> Bool { sender.canSend }
+    ///
+    /// 門は 2 つある。
+    ///
+    /// 1. **送出できること**（TCC + secure input。`sender.canSend`）。
+    /// 2. **最前面が Ghost Voice 自身でないこと。**
+    ///
+    /// 2 が無いと、設定画面や履歴画面を開いたまま発話したときに
+    /// **⌘V が自分の窓へ配送される**（`AppWindow.present()` が `NSApp.activate()` するので
+    /// 最前面は Ghost Voice になり、PTT は `CGEventTap` なのでその状態でも録音は始まる）。
+    /// 結果は 2 通りで、**どちらも履歴には `.pasteboard` 成功として記録されていた**——
+    /// ユーザー辞書の入力欄にフォーカスがあれば**発話がそこへ貼られ**、
+    /// 無ければ**どこにも入らないのに「完了」と出る**
+    /// （最終レビュー 視点1 の B-1 / 視点3 の指摘 1）。
+    /// 一段目（`AccessibilityInserter.isSafeTarget`）は自プロセスを弾いていたのに、
+    /// ここだけ挿入先を一切見ていなかった。
+    /// FR-9 の再挿入は同じ危険を `FocusHandback` で構造的に塞いである。
+    ///
+    /// - Important: **判らないときは弾かない。** 門の根拠は「自分である」ことだけである。
+    ///   判らないという理由で弾くと、判定が壊れた瞬間に挿入が全部止まる。
+    ///   （AX 経路が不明な相手を弾くのは「自プロセスへの書き込みが背景スレッドから
+    ///   永久にブロックする」という別の理由による。）
+    /// - Note: 費用は 0.3〜1.1 ms（実測 2026-08-15。`frontmostProcessIdentifier()` の注記）。
+    ///   **1 プロセスの最初の 1 回だけ 38〜52 ms**掛かるが、そこは window server との
+    ///   接続の確立で、窓を出したことのあるプロセスでは既に済んでいる。
+    public func canInsert() -> Bool {
+        guard sender.canSend else { return false }
+        guard let frontmost = frontmostProcessIdentifier() else { return true }
+        return frontmost != ownProcessIdentifier
+    }
 
     /// - Important: **この経路は差し替えの錨を返さない**（常に `.inserted(anchor: nil)`）。
     ///   `CGEvent.post` は `Void` を返し、貼り付いたかどうかも、どの範囲へ入ったかも

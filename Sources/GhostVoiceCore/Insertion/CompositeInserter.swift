@@ -153,12 +153,20 @@ public struct CompositeInserter: AnchoringTextInserting {
         sender: any PasteShortcutSending = SystemPasteShortcutSender(),
         restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
         epoch: InsertionEpoch = InsertionEpoch(),
+        ownProcessIdentifier: pid_t = getpid(),
+        frontmostProcessIdentifier: @escaping @Sendable () -> pid_t? = {
+            SystemAccessibility.frontmostProcessIdentifier()
+        },
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) -> CompositeInserter {
         let pasteboardInserter = PasteboardInserter(
-            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay)
+            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay,
+            ownProcessIdentifier: ownProcessIdentifier,
+            frontmostProcessIdentifier: frontmostProcessIdentifier)
         return CompositeInserter(
-            primary: AccessibilityInserter(accessibility: accessibility, epoch: epoch),
+            primary: AccessibilityInserter(
+                accessibility: accessibility, ownProcessIdentifier: ownProcessIdentifier,
+                epoch: epoch),
             fallback: pasteboardInserter,
             lastResort: pasteboardInserter,
             epoch: epoch,
@@ -212,13 +220,24 @@ extension CompositeInserter {
         sender: any PasteShortcutSending = SystemPasteShortcutSender(),
         restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
         announcer: any ReplacementAnnouncing = SilentAnnouncer(),
+        ownProcessIdentifier: pid_t = getpid(),
+        frontmostProcessIdentifier: @escaping @Sendable () -> pid_t? = {
+            SystemAccessibility.frontmostProcessIdentifier()
+        },
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) -> InsertionStack {
         let epoch = InsertionEpoch()
+        // **自プロセスの判定は両段へ渡す。** 一段目（AX）だけに掛けていた頃は、
+        // 設定画面を開いたまま発話すると二段目の ⌘V が自分の窓へ飛んだ
+        // （最終レビュー 視点1 の B-1 / 視点3 の指摘 1）。
         let pasteboardInserter = PasteboardInserter(
-            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay)
+            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay,
+            ownProcessIdentifier: ownProcessIdentifier,
+            frontmostProcessIdentifier: frontmostProcessIdentifier)
         let inserter = CompositeInserter(
-            primary: AccessibilityInserter(accessibility: accessibility, epoch: epoch),
+            primary: AccessibilityInserter(
+                accessibility: accessibility, ownProcessIdentifier: ownProcessIdentifier,
+                epoch: epoch),
             fallback: pasteboardInserter,
             lastResort: pasteboardInserter,
             epoch: epoch,
@@ -230,6 +249,7 @@ extension CompositeInserter {
             clipboard: pasteboardInserter,
             announcer: announcer,
             epoch: epoch,
+            ownProcessIdentifier: ownProcessIdentifier,
             isSecureInputEnabled: isSecureInputEnabled
         )
         return InsertionStack(
