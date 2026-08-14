@@ -373,6 +373,17 @@ public final class TextReplacer: Sendable {
         // どちらでもない。**喪失の疑い。2 度目の書き込みはしない。**
         // 二重挿入は入らないことより悪い（詳細設計書 §6.2）。選択も戻さない——
         // 欄がどうなっているか判らない状態で、これ以上触るほうが危ない。
+        //
+        // **この退避は上書きされうる**（再レビュー B-3）。次の発話が Pasteboard 経路に
+        // いると、その経路は「退避 → ⌘V → 300 ms 待つ → 復元」でクリップボードを握って
+        // おり、**復元がここで置いた文字列を上書きする。**
+        // 一段目（AX）は世代の錠を通るのでここと直列化されるが、
+        // **`PasteboardInserter.tryInsert` は錠の外にある**——一段目が
+        // `canInsert()` で適用外を返す相手（AX で書けないアプリ）では、
+        // ここと復元が同時に走りうる。`TextReplacer` は挿入が進行中かを知る手段を
+        // 持たない（Core の型に印が無い）ので、**塞ぐのではなく告知の側を
+        // 嘘にならない言い方にしてある**（`SessionNoticeAnnouncement.textMayHaveBeenLost`
+        // は履歴も在り処として挙げる）。整形前のテキストは履歴に残っている。
         clipboard.leave(replacement)
         announcer.announce(.textMayHaveBeenLost)
         blocked.withLock { _ = $0.insert(anchor.processIdentifier) }

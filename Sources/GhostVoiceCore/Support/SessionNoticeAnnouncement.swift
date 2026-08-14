@@ -102,9 +102,22 @@ public struct SessionNoticeAnnouncement: Sendable, Equatable {
                 weight: .warning, isFailure: true)
 
         case .textMayHaveBeenLost:
+            // **「クリップボードから貼り直せます」と言い切ってはならない**（再レビュー B-3）。
+            // 退避（`TextReplacer` の `.lost`）は、次の発話が Pasteboard 経路で
+            // 挿入している最中だと**300 ms 後の復元で上書きされる。**
+            // `TextReplacer` は挿入が進行中かを知る手段を持たない（Core の型に印が無い）ので、
+            // **窓は構造として残る。** 告げる側で嘘にならない言い方にする——
+            // 整形前のテキストは履歴にある（(a) の分岐は履歴へ書けたときにしか
+            // 差し替えを始めない。`insertRawThenRevise`）。
             self.init(
-                summary: "入力欄のテキストが失われた可能性があります。クリップボードから貼り直せます。",
-                detail: "差し替えの途中で欄の内容が判らなくなりました（R-9）。以後このアプリでは差し替えを試みません。",
+                summary: "入力欄のテキストが失われた可能性があります。クリップボードか履歴から取り出せます。",
+                detail: """
+                    差し替えの途中で欄の内容が判らなくなりました（R-9）。\
+                    整形後のテキストはクリップボードへ退避しましたが、\
+                    **次の発話の挿入と重なると上書きされることがあります**——\
+                    その場合も整形前のテキストは履歴に残っています。\
+                    以後このアプリでは差し替えを試みません。
+                    """,
                 weight: .lost, isFailure: true)
 
         case .undone:

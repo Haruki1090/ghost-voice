@@ -248,17 +248,31 @@ public enum HUDRehearsal {
         Step(display: .processing(.inserting), duration: .milliseconds(500), note: "挿入中"),
         Step(display: .completed, duration: .milliseconds(600), note: "完了（チェックマーク）"),
         Step(display: .processing(.revising), duration: .milliseconds(800), note: "差し替え中（控えめ）"),
+        // **文言は Core の 1 箇所から取る**（`SessionFailureNotice` /
+        // `SessionNoticeAnnouncement`）。素振りに写しを置くと、Core の文言を直したときに
+        // **素振りだけが古い嘘を出し続ける**——実際に R-9 の文言でそうなりかけた（再レビュー B-3）。
         Step(
-            display: .message(HUDMessage(text: "認識できませんでした。", severity: .warning)),
+            display: .message(
+                HUDMessage(
+                    text: SessionFailureNotice(.noSpeechRecognized).summary, severity: .warning)),
             duration: .seconds(1), note: "エラー"),
         Step(
             display: .message(
-                HUDMessage(text: "パスワード入力欄（secure input）が有効でした。", severity: .refusal)),
+                HUDMessage(
+                    text: SessionFailureNotice(.refusedSecureInput).summary, severity: .refusal)),
             duration: .seconds(1), note: "拒否（エラーとして出さない）"),
         Step(
-            display: .message(
-                HUDMessage(text: "入力欄のテキストが失われた可能性があります。クリップボードから貼り直せます。", severity: .lost)),
+            display: .message(HUDMessage(text: Self.lostSummary, severity: .lost)),
             duration: .milliseconds(1200), note: "喪失の疑い（最も強い表示）"),
         Step(display: .hidden, duration: .milliseconds(600), note: "非表示"),
     ]
+
+    /// R-9 の告知の要約。
+    ///
+    /// **nil にはならない**——`.textMayHaveBeenLost` は「告げない 2 つ」に入っていない
+    /// （`SessionNoticeAnnouncementTests` が固定している）。それでも `??` を置くのは、
+    /// 素振りの都合で製品コードを `try!` にしないためである。
+    private static var lostSummary: String {
+        SessionNoticeAnnouncement(.textMayHaveBeenLost)?.summary ?? "入力欄のテキストが失われた可能性があります。"
+    }
 }

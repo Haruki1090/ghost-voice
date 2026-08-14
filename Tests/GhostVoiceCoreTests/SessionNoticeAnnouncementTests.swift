@@ -95,6 +95,24 @@ struct SessionNoticeAnnouncementTests {
         #expect(announcement.isFailure)
     }
 
+    /// **「クリップボードから貼り直せます」と言い切ってはならない。**
+    ///
+    /// R-9 の退避（`TextReplacer` の `.lost`）は、**次の発話が Pasteboard 経路で
+    /// 挿入している最中だと 300 ms 後の復元で上書きされる**（再レビュー B-3）。
+    /// `TextReplacer` は挿入が進行中かを知る手段を持たない（Core の型に印が無い）。
+    /// **告知が嘘になる窓が構造として残っている以上、もう 1 つの在り処を必ず言う。**
+    /// 整形前のテキストは履歴にある——(a) の分岐は履歴へ書けたときにしか
+    /// 差し替えを始めないので（`insertRawThenRevise`）、ここでは必ず残っている。
+    @Test("喪失の疑いは、クリップボードだけを在り処として言い切らない")
+    func lostPointsAtEveryRemainingCopy() throws {
+        let announcement = try #require(SessionNoticeAnnouncement(.textMayHaveBeenLost))
+        let text = announcement.summary + announcement.detail
+        #expect(text.contains("クリップボード"))
+        #expect(
+            text.contains("履歴"),
+            "クリップボードの退避が上書きされた場合の在り処（履歴）を言っていない")
+    }
+
     @Test("断念の理由をすべて文言にしてある（新しい理由が既存の文言へ吸い込まれない）")
     func everyDeclineReasonHasItsOwnText() {
         let reasons: [ReplacementDecline] = [
