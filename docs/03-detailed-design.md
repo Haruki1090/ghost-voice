@@ -53,7 +53,9 @@ ghost-voice/
 │   │   ├── SettingsStore.swift
 │   │   └── VocabularyStore.swift
 │   ├── Session/
-│   │   └── DictationSession.swift     状態機械（基本設計書 §4）
+│   │   ├── DictationSession.swift     状態機械（基本設計書 §4）
+│   │   ├── SessionBroadcast.swift     単一消費者のストリームを何人へでも配り直す（§10 の欠落 1 / 3）
+│   │   └── SessionMirror.swift        MainActor から同期で読める状態の写し（欠落 2）
 │   └── Support/
 │       ├── Metrics.swift              性能計測点
 │       └── SessionFailureNotice.swift 縮退の理由 → 媒体に依らない表示材料（§8.5）
