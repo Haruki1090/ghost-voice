@@ -586,12 +586,13 @@ FR-3 は物理的に満たせないので、要件定義書 §4.3 の「notch �
 
 | 項目 | 内容 |
 |---|---|
-| バンドルの作り方 | **SwiftPM の実行ファイルターゲット + 後段の組み立てスクリプト**（`Scripts/make-app.sh` 相当が `Contents/MacOS/` へ実行ファイルを置き、`Info.plist` を書き、`codesign` する）。**`.xcodeproj` は作らない**（下記） |
+| バンドルの作り方 | **SwiftPM の実行ファイルターゲット + 後段の組み立てスクリプト。`.xcodeproj` は作らない**（下記）。実体は `Scripts/make-app.sh` で、SwiftPM の実行ファイル（`GhostVoice`）を `Ghost Voice.app` へ組み立て、`Info.plist` と entitlements を置いて `codesign` する。**`swift build` / `swift test` の走らせ方を変えないため** |
 | App Sandbox | **無効**（AX API に必須）。entitlement を書かないことで無効にする |
 | Hardened Runtime | 有効（`codesign --options runtime`） |
-| 署名 | **Apple Development 証明書（または Developer ID）で署名する。ad-hoc（`-s -`）は採らない**（下記） |
-| 必要な Info.plist | `NSMicrophoneUsageDescription`（**`NSSpeechRecognitionUsageDescription` は不要**。`SpeechAnalyzer` は音声認識の TCC を要求しない。実測 V-14）。ほかに `CFBundleIdentifier` / `CFBundleName` / `CFBundleExecutable` / `CFBundlePackageType`(`APPL`) / `CFBundleShortVersionString` / `CFBundleVersion` / `LSMinimumSystemVersion`(`26.0`) / `LSUIElement` / `NSHighResolutionCapable` |
-| 必要な entitlements（署名時に渡す。`Info.plist` ではない） | `com.apple.security.app-sandbox` は書かない（＝無効）。`com.apple.security.device.audio-input` = `true`（Hardened Runtime 下のマイク使用に要る。**Apple の仕様であって本プロジェクトでは未実測。V-17**）。`com.apple.security.automation.apple-events` は不要 |
+| 署名 | **Apple Development 証明書（または Developer ID）で署名する。ad-hoc（`-s -`）は採らない**（下記）。ad-hoc の designated requirement は cdhash 単体で、実コードを 1 行変えるだけで別物になり、**ビルドのたびに利用者へ権限を付け直させる**ことになる（実測。詳細設計書 §9）。証明書が無い環境向けに `--allow-adhoc` を用意するが、スクリプトがその欠点を警告する |
+| 必要な Info.plist | `NSMicrophoneUsageDescription`（**`NSSpeechRecognitionUsageDescription` は不要**。`SpeechAnalyzer` は音声認識の TCC を要求しない。実測 V-14）。ほかに `CFBundleIdentifier` / `CFBundleName` / `CFBundleExecutable` / `CFBundlePackageType`(`APPL`) / `CFBundleShortVersionString` / `CFBundleVersion` / `LSMinimumSystemVersion`(`26.0`) / `LSUIElement` / `NSHighResolutionCapable`。**アクセシビリティ・入力監視・キー送出に対応する usage description キーは存在しない**（tccd が参照するキーを列挙して確認。`NSAccessibilityUsageDescription` のような名前を書いても無視されるだけで、この 3 つは利用者がシステム設定で追加する形式である）。実体は `Resources/Info.plist` |
+| 必要な entitlements（署名時に渡す。`Info.plist` ではない） | `com.apple.security.app-sandbox` は書かない（＝無効）。`com.apple.security.device.audio-input` = `true`（Hardened Runtime 下のマイク使用に要る。**「無いと開けない」ことは Apple の仕様であって本プロジェクトでは未実測。V-17**）。`com.apple.security.automation.apple-events` は**書かない**（Apple Events を使わない）。実体は `Resources/GhostVoice.entitlements` |
+| `CFBundleIdentifier` | `com.haruki1090.GhostVoice`。**二度と変えない**（DR に焼き込まれ、変えると TCC の許可がすべて失われる） |
 | 必要な TCC 権限 | マイク、アクセシビリティ（`kTCCServiceAccessibility` と `kTCCServicePostEvent` の両方）、キーイベント監視（`kTCCServiceListenEvent` / 入力監視。ホットキーの `CGEventTap` に要る）。**音声認識は不要**（実測 V-14） |
 | `LSUIElement` | `true`（Dock に表示しない）。**実測でコードを 1 行も書かずに `activationPolicy == .accessory` になった**（2026-08-14 / M3 / macOS 26.5.2。手で組み立てた `.app` で確認）。`setActivationPolicy(.accessory)` の明示呼び出しは要らない |
 | 配布 | Developer ID 署名 + notarization。Mac App Store は不可（要件定義書 §5）。**自分でビルドして自分で使う間は公証は要らない**——自前ビルドの `.app` には `com.apple.quarantine` が付かず、`open` で警告なく起動した（実測 2026-08-14） |
@@ -675,6 +676,10 @@ FR-3 は物理的に満たせないので、要件定義書 §4.3 の「notch �
 | V-28 | (a)(b) 両分岐の M5a と、差し替え経路の M6 / M7（NFR-P6a / NFR-P6b の達成判定） |
 | V-29 | 差し替えの体感と、利用者が続きを打ち始めるまでの時間（NFR-P6b の打ち切りの根拠） |
 | V-30 | Pasteboard 経路で限定読み戻しによって貼付を確認できるか（できれば (a) をこの経路へ広げられる） |
+| V-31 | 実マイク・肉声での NFR-P3（現行定義: 結果ストリームの終端）と、V-12 の修正が実機で効いていること |
+| V-32 | 起動直後に押した場合の M1a（起動時の捨て往復の残りを待つ経路） |
+| V-33 | ad-hoc 署名 + DR 固定でも TCC の許可が残るか（OSS 公開の前。§10） |
+| V-34 | 発話の途中の終了要求（⌘Q / SIGTERM）で発話が失われないか（`.app` 版） |
 
 詳細と実施時期は詳細設計書 §13 の一覧に集約する。
 

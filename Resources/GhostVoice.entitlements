@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  署名時に codesign へ渡す entitlements（Info.plist ではない）。
+
+  - com.apple.security.app-sandbox = false … **App Sandbox は無効。**
+    AX API（kTCCServiceAccessibility）とサンドボックスは両立しない（基本設計書 §10）
+  - com.apple.security.device.audio-input = true … Hardened Runtime 下でマイクを使うために要る。
+    **Apple の仕様であり、「無いとマイクが開けない」ことは未実測**（app-bundle.md §4.6 / 詳細設計書 §13 の V-17）
+
+  com.apple.security.automation.apple-events は**書かない**（Apple Events を使わないため）。
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>
