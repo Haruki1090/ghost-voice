@@ -13,7 +13,8 @@ struct SettingsTests {
         #expect(s.localeIdentifier == "ja-JP")
         #expect(s.transcriberKind == .dictation)
         #expect(s.refinementEnabled)
-        #expect(s.refinementTimeoutMs == 500)
+        // 打ち切りは NFR-P4 の目標値 500 ms ではなく NFR-P6 の予算から決まる（詳細設計書 §10）。
+        #expect(s.refinementTimeoutMs == 750)
         #expect(s.historyLimit == 50)
     }
 
