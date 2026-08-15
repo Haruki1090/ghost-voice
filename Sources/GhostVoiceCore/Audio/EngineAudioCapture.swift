@@ -293,7 +293,11 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
     /// デバイスが切り替わった瞬間に発話が丸ごと失われる。
     private func reconfigure() {
         lock.withLock {
-            guard isPrepared else { return }
+            // **寝ている間は組み直さない。** ここで `engine.start()` すると、
+            // 待機中にデバイスが変わっただけで勝手に起きてしまう（オレンジ点が点く）。
+            // 入力形式の変化は、次に起きるとき `installTap` が
+            // `outputFormat(forBus:)` を読み直すので自然に追従する。
+            guard isPrepared, isAwakeState else { return }
             reconfigurations += 1
 
             let wasTapped = isTapped

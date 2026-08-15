@@ -333,6 +333,42 @@ struct AudioCaptureTapTests {
         #expect(!capture.isAwake)
     }
 
+    @Test("寝ている間に設定変更が来ても勝手に起きない")
+    func reconfigurationDoesNotWakeSleepingEngine() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        capture.sleep()
+        #expect(!capture.isAwake)
+
+        NotificationCenter.default.post(
+            name: .AVAudioEngineConfigurationChange, object: rig.engine)
+        await capture.waitForReconfiguration()
+
+        // **`isAwake` ではなく `isEngineRunning` を見る。** 欠陥はまさに「フラグを
+        // 触らずにエンジンだけ起こす」形で出るので、フラグ側を見ると素通りする
+        // （実際、フラグだけ見ていたときこのテストは欠陥のまま緑になった）。
+        // オレンジ点を決めるのは実際のエンジンであってこちらの帳簿ではない。
+        #expect(!capture.isEngineRunning, "寝ている最中にデバイスが変わって勝手に起きた（点が点く）")
+        #expect(!capture.isAwake)
+    }
+
+    @Test("起きている間の設定変更は今までどおり組み直す")
+    func reconfigurationStillRunsWhileAwake() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+
+        NotificationCenter.default.post(
+            name: .AVAudioEngineConfigurationChange, object: rig.engine)
+        await capture.waitForReconfiguration()
+
+        #expect(capture.reconfigurationCount >= 1, "起きている間の再構成まで止めてしまった")
+        #expect(capture.isTapping)
+        capture.stopTap()
+    }
+
     @Test("変換に失敗したバッファは捨てた数として残る（タップが通る経路そのもの）")
     func countsDroppedBuffers() {
         let counter = DroppedBufferCounter()
@@ -658,14 +694,25 @@ struct AudioCaptureTapTests {
             "武装コストの最大値が壊れ検知の線を割った（線は要件値ではない。要件 NFR-P1 は 50 ms）: \(sorted.last!) ms")
     }
 
-    @Test("タップしていないときの設定変更でもエンジンは生きたまま")
-    func configurationChangeWhileIdle() async throws {
+    /// **起きてはいるがタップは張っていない**状態（発話と発話のあいだ）での設定変更。
+    ///
+    /// 2026-08-15 の改訂で「タップしていない」に 2 通りができた——寝ているか、
+    /// 起きているが張っていないか。**寝ている側は起こしてはならず**
+    /// （`reconfigurationDoesNotWakeSleepingEngine`）、起きている側は生かしたままにする。
+    /// ここは後者を見る。
+    @Test("起きていてタップしていないときの設定変更でもエンジンは生きたまま")
+    func configurationChangeWhileAwakeAndNotTapping() async throws {
         let rig = try ManualRenderingRig()
         let capture = makeCapture(on: rig)
         try capture.prepare()
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()          // 起きたまま、張っていない状態
+        #expect(capture.isAwake)
+
         NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: rig.engine)
         await capture.waitForReconfiguration()
         #expect(capture.isEngineRunning)
+        #expect(capture.isAwake)
     }
 }
 
