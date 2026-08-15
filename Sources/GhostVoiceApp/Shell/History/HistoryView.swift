@@ -94,6 +94,18 @@ public struct HistoryView: View {
                     .padding(.horizontal, 6)
                     .padding(.vertical, 1)
                     .background(.quaternary, in: Capsule())
+                // **確定していないテキストであることを、一覧で区別できるようにする。**
+                // 確定済みと同じ顔で並ぶと、利用者は「認識がおかしい」と読む
+                // （実際には終了要求で打ち切られただけである。`HistoryEntry.isProvisional`）。
+                if entry.isProvisional {
+                    Text("暫定（確定前）")
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                        .foregroundStyle(.orange)
+                        .help("終了要求で録音の途中を打ち切ったため、確定していないテキストです。")
+                }
                 Spacer()
             }
             if let refined = entry.refinedText {

@@ -20,7 +20,12 @@ extension ConsoleWriting {
             // 進行表示（`SessionNarration` が `\r` で行を上書きする）の途中に割り込む。
             // **必ず行を改めてから出す。**
             write("\n" + announcement.text + "\n")
-        case .gaveUp, .utteranceLost, .finished:
+        case .stillWaiting:
+            // **待っている間も 1 秒ごとに出す。** 端末では HUD が無いので、
+            // ここが「まだ生きている」を示す唯一の手がかりになる。
+            // 録音は続いているので進行表示が `\r` で走っている——行を改めてから出す。
+            write("\n" + announcement.text + "\n")
+        case .gaveUp, .utteranceInterrupted, .finished:
             write(announcement.text + "\n")
         }
     }

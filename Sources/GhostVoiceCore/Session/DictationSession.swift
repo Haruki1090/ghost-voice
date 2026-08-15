@@ -260,6 +260,16 @@ public actor DictationSession {
     private var latestFinal = ""
     private var droppedAtStart = 0
 
+    /// **終了要求で録音を打ち切ったとき、その発話をどこへ残せたか。**
+    ///
+    /// `run()` が戻った後に終了処理が読む（`Shutdown.perform` の `salvage`）。
+    /// **`.nothingHeld` のままなら打ち切っていない**（＝発話は普通に完走した）。
+    ///
+    /// `isBusy` で代用してはならない——救出は `finishIdle()` まで走るので、
+    /// **救出に成功した直後の `isBusy` は偽である。** それを「何も抱えていなかった」と
+    /// 読むと、**打ち切ったことも履歴に在ることも一切告げないまま終わる。**
+    public private(set) var shutdownSalvage: ShutdownSalvage = .nothingHeld
+
     /// 発話の通し番号。**前の発話の結果ストリームを消費しているタスクが、
     /// 次の発話の状態を触るのを防ぐために要る。**
     ///
@@ -728,6 +738,10 @@ public actor DictationSession {
             case .undoRequested: beginUndo()
             }
         }
+        // **イベント列が尽きた時点でまだ録音中なら、その発話を救う。**
+        // ここへ来る経路は「終了処理がホットキーを止めた」だけである
+        // （監視器の死は `.interrupted` で来るので、そちらは確定として扱われる）。
+        salvageAbandonedRecording()
         await completionTask?.value
         completionTask = nil
         // **保留中の差し替えは見届けない。** 捨てても生テキストは欄にあり、
@@ -1606,6 +1620,76 @@ public actor DictationSession {
             fail(.historyUnavailable(insertedElsewhere: false))
             return
         }
+        finishIdle()
+    }
+
+    /// **終了要求で録音の途中を打ち切るときの、最後の写し。**
+    ///
+    /// ## なぜ要るのか（実機 2026-08-15 / 利用者の機体）
+    ///
+    /// 利用者が PTT キーを押したまま喋っている最中に `SIGTERM` が届いた。
+    /// 猶予 10 秒を使い切って打ち切られ——**そこまでの発話は欄にもクリップボードにも
+    /// 履歴にも、どこにも残らなかった。** 打ち切りそのものは設計どおりである
+    /// （無限に待つと終了できないプロセスになる。それは直前に直した欠陥そのものである）。
+    /// **穴は「打ち切ったあとに何もしていない」ことだった。**
+    ///
+    /// ## ESC との非対称を埋める
+    ///
+    /// **ESC による中断は `.notInserted` として履歴へ残す**（基本設計書 §4 /
+    /// `InsertionMethod.notInserted`）。同じ「発話の途中でやめる」なのに、
+    /// 終了の打ち切りだけ穴が空いていた。**ここで同じ扱いに揃える。**
+    ///
+    /// ## 確定を撃たない理由
+    ///
+    /// ここは**終了処理の中**であり、既に猶予を使い切っている。認識器へ確定
+    /// （`finish()`）を撃って結果ストリームの終端を待つと、**打ち切ったはずの終了が
+    /// さらに最大 `finalizeDeadline` 延びる。** 終了を延ばさないことがこの経路の要件なので、
+    /// **その時点でメモリに在るものをそのまま残す**——確定済みの前半（`latestFinal`）＋
+    /// 未確定の末尾（`latestVolatile`）である。
+    ///
+    /// **したがってこのテキストは確定していない。** `isProvisional: true` を立てて、
+    /// 利用者が履歴で見たときに確定済みのものと区別できるようにする。
+    ///
+    /// - Important: **secure input 中は何も残さない**（基本設計書 §7 / FR-4 の唯一の例外）。
+    ///   `completeUtterance` が整形の手前で同じ判定をしているのと同じ理由で、
+    ///   ここを抜くとパスワードが `history.json` へ入る。
+    private func salvageAbandonedRecording() {
+        guard phase == .recording else { return }
+        phase = .processing
+        // 録音の後片付け。**タップを外さないとマイクを掴んだままプロセスが消える。**
+        audio.stopTap()
+        maxDurationTask?.cancel()
+        maxDurationTask = nil
+
+        guard !isSecureInputEnabled() else {
+            shutdownSalvage = .refusedSecureInput
+            fail(.refusedSecureInput)
+            return
+        }
+
+        // **確定済みの前半と未確定の末尾を繋ぐ。** `completeUtterance` の
+        // 「`latestFinal` が空なら `latestVolatile`」とは条件が違う——あちらは
+        // 確定を撃った後なので末尾も `latestFinal` に入っている。ここは撃っていない。
+        let raw = (latestFinal + latestVolatile).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else {
+            // 一言も認識されていなかった。**失うものが無いので告げない。**
+            shutdownSalvage = .nothingHeld
+            finishIdle()
+            return
+        }
+
+        let stored = record(
+            HistoryEntry(
+                rawText: raw, refinedText: nil,
+                localeIdentifier: settings.settings.localeIdentifier,
+                insertionMethod: .notInserted, isProvisional: true))
+        guard stored == .stored else {
+            // **この発話はどこにも残っていない。** 挿入していないので手元にも無い。
+            shutdownSalvage = .lost
+            fail(.historyUnavailable(insertedElsewhere: false))
+            return
+        }
+        shutdownSalvage = .retainedInHistory(provisional: true)
         finishIdle()
     }
 

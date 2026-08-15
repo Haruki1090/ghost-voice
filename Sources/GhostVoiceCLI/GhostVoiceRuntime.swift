@@ -321,6 +321,10 @@ public enum GhostVoiceRuntime {
                     awaitRun: { await run.value },
                     // **`state` ではなく `isBusy`**（押下から最初の emit までの窓を含めるため）
                     isBusy: { await session.isBusy },
+                    // **打ち切った発話の行き先は状態機械しか知らない。**
+                    // `isBusy` で代用すると、救出に成功した直後は偽なので
+                    // 「打ち切った」ことすら告げずに終わる。
+                    salvage: { await session.shutdownSalvage },
                     announce: { err.announce($0) })
                 await narration.value
                 // **待ってから落とす。** キャンセルすると最後の顛末が出ないまま消える。
