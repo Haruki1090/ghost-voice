@@ -217,7 +217,7 @@ struct RefinementGuardTests {
     /// **独立に効くのは「入力側にフェンスがある」場合だけ**である。そのとき
     /// フェンスは入力由来なので追加字数は 0 になり、**追加字数の検査は通してしまう。**
     /// 音声認識がバッククォートを返すことは無いが、**FR-6 の辞書は利用者が手で書く**
-    /// （`applyingVocabulary` が入力へ当てるので、辞書経由で `expected` に入りうる）。
+    /// （`permittingVocabulary` が入力へ足すので、辞書経由で `expected` に入りうる）。
     ///
     /// **「整形結果にコードフェンスは決して現れない」は入力に依らない絶対条件**である。
     @Test("入力にコードフェンスが含まれていても、出力のフェンスは受け入れない")
@@ -977,6 +977,46 @@ struct RetainedRatioTests {
         #expect(
             RefinementGuard.accept(output, refinementOf: raw) == nil,
             "辞書無しでも通るなら、追加字数の検査が効いていない")
+    }
+
+    /// **実運用で整形が丸ごと落ちていた原因**（実測 2026-08-15 / 利用者の履歴）。
+    ///
+    /// 利用者が辞書へ `頭, 列, スレッズ → Threads` を入れた状態で、
+    /// **モデルが置換をしなかった**（実 LLM で 3/3 再現）:
+    ///
+    /// ```
+    /// raw    : 頭のAPIが使えるようになったので
+    /// out    : 頭のAPIが使えるようになったので   ← 入力と 1 字も違わない
+    /// ```
+    ///
+    /// 旧実装は `expected` を `ThreadsのAPIが…` へ**置き換えて**いたので、
+    /// **利用者が実際に言った `頭` が「入力に無い文字」に数えられて拒否された。**
+    /// **辞書に語を 1 つ入れた瞬間、置換されなかった発話の整形が全部落ちる。**
+    ///
+    /// 置換は「してもよい」であって「しなければならない」ではない
+    /// （`RefinementGuard.permittingVocabulary`）。
+    @Test("辞書があってもモデルが置換しなければ、入力そのままの出力を受け入れる")
+    func acceptsUnsubstitutedOutputWhenTermsAreGiven() {
+        let terms = [VocabularyTerm(canonical: "Threads", misheard: ["列", "頭", "スレッズ"])]
+        let raw = "頭のAPIが使えるようになったので"
+
+        #expect(
+            RefinementGuard.accept(raw, refinementOf: raw, terms: terms) != nil,
+            "入力と 1 字も違わない出力を、辞書があるという理由だけで落としている")
+        #expect(
+            RefinementGuard.accept("頭のAPIが使えるようになったので。", refinementOf: raw, terms: terms)
+                != nil,
+            "句読点を補っただけの出力も同じく通ること")
+        // 置換した側も通る（両方の表記を由来として認める）。
+        #expect(
+            RefinementGuard.accept(
+                "ThreadsのAPIが使えるようになったので。", refinementOf: raw, terms: terms) != nil)
+        // **緩めたのは辞書の語だけである。** 言っていない語は今までどおり落ちる。
+        #expect(
+            RefinementGuard.accept(
+                "頭のAPIが使えるようになったので、スレッズをThreadsにしました。",
+                refinementOf: raw, terms: terms) == nil,
+            "モデルが付けた注釈まで通してはならない（実機で観測した出力）")
     }
 
     /// 辞書を渡しても、頼んでいない置換は通らない。
