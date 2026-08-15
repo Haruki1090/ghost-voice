@@ -162,9 +162,11 @@ enum RefinementGuard {
     ///
     /// `ジーエイエスを使いました` → `Google Apps Script を使いました。` は、
     /// 素で測ると **16 字の追加**（許容量 0 字はもちろん、逸脱の最小 6 字も大きく超える）。
-    /// だから `accept` は**先に頼んだ置換を入力へ当ててから**測る
-    /// （`applyingVocabulary(_:terms:)`）。当てた後は追加 0 字になる。
+    /// だから `accept` は**頼んだ置換も由来として認めてから**測る
+    /// （`permittingVocabulary(_:terms:)`）。認めた後は追加 0 字になる。
     /// **辞書を渡さなければ同じ出力が落ちる**ことも検査で固定してある。
+    /// **置換は任意であって必須ではない**（置き換えてしまうと、モデルが置換しなかった
+    /// ときに入力そのままの出力まで落ちる。実運用でそれが起きた）。
     ///
     /// ## フェーズ 2 最終レビュー: 「間隙 3」も破れていた（V-38 / 実測 2026-08-15）
     ///
@@ -323,18 +325,46 @@ enum RefinementGuard {
     ///   整形が落ち始める。逆に規則 5 がある限り、上げる理由は実測上どこにも無い。
     static let maximumUnsupportedAdditions = 0
 
-    /// 頼んだ置換（FR-6 の用語辞書）を入力へ先に当てる。
+    /// 頼んだ置換（FR-6 の用語辞書）を、**由来として認める形**として入力へ足す。
     ///
     /// **これをしないと、用語の正規化が逸脱と区別できない。**
     /// `ジーエイエスを使いました` → `Google Apps Script を使いました。` は素で測ると
-    /// **16 字の追加**で、逸脱の最小（5 字）を大きく超える（上記の表）。
+    /// **16 字の追加**で、逸脱の最小（6 字）を大きく超える（上記の表）。
     /// 整形器はこの辞書をプロンプトへ入れて置換を依頼しているので、
-    /// **置換後の姿こそが「期待される入力」である。**
-    static func applyingVocabulary(_ raw: String, terms: [VocabularyTerm]) -> String {
+    /// **置換後の姿も「期待される入力」である。**
+    ///
+    /// ## 置き換えてはならない。**両方を残す**（実運用の実測 / 2026-08-15）
+    ///
+    /// 当初はここで誤認識表記を正規表記へ**置き換えて**いた。
+    /// **その形は「置換は必須である」と言っているに等しく、実機で整形を丸ごと落とした。**
+    ///
+    /// 利用者が辞書に `頭, 列, スレッズ → Threads` を入れた状態で、
+    /// **モデルが置換をしなかった**ときの実測（各 3 回・同一）:
+    ///
+    /// ```
+    /// raw     : 頭のAPIが使えるようになったので
+    /// 置換後の expected : ThreadsのAPIが使えるようになったので
+    /// モデルの出力     : 頭のAPIが使えるようになったので、スレッズをThreadsにしました。
+    /// ```
+    ///
+    /// **`頭` は利用者が実際に言った（認識された）文字なのに、`expected` から消えていたので
+    /// 「入力に無い文字」に数えられた。** 出力が入力と 1 字も違わない場合ですら、
+    /// 辞書に語を 1 つ入れた瞬間に**追加 1 字**となって拒否される。
+    /// **辞書を足すと整形が効かなくなる**——FR-6 が FR-5 を壊していた。
+    ///
+    /// **置換は「してもよい」であって「しなければならない」ではない。**
+    /// だから誤認識表記を消さず、**その直後に正規表記を挿し込む**。
+    /// 出力がどちらの表記を採っても（両方を並べても）追加 0 字になり、
+    /// **利用者が言っていない語だけが追加として残る。**
+    ///
+    /// - Note: 実測の裏づけは `RefinerTests` の
+    ///   `辞書があってもモデルが置換しなければ、入力そのままの出力を受け入れる`。
+    static func permittingVocabulary(_ raw: String, terms: [VocabularyTerm]) -> String {
         var result = raw
         for term in terms {
             for variant in term.misheard where !variant.isEmpty {
-                result = result.replacingOccurrences(of: variant, with: term.canonical)
+                result = result.replacingOccurrences(
+                    of: variant, with: variant + term.canonical)
             }
         }
         return result
@@ -346,8 +376,9 @@ enum RefinementGuard {
         _ output: String, refinementOf raw: String, terms: [VocabularyTerm] = []
     ) -> String? {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 追加字数は**頼んだ置換を当てた後の入力**と比べる（`applyingVocabulary` の理由）。
-        let expected = applyingVocabulary(raw, terms: terms)
+        // 追加字数は**頼んだ置換も由来として認めた入力**と比べる
+        // （`permittingVocabulary` の理由。置換は任意であって必須ではない）。
+        let expected = permittingVocabulary(raw, terms: terms)
         // 長さの検査を先に通す。`unsupportedAdditions` は共通部分列を取るので
         // 出力の長さに比例して重くなり、暴走した生成をそのまま渡したくない。
         guard !trimmed.isEmpty,

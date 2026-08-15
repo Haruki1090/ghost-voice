@@ -208,7 +208,7 @@ struct GuardVerdict {
     let accepted: Bool
 
     init(output: String, raw: String, terms: [VocabularyTerm] = []) {
-        let expected = RefinementGuard.applyingVocabulary(raw, terms: terms)
+        let expected = RefinementGuard.permittingVocabulary(raw, terms: terms)
         outputLength = output.count
         plausible = RefinementGuard.isPlausible(output, refinementOf: raw)
         legacyRetained = Self.legacyRetainedRatio(output, of: expected)
