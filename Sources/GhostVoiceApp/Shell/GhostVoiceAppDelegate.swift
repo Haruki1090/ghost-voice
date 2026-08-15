@@ -89,7 +89,7 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
             // **セッションは作らない。** 終了の段取りだけを本物と同じ形で通す。
             shutdownTarget = ShutdownRehearsal(busyFor: .milliseconds(Int(seconds * 1000)))
             AppDiagnostics.note(
-                "[--shutdown-check] 終了の素振りです。\(seconds) 秒のあいだ「発話を抱えている」ことにします。"
+                "[--shutdown-check] 終了の素振りです。\(JapaneseDuration.text(.seconds(seconds))) のあいだ「発話を抱えている」ことにします。"
                     + "終了要求（SIGTERM / ⌘Q / osascript の quit）を送ってください。")
         } else {
             AppDiagnostics.note("[--shell-only] セッションを作らずに器だけを起動しました。")
@@ -118,6 +118,12 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [launchSequence, options] in
             launchSequence.enterRunLoop(services: services)
 
+            // **終了待ちの案内を出せる画面をここで繋ぐ。**
+            // 繋がなければ文言はログにしか出ず、**正しく待っているのに壊れて見える**
+            // （2026-08-15 の実機。利用者は案内を一度も見ないまま猶予を使い切った）。
+            AppShutdownAnnouncer.use(
+                launchSequence.surfaces.compactMap { $0 as? any ShutdownAnnouncingSurface }.first)
+
             if let seconds = options.hudRehearsalSeconds {
                 guard
                     let rehearsing = launchSequence.surfaces
@@ -127,7 +133,7 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
                     NSApp.terminate(nil)
                     return
                 }
-                AppDiagnostics.note("[--hud-check] HUD の素振りを \(seconds) 秒行います。")
+                AppDiagnostics.note("[--hud-check] HUD の素振りを \(JapaneseDuration.text(.seconds(seconds))) 行います。")
                 rehearsing.startRehearsal(seconds: seconds) {
                     // **`exit` しない。** 終了は器の段取り（`applicationShouldTerminate`）を通す。
                     NSApp.terminate(nil)
@@ -144,7 +150,7 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
                     NSApp.terminate(nil)
                     return
                 }
-                AppDiagnostics.note("[--window-check] 窓の素振りを \(seconds) 秒行います。")
+                AppDiagnostics.note("[--window-check] 窓の素振りを \(JapaneseDuration.text(.seconds(seconds))) 行います。")
                 rehearsing.startWindowRehearsal(seconds: seconds) {
                     NSApp.terminate(nil)
                 }

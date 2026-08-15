@@ -410,6 +410,72 @@ struct HUDPresenterTests {
         presenter.apply(.state(.recording(volatileText: "")), at: start + .seconds(1))
         #expect(presenter.display.recordingText == "")
     }
+
+    // MARK: - 終了待ち
+
+    /// **終了待ちがいちばん要る場面は「押しっぱなしで喋っている最中」である。**
+    ///
+    /// そこでは `.recording` が 50 ms ごとに届き、しかも
+    /// **`.recording` は保持中のどんな表示にも勝つ。** ふつうの告知
+    /// （`announce(_:hold:at:)`）で出すと一瞬で消える——
+    /// **実機で利用者が案内を見られなかったのと同じ結果になる。**
+    @Test("終了待ちは、録音の暫定テキストに上書きされない")
+    func shutdownNoticeOutranksRecording() {
+        var presenter = makePresenter()
+        let start = ContinuousClock.now
+        presenter.apply(.state(.recording(volatileText: "喋っている途中")), at: start)
+
+        let notice = HUDMessage(text: "終了待ち: PTT キーを離してください（残り 9 秒）", severity: .info)
+        presenter.announceShutdown(notice, hold: .seconds(2), at: start)
+        #expect(presenter.display == .message(notice))
+
+        // **暫定テキストが届き続けても譲らない。**
+        presenter.apply(.state(.recording(volatileText: "まだ喋っている")), at: start + .milliseconds(60))
+        presenter.apply(.level(0.4), at: start + .milliseconds(120))
+        #expect(presenter.display == .message(notice), "録音の更新に負けている: \(presenter.display)")
+    }
+
+    /// **`.idle` でも出ること。** 「`.idle` なら非表示」の規則は
+    /// 「発話が無いときに邪魔をしない」ためのもので、終了待ちは
+    /// **発話の有無に関わらず利用者の行動（キーを離す）を待っている。**
+    @Test("待機中でも終了待ちは出る")
+    func shutdownNoticeShowsEvenWhenIdle() {
+        var presenter = makePresenter()
+        let start = ContinuousClock.now
+        presenter.apply(.state(.idle), at: start)
+        #expect(presenter.display == .hidden)
+
+        let notice = HUDMessage(text: "終了待ち", severity: .info)
+        presenter.announceShutdown(notice, hold: .seconds(2), at: start)
+        #expect(presenter.display == .message(notice))
+        presenter.apply(.state(.idle), at: start + .milliseconds(10))
+        #expect(presenter.display == .message(notice))
+    }
+
+    /// **譲らないのは期限までである。** 永久に居座ると、素振り（`--hud-check`）の
+    /// 後に帯が残り、次の発話も映らなくなる。
+    @Test("終了待ちは期限が来たら畳み、以後は普通に映る")
+    func shutdownNoticeExpires() {
+        var presenter = makePresenter()
+        let start = ContinuousClock.now
+        presenter.announceShutdown(
+            HUDMessage(text: "終了待ち", severity: .info), hold: .seconds(2), at: start)
+
+        presenter.apply(.tick, at: start + .seconds(2))
+        #expect(presenter.display == .hidden)
+        presenter.apply(.state(.recording(volatileText: "次の発話")), at: start + .seconds(3))
+        #expect(presenter.display.recordingText == "次の発話")
+    }
+
+    /// **起こし直す時刻を返すこと。** 返さないと `.tick` が来ず、帯が消えない。
+    @Test("終了待ちは起こし直す時刻を返す")
+    func shutdownNoticeAsksToBeWokenUp() {
+        var presenter = makePresenter()
+        let start = ContinuousClock.now
+        let wake = presenter.announceShutdown(
+            HUDMessage(text: "終了待ち", severity: .info), hold: .seconds(2), at: start)
+        #expect(wake == start + .seconds(2))
+    }
 }
 
 extension HUDDisplay {

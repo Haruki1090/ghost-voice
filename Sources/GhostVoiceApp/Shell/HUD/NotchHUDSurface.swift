@@ -213,6 +213,43 @@ public final class NotchHUDSurface: AppSurface {
     }
 }
 
+// MARK: - 終了待ち
+
+extension NotchHUDSurface: ShutdownAnnouncingSurface {
+
+    /// **終了待ちを帯に出す。**
+    ///
+    /// `handle(_:)` を通さないのは、これが `SessionState` の並びに由来しないためである
+    /// （`announce(_:hold:at:)` と同じ理由）。**`.idle` でも出る**——
+    /// 「`.idle` なら非表示」の規則は「発話が無いときに邪魔をしない」ためのもので、
+    /// 終了待ちは発話の有無に関わらず**利用者の行動（キーを離す）を待っている。**
+    ///
+    /// - Important: **フォーカスは奪わない。** 通る先は `HUDPanel.render` だけで、
+    ///   そこは `orderFrontRegardless()`（`makeKeyAndOrderFront` ではない）である。
+    ///   利用者は終了待ちの間も挿入先アプリで作業している。
+    public func showShutdown(_ announcement: ShutdownAnnouncement) {
+        guard let text = announcement.hudText else { return }
+        let wake = presenter.announceShutdown(
+            HUDMessage(text: text, severity: HUDPresenter.severity(for: announcement.weight)),
+            hold: Self.hold(for: announcement), at: .now)
+        panel?.render(presenter.display)
+        schedule(wake)
+    }
+
+    /// どれだけ譲らないか。**秒数は媒体の関心である**（`HUDPresenter.hold` と同じ規律）。
+    ///
+    /// **どれも要件値ではない。** 待ちの告知は「次の『まだ待っています』が来るまで」を
+    /// 覆えばよく、余白の 1 秒は刻みが遅れた回に帯が消えないためだけにある。
+    static func hold(for announcement: ShutdownAnnouncement) -> Duration {
+        switch announcement {
+        case .waiting(let grace): grace + .seconds(1)
+        case .stillWaiting(let remaining): min(remaining, Shutdown.heartbeat) + .seconds(1)
+        // 打ち切った後はプロセスが畳まれるまでの短い間だけ。
+        case .gaveUp, .utteranceInterrupted, .finished: .seconds(8)
+        }
+    }
+}
+
 // MARK: - 目視確認のための素振り
 
 /// `--hud-check` が呼ぶ口。**製品の経路ではない。**
@@ -251,6 +288,23 @@ extension NotchHUDSurface: HUDRehearsing {
                     AppDiagnostics.note("[HUD 素振り] \(step.note)")
                     try? await Task.sleep(for: step.duration)
                 }
+            }
+            // **終了待ちだけは製品とまったく同じ経路で 1 度出す。**
+            //
+            // 上の `script` は `HUDPanel.render` を直に叩く（見た目の網羅が目的）。
+            // ここは `showShutdown` → `HUDPresenter.announceShutdown` → `HUDPanel` と
+            // いう本番の経路であり、**「窓の出し入れ」のログもここでしか出ない。**
+            // 実機で確かめられるのはこの 1 手である（`--hud-check` の受け入れ条件）。
+            if let self, !Task.isCancelled {
+                // **先に引っ込める。** 出しっぱなしのまま差し替えると、`HUDPanel` は
+                // 「出したとき」にしか矩形と level を言わない（表示の切り替わりでしか
+                // 呼ばないのは、暫定テキストの更新回数だけ行を増やさないため）。
+                // **終了待ちのための `窓を出しました` を 1 行残す**のがここの目的である。
+                self.panel?.render(.hidden)
+                try? await Task.sleep(for: .milliseconds(400))
+                AppDiagnostics.note("[HUD 素振り/配線] 終了待ち（製品と同じ経路）")
+                self.showShutdown(.stillWaiting(remaining: HUDRehearsal.shutdownRemaining))
+                try? await Task.sleep(for: .seconds(2))
             }
             self?.panel?.render(.hidden)
             AppDiagnostics.note("[HUD 素振り] 終了しました。")
@@ -348,8 +402,29 @@ public enum HUDRehearsal {
         Step(
             display: .message(HUDMessage(text: Self.lostSummary, severity: .lost)),
             duration: .milliseconds(1200), note: "喪失の疑い（最も強い表示）"),
+        // **終了待ち。** 実機ではこれが出ないまま利用者が猶予 10 秒を使い切った
+        // （2026-08-15）。文言・重さともに Core の 1 箇所から取る。
+        Step(
+            display: .message(
+                HUDMessage(
+                    text: Self.shutdownWaitSummary,
+                    severity: HUDPresenter.severity(for: Self.shutdownWait.weight))),
+            duration: .milliseconds(1200), note: "終了待ち（PTT キーを離してくださいの案内）"),
         Step(display: .hidden, duration: .milliseconds(600), note: "非表示"),
     ]
+
+    /// 素振りで見せる「残り」。**実測ではない。** 目視のための数である。
+    public static let shutdownRemaining: Duration = .seconds(9)
+
+    /// 素振りが見せる終了待ちの告知。**文言は Core の 1 箇所から取る。**
+    static var shutdownWait: ShutdownAnnouncement { .stillWaiting(remaining: shutdownRemaining) }
+
+    /// **nil にはならない**——`.stillWaiting` は `hudText` を必ず持つ
+    /// （`ShutdownAnnouncementTests` が固定している）。`??` を置くのは、
+    /// 素振りの都合で製品コードを `try!` にしないためである（`lostSummary` と同じ）。
+    static var shutdownWaitSummary: String {
+        shutdownWait.hudText ?? "終了待ち: PTT キーを離してください"
+    }
 
     /// R-9 の告知の要約。
     ///

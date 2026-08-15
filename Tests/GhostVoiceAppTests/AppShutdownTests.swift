@@ -50,7 +50,56 @@ struct AppShutdownTests {
     func announcementTextComesFromCore() {
         let text = ShutdownAnnouncement.waiting(grace: Shutdown.defaultGrace).text
         #expect(text.contains("録音中なら PTT キーを離してください"))
-        #expect(ShutdownAnnouncement.utteranceLost.text.contains("挿入されませんでした"))
+        #expect(ShutdownAnnouncement.utteranceInterrupted(.lost).text.contains("どこにも残せませんでした"))
+    }
+
+    /// **終了の文言をログだけに流していないこと。**
+    ///
+    /// 実機 2026-08-15: 文言は正しかったが `.app` では unified log にしか出ず、
+    /// **利用者は「キーを離してください」を一度も見ないまま猶予 10 秒を使い切った。**
+    /// `AppDiagnostics.note` を直に渡す形へ戻すと、その状態に戻る。
+    @Test("終了の文言は HUD にも流す出口（AppShutdownAnnouncer）を通る")
+    func announcementsGoThroughTheHUDSink() throws {
+        for path in [
+            "Sources/GhostVoiceApp/Shell/AppSessionRuntime.swift",
+            "Sources/GhostVoiceApp/Shell/ShutdownRehearsal.swift",
+        ] {
+            let code = try Self.sourceWithoutComments(path)
+            #expect(
+                code.contains("announce: AppShutdownAnnouncer.sink"),
+                "\(path) が終了の文言をログだけに流している")
+            #expect(
+                !code.contains("announce: { AppDiagnostics.note"),
+                "\(path) がログ直行に戻っている（HUD に何も出ない）")
+        }
+        // 器が受け手を繋いでいること。繋がなければ出口はあっても届かない。
+        let delegate = try Self.sourceWithoutComments(
+            "Sources/GhostVoiceApp/Shell/GhostVoiceAppDelegate.swift")
+        #expect(delegate.contains("AppShutdownAnnouncer.use("))
+        #expect(delegate.contains("as? any ShutdownAnnouncingSurface"))
+    }
+
+    /// **ログには必ず残ること。** HUD が死んでいる状況でも終了待ちは起きる——
+    /// 直前に直した欠陥（メインキューが詰まって `@MainActor` が全部死ぬ）がまさにそれで、
+    /// そのときログだけが残る。**HUD だけに寄せてはならない。**
+    @Test("終了の文言は HUD の有無にかかわらずログへ出る")
+    func announcementsAlwaysReachTheLog() throws {
+        let code = try Self.sourceWithoutComments(
+            "Sources/GhostVoiceApp/Shell/AppShutdownAnnouncer.swift")
+        let sink = try #require(code.range(of: "static let sink"))
+        let body = String(code[sink.upperBound...])
+        let note = try #require(body.range(of: "AppDiagnostics.note(announcement.text)"))
+        let hud = try #require(body.range(of: "showShutdown(announcement)"))
+        #expect(note.lowerBound < hud.lowerBound, "HUD の前にログへ出していない")
+    }
+
+    /// **HUD へ渡すのはメインを経由すること。** `Shutdown.perform` は `nonisolated` で、
+    /// 一般の実行文脈から `announce` を呼ぶ。直に `@MainActor` を触ると成立しない。
+    @Test("HUD へはメインへ渡してから出す")
+    func hudIsTouchedOnMain() throws {
+        let code = try Self.sourceWithoutComments(
+            "Sources/GhostVoiceApp/Shell/AppShutdownAnnouncer.swift")
+        #expect(code.contains("Task { @MainActor in"))
     }
 
     /// アプリは `stateUpdates` を消費しない（**HUD は分配器の `stateStream()` を使う**）ので門を持たない。

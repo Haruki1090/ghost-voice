@@ -90,6 +90,12 @@ public final class ShutdownRehearsal: AppShutdownPerforming {
             stopHotkey: { stopped.value = true },
             awaitRun: { await runTask?.value },
             isBusy: { ContinuousClock.now < busyUntil },
-            announce: { AppDiagnostics.note($0.text) })
+            // **救出の仕組みは持たない**（セッションが無い）。`Shutdown.perform` は
+            // nil のとき `isBusy` を見て `.lost` として告げる——素振りで
+            // 「履歴に残っています」と嘘を言わせないため、ここは埋めない。
+            salvage: nil,
+            // **本物と同じ出口を通る。** ここを `AppDiagnostics.note` に戻すと、
+            // **素振りでは HUD に何も出ないのに素振りは緑**という形になる。
+            announce: AppShutdownAnnouncer.sink)
     }
 }

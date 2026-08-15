@@ -134,6 +134,12 @@ public final class AppSessionRuntime: AppShutdownPerforming {
             stopHotkey: { [monitor] in monitor.stop() },
             awaitRun: { await runTask?.value },
             isBusy: { [session] in await session.isBusy },
-            announce: { AppDiagnostics.note($0.text) })
+            // **打ち切った発話の行き先は状態機械しか知らない。**
+            // `isBusy` で代用すると、救出に成功した直後は偽なので
+            // 「打ち切った」ことすら告げずに終わる。
+            salvage: { [session] in await session.shutdownSalvage },
+            // **ログと HUD の両方へ流す。** ログだけだと `.app` では画面に何も出ず、
+            // HUD だけだと HUD が死んでいる状況（＝直前に直した欠陥）で何も残らない。
+            announce: AppShutdownAnnouncer.sink)
     }
 }

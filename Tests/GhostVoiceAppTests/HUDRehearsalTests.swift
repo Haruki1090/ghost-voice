@@ -1,4 +1,5 @@
 import Foundation
+import GhostVoiceCore
 import Testing
 
 @testable import GhostVoiceApp
@@ -67,8 +68,7 @@ struct HUDRehearsalTests {
     /// 「録音では出ない」を切り分けられなかった。**録音の入口の状態を必ず含めること。**
     @Test("配線の筋書きは録音の状態から始まる（製品と同じ入口）")
     func wiringScriptStartsWithRecording() {
-        let first = try? #require(HUDRehearsal.wiringScript.first)
-        #expect(first?.event == .state(.recording(volatileText: "")))
+        #expect(HUDRehearsal.wiringScript.first?.event == .state(.recording(volatileText: "")))
     }
 
     /// **音量も配線の一部である**（`levelStream()` は状態とは別の口）。
@@ -82,5 +82,48 @@ struct HUDRehearsalTests {
     @Test("配線の筋書きは待機で終わる")
     func wiringScriptEndsIdle() {
         #expect(HUDRehearsal.wiringScript.last?.event == .state(.idle))
+    }
+
+    // MARK: - 終了待ち
+
+    /// **実機で出ないまま利用者が猶予 10 秒を使い切った表示である**（2026-08-15）。
+    /// 素振りの一覧に無ければ、誰も見ないまま出荷される。
+    @Test("素振りの一覧に終了待ちが入っている")
+    func scriptShowsTheShutdownWait() {
+        let texts = HUDRehearsal.script.compactMap { step -> String? in
+            if case .message(let message) = step.display { return message.text }
+            return nil
+        }
+        #expect(texts.contains { $0.contains("離して") }, "終了待ちの案内が一覧に無い: \(texts)")
+    }
+
+    /// **文言は Core の 1 箇所から取る。** 素振りに写しを置くと、Core の文言を直したときに
+    /// **素振りだけが古い嘘を出し続ける**（R-9 の文言で実際にそうなりかけた）。
+    @Test("終了待ちの文言は Core のものと 1 文字も違わない")
+    func shutdownWaitTextComesFromCore() {
+        #expect(
+            HUDRehearsal.shutdownWaitSummary
+                == ShutdownAnnouncement.stillWaiting(remaining: HUDRehearsal.shutdownRemaining)
+                .hudText)
+    }
+
+    /// **終了待ちは失敗として出さない。** 赤く出すと「壊れた」と読まれる——
+    /// 正しく待っているアプリを見て「全然反応しません」と言われたのがこの欠陥である。
+    @Test("素振りの終了待ちは失敗の色で出さない")
+    func shutdownWaitIsNotShownAsFailure() {
+        let severity = HUDPresenter.severity(
+            for: ShutdownAnnouncement.stillWaiting(remaining: .seconds(9)).weight)
+        #expect(severity == .info)
+    }
+
+    /// **譲らない長さは、次の刻みが来るまでを覆えばよい。**
+    /// 短すぎると刻みの合間に帯が消え、長すぎると打ち切った後も居座る。
+    @Test("終了待ちの保持は次の刻みを覆う")
+    @MainActor
+    func shutdownHoldCoversTheNextBeat() {
+        let hold = NotchHUDSurface.hold(for: .stillWaiting(remaining: .seconds(9)))
+        #expect(hold > Shutdown.heartbeat, "次の刻みが来る前に帯が消える")
+        // 上限は「打ち切った後も居座らない」ための線であり、要件値ではない。
+        #expect(hold <= .seconds(3))
     }
 }
