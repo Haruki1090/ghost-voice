@@ -101,7 +101,8 @@ struct AppShutdownTests {
         let body = code[shouldTerminate.upperBound...]
         #expect(body.contains(".terminateLater"))
 
-        let shutdown = try #require(body.range(of: "await runtime.shutdown()"), "段取りを通っていない")
+        let shutdown = try #require(
+            body.range(of: "await shutdownTarget.shutdown()"), "段取りを通っていない")
         let reply = try #require(
             body.range(of: "NSApp.reply(toApplicationShouldTerminate: true)"), "返事をしていない")
         #expect(shutdown.lowerBound < reply.lowerBound, "段取りを待たずに終了を許している")
@@ -120,6 +121,88 @@ struct AppShutdownTests {
         #expect(!code.contains("await session.state"), "終了の判断に state を使っている")
         // 段取りは Core の 1 実装だけを通る。
         #expect(code.contains("await Shutdown.perform("))
+    }
+
+    // MARK: - シグナルの受け口（実機で 17 分止まった箇所）
+
+    /// **終了要求の受け口をメインキューに置いてはならない。**
+    ///
+    /// 置くと、ハンドラが**メインキューのブロックとして**走り、その中で
+    /// `.terminateLater` の入れ子のランループへ入る。返事を出す `Task` は
+    /// メインキューへ積まれるので**二度と走らず、プロセスが終わらない**
+    /// （実機で `SIGTERM` も `pkill` も効かず `kill -9` しか残らなかった）。
+    /// 機序と実測は `MainRunLoopHop` の注記、届くことの検査は `MainRunLoopHopTests` にある。
+    ///
+    /// **これは振る舞いでは検査できない**——テストプロセスごと終了してしまう。
+    /// だからソースの形として固定する（`terminationIsNotPassedThrough` と同じ形）。
+    @Test("シグナルの受け口はメインキューに置かず、メインへは MainRunLoopHop で渡す")
+    func signalTrapDoesNotUseTheMainQueue() throws {
+        let code = try Self.sourceWithoutComments(
+            "Sources/GhostVoiceApp/Shell/GhostVoiceAppDelegate.swift")
+        let install = try #require(code.range(of: "func installSignalTrap()"))
+        let body = String(code[install.upperBound...])
+        let end = try #require(body.range(of: "\n    }"))
+        let trap = String(body[..<end.lowerBound])
+
+        #expect(!trap.contains("queue: .main"), "受け口がメインキューに戻っている（終了要求が届かない）")
+        #expect(trap.contains("DispatchQueue(label:"), "専用のキューを使っていない")
+        #expect(code.contains("MainRunLoopHop.perform"), "メインへの受け渡しが素の main キューに戻っている")
+        #expect(!code.contains("DispatchQueue.main.async { NSApp.terminate"))
+    }
+
+    /// **ハンドラは `nonisolated` でなければならない。**
+    ///
+    /// `@MainActor` の文脈で `setEventHandler { … }` とクロージャを直接書くと、
+    /// そのクロージャは `@MainActor` を継ぎ、入口に隔離の実行時検査が入る。
+    /// **メイン以外のキューに載せた瞬間 `SIGTRAP` で即死する**
+    /// （実測 2026-08-15。使い捨てプログラムで終了コード 133。`MainRunLoopHop` の表）。
+    ///
+    /// 即死は「終わらない」より悪い——**終了処理を 1 行も通らずに消えるので、
+    /// ⌘V 送出後・クリップボード復元前なら発話がそのまま失われる。**
+    ///
+    /// **これも振る舞いでは検査できない**（当たればテストプロセスが落ちる）。
+    @Test("シグナルのハンドラはクロージャで書かず、nonisolated な関数を渡す")
+    func signalHandlerIsNotIsolated() throws {
+        let code = try Self.sourceWithoutComments(
+            "Sources/GhostVoiceApp/Shell/GhostVoiceAppDelegate.swift")
+        #expect(
+            code.contains("setEventHandler(handler: Self.requestTermination)"),
+            "ハンドラをクロージャで書いている（背景キューで SIGTRAP になる）")
+        #expect(code.contains("private nonisolated static func requestTermination()"))
+        #expect(!code.contains("source.setEventHandler {"), "クロージャが復活している")
+    }
+
+    // MARK: - 終了の素振り（--shutdown-check）
+
+    /// **素振りも本物と同じ順序で畳むこと。** 素振りが本物と違う順序で通ると、
+    /// V-34 の手順は緑なのに製品が壊れている、という形になる。
+    @Test("素振りは、待機へ戻るまで待ってからホットキーを止め、run() を見届ける")
+    @MainActor
+    func rehearsalWaitsForTheUtterance() async throws {
+        let rehearsal = ShutdownRehearsal(busyFor: .milliseconds(200))
+        #expect(!rehearsal.didDeliverUtterance)
+
+        let started = ContinuousClock.now
+        await rehearsal.shutdown(grace: .seconds(5))
+        let elapsed = ContinuousClock.now - started
+
+        // **抱えていた発話を最後まで届けてから戻ること。**
+        #expect(rehearsal.didDeliverUtterance, "抱えていた発話を見届けずに終わった")
+        // 合否線は要件値ではない。「待ちが効いていない」（＝即座に戻る）ことだけを弾く。
+        #expect(elapsed >= .milliseconds(150), "待たずに畳んでいる")
+    }
+
+    /// **抱えていないときは待たないこと。** ここが待つと、実機で見つかった
+    /// 「発話が無いのに終わらない」の再現になる。
+    @Test("抱えていなければ素振りは即座に終わる")
+    @MainActor
+    func rehearsalWithNothingHeldFinishesAtOnce() async throws {
+        let rehearsal = ShutdownRehearsal(busyFor: .zero)
+        let started = ContinuousClock.now
+        await rehearsal.shutdown(grace: .seconds(5))
+        // 上限は「戻らない実装を黙って待たない」ための値であり、要件値ではない。
+        #expect(ContinuousClock.now - started < .seconds(2))
+        #expect(rehearsal.didDeliverUtterance)
     }
 
     /// リポジトリの根。**テストの置き場所から辿る**（作業ディレクトリに依存しない）。

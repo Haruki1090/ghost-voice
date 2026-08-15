@@ -14,7 +14,7 @@ import GhostVoiceCore
 ///   したがって `.app` では `stateUpdates` の読み手が 1 人も居ない
 ///   （バッファは最新 32 件で頭打ちになるだけで、溜まり続けることは無い）。
 @MainActor
-public final class AppSessionRuntime {
+public final class AppSessionRuntime: AppShutdownPerforming {
 
     public let session: DictationSession
 
@@ -118,7 +118,11 @@ public final class AppSessionRuntime {
     ///   門を持てる経路が空いていることになるが、**ここでは持たない**：終了の判定に
     ///   分配器を使ってはならない（読み手が遅れると古いものから捨てるので、
     ///   `.idle` を取りこぼしうる。`SessionBroadcast` の注記）。
-    public func shutdown(grace: Duration = Shutdown.defaultGrace) async {
+    public func shutdown() async {
+        await shutdown(grace: Shutdown.defaultGrace)
+    }
+
+    public func shutdown(grace: Duration) async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
         watchdog?.cancel()

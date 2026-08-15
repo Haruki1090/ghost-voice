@@ -170,8 +170,11 @@ open "/Applications/Ghost Voice.app"
 
 `LSUIElement` なので標準エラーはどこにも出ない。unified log で読む。
 
+**`log` は必ず `/usr/bin/log` と絶対パスで書くこと**（この機体では同名のシェル関数と衝突する。
+2026-08-15 実測）。この文書のすべての例がそうなっている。
+
 ```bash
-log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
+/usr/bin/log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
 ```
 
 **権限一覧の 4 行すべてに ✓ が付いていること。** 3 行で先へ進まないこと——
@@ -299,7 +302,7 @@ swift build && .build/debug/ghost-voice --check    # 4 項目すべてに ✓ �
 `.tapDisabledByTimeout` は unified log に出る。長め（10 分ほど）に常駐させてから見る:
 
 ```bash
-log show --last 15m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact | grep -i "tap"
+/usr/bin/log show --last 15m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact | grep -i "tap"
 ```
 
 **結果の記入先**: 詳細設計書 §13 の **V-19** の行。
@@ -340,7 +343,7 @@ Scripts/make-app.sh
 osascript -e 'quit app "Ghost Voice"' 2>/dev/null || pkill -f "Ghost Voice.app/Contents/MacOS/GhostVoice"
 cp -R ".build/app/Ghost Voice.app" /Applications/
 open "/Applications/Ghost Voice.app"
-log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
+/usr/bin/log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
 ```
 
 **4 項目の照会値が 1 つも変わっていないこと**（4 行とも ✓ のまま）。
@@ -881,7 +884,7 @@ open "/Applications/Ghost Voice.app" --args --hud-check=60
 まず、どこへ出したかがログに 1 行出る。**これが出ていなければ HUD は作られていない。**
 
 ```bash
-log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact | grep HUD
+/usr/bin/log show --last 2m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact | grep HUD
 # 例: [HUD] 表示先: 内蔵ディスプレイ(id 1) / 切り欠きの直下（notch x 791.0, y 1131.0, w 221.0, h 38.0） / 上辺 y=1169.0 中心 x=901.5
 ```
 

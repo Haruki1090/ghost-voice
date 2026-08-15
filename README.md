@@ -120,7 +120,7 @@ open ".build/app/Ghost Voice.app" --args --window-check=16 # 窓のフォーカ�
 Finder から起動すると標準エラーはどこにも出ないので、こちらで読む:
 
 ```bash
-log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
+/usr/bin/log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
 ```
 
 ## 窓のフォーカスの確認（`--window-check`）
