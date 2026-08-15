@@ -197,13 +197,13 @@ struct AudioCaptureTapTests {
     private let target = AVAudioFormat(
         commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
 
-    @Test("prepare を二重に呼んでも例外を出さず、エンジンが動いている")
+    @Test("prepare を二重に呼んでも例外を出さず、寝たままである")
     func prepareIsIdempotent() throws {
         let rig = try ManualRenderingRig()
         let capture = makeCapture(on: rig)
         try capture.prepare()
         try capture.prepare()
-        #expect(capture.isEngineRunning)
+        #expect(!capture.isAwake, "prepare が起こしたまま返っている")
         capture.stopTap()
     }
 
@@ -236,6 +236,137 @@ struct AudioCaptureTapTests {
         #expect(capture.isTapping)
         capture.stopTap()
         #expect(!capture.isTapping, "stopTap した後も装着中のままになっている")
+    }
+
+    // MARK: - アイドルで寝る（設計書 2026-08-15）
+
+    @Test("prepare は捨て起動を通した上で寝た状態で返る")
+    func prepareLeavesEngineAsleep() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        #expect(!capture.isAwake, "prepare がエンジンを起動したまま返っている（点が消えない）")
+        #expect(!capture.isEngineRunning)
+    }
+
+    @Test("寝ていても startTap が自分で起こす")
+    func startTapWakesFromSleep() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        #expect(!capture.isAwake)
+
+        _ = try capture.startTap(format: nil)
+        #expect(capture.isAwake, "寝たまま張ろうとしている。音が一切届かない")
+        #expect(capture.isTapping)
+        capture.stopTap()
+    }
+
+    @Test("stopTap ではエンジンを止めない（連続発話のため）")
+    func stopTapKeepsEngineAwake() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()
+        #expect(capture.isAwake, "発話のたびに寝ると、次の押下が毎回 63 ms を払う")
+    }
+
+    @Test("sleep でエンジンが止まる")
+    func sleepStopsEngine() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()
+
+        capture.sleep()
+        #expect(!capture.isAwake)
+        #expect(!capture.isEngineRunning)
+    }
+
+    @Test("タップが張られている間の sleep は無視される")
+    func sleepIsIgnoredWhileTapping() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+
+        capture.sleep()
+        #expect(capture.isAwake, "録音中にエンジンを止めた。その発話が丸ごと消える")
+        #expect(capture.isTapping)
+        capture.stopTap()
+    }
+
+    @Test("sleep は冪等（二度呼んでも落ちない）")
+    func sleepIsIdempotent() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        capture.sleep()
+        capture.sleep()
+        #expect(!capture.isAwake)
+    }
+
+    @Test("寝て起きてを繰り返しても音が流れる")
+    func sleepWakeCycling() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+
+        for _ in 0..<3 {
+            let stream = try capture.startTap(format: target)
+            try rig.render(frames: 4_800)
+            capture.stopTap()
+            let summary = await summarize(stream)
+            #expect(summary.frames > 0, "寝起きの後にバッファが 1 つも来ていない")
+            capture.sleep()
+            #expect(!capture.isAwake)
+        }
+    }
+
+    @Test("prepare していなければ sleep は何もしない")
+    func sleepBeforePrepareIsHarmless() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        capture.sleep()
+        #expect(!capture.isAwake)
+    }
+
+    @Test("寝ている間に設定変更が来ても勝手に起きない")
+    func reconfigurationDoesNotWakeSleepingEngine() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        capture.sleep()
+        #expect(!capture.isAwake)
+
+        NotificationCenter.default.post(
+            name: .AVAudioEngineConfigurationChange, object: rig.engine)
+        await capture.waitForReconfiguration()
+
+        // **`isAwake` ではなく `isEngineRunning` を見る。** 欠陥はまさに「フラグを
+        // 触らずにエンジンだけ起こす」形で出るので、フラグ側を見ると素通りする
+        // （実際、フラグだけ見ていたときこのテストは欠陥のまま緑になった）。
+        // オレンジ点を決めるのは実際のエンジンであってこちらの帳簿ではない。
+        #expect(!capture.isEngineRunning, "寝ている最中にデバイスが変わって勝手に起きた（点が点く）")
+        #expect(!capture.isAwake)
+    }
+
+    @Test("起きている間の設定変更は今までどおり組み直す")
+    func reconfigurationStillRunsWhileAwake() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+
+        NotificationCenter.default.post(
+            name: .AVAudioEngineConfigurationChange, object: rig.engine)
+        await capture.waitForReconfiguration()
+
+        #expect(capture.reconfigurationCount >= 1, "起きている間の再構成まで止めてしまった")
+        #expect(capture.isTapping)
+        capture.stopTap()
     }
 
     @Test("変換に失敗したバッファは捨てた数として残る（タップが通る経路そのもの）")
@@ -310,7 +441,13 @@ struct AudioCaptureTapTests {
         let capture = makeCapture(on: rig)
         try capture.prepare()
         capture.stopTap()
-        #expect(capture.isEngineRunning)
+        // **`prepare()` は寝た状態で返る**（2026-08-15 改訂）ので、ここで見るのは
+        // 「エンジンが動いていること」ではなく「壊れていないこと」——
+        // 続けて張れば起きて張れる、という形で確かめる。
+        #expect(!capture.isAwake)
+        _ = try capture.startTap(format: nil)
+        #expect(capture.isAwake)
+        capture.stopTap()
     }
 
     @Test("stopTap でストリームが終了する")
@@ -557,14 +694,25 @@ struct AudioCaptureTapTests {
             "武装コストの最大値が壊れ検知の線を割った（線は要件値ではない。要件 NFR-P1 は 50 ms）: \(sorted.last!) ms")
     }
 
-    @Test("タップしていないときの設定変更でもエンジンは生きたまま")
-    func configurationChangeWhileIdle() async throws {
+    /// **起きてはいるがタップは張っていない**状態（発話と発話のあいだ）での設定変更。
+    ///
+    /// 2026-08-15 の改訂で「タップしていない」に 2 通りができた——寝ているか、
+    /// 起きているが張っていないか。**寝ている側は起こしてはならず**
+    /// （`reconfigurationDoesNotWakeSleepingEngine`）、起きている側は生かしたままにする。
+    /// ここは後者を見る。
+    @Test("起きていてタップしていないときの設定変更でもエンジンは生きたまま")
+    func configurationChangeWhileAwakeAndNotTapping() async throws {
         let rig = try ManualRenderingRig()
         let capture = makeCapture(on: rig)
         try capture.prepare()
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()          // 起きたまま、張っていない状態
+        #expect(capture.isAwake)
+
         NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: rig.engine)
         await capture.waitForReconfiguration()
         #expect(capture.isEngineRunning)
+        #expect(capture.isAwake)
     }
 }
 
@@ -618,7 +766,7 @@ struct AudioCapturePermissionTests {
         authorization.current = .denied      // ユーザーがシステム設定で取り消した
         // 門番があれば 2 回目は何もせず返る。無ければ microphoneAccessNotGranted を投げる。
         #expect(throws: Never.self) { try capture.prepare() }
-        #expect(capture.isEngineRunning)
+        #expect(!capture.isAwake)
     }
 
     @Test("手動レンダリングではマイクを開かないので TCC の状態を動かさない")
@@ -738,6 +886,13 @@ struct AudioCaptureMicrophoneTests {
         let capture = EngineAudioCapture()
         try capture.prepare()
 
+        // **測る前に起こす。** 改訂後の NFR-P1 が 50 ms を要求するのは連続する発話
+        // （＝エンジンが起きている状態）であり、スリープからの初回は別枠である
+        // （下の `wakeLatency` がそちらを測る）。ここで起こしておかないと、
+        // 30 回のうち 1 回目だけが起床ぶんを含んで壊れ検知の線を割る。
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()
+
         var samples: [Double] = []
         for _ in 0..<30 {
             let start = ContinuousClock.now
@@ -753,6 +908,52 @@ struct AudioCaptureMicrophoneTests {
         #expect(
             s.max < 75,
             "壊れ検知の線を割った（線は要件値ではない。要件 NFR-P1 は 50 ms）: 最大 \(s.max) ms")
+    }
+
+    /// **スリープからの起床費用**（設計書 2026-08-15 / V-46）。
+    ///
+    /// 改訂後の NFR-P1 は、アイドル 30 秒を超えて眠った後の最初の 1 回について
+    /// この量を許容している。**合否線ではなく計測である**——印字された中央値と最大を
+    /// 読んで判断すること。線は壊れ検知として 300 ms に置く（設計時の実測は
+    /// 中央値 63.0 ms / 最大 129.6 ms。2026-08-15 / M3 / macOS 26.5.2 / n=20）。
+    @Test("M1c: スリープからの起床 → タップ武装")
+    func wakeLatency() throws {
+        let capture = EngineAudioCapture()
+        try capture.prepare()
+
+        var samples: [Double] = []
+        for _ in 0..<20 {
+            capture.sleep()
+            #expect(!capture.isAwake)
+            let start = ContinuousClock.now
+            _ = try capture.startTap(format: nil)
+            samples.append(milliseconds(ContinuousClock.now - start))
+            capture.stopTap()
+        }
+        let s = stats(samples)
+        print(String(format: "M1c 起床 → タップ武装: 中央値 %.1f ms / 最小 %.1f / 最大 %.1f（20 回・実 HAL）",
+                     s.median, s.min, s.max))
+        #expect(
+            s.max < 300,
+            "壊れ検知の線を割った（線は要件値ではない。設計時の実測は最大 129.6 ms）: 最大 \(s.max) ms")
+    }
+
+    /// **オレンジ点を点けているのはタップではなくエンジンである**（設計書 §2.1）。
+    /// この対応が崩れると、寝かせても点が消えなくなる。
+    @Test("エンジンの起動状態が入力デバイスの使用状態に一致する")
+    func engineStateMatchesDeviceUsage() throws {
+        let capture = EngineAudioCapture()
+        try capture.prepare()
+        capture.sleep()
+        #expect(!capture.isAwake)
+
+        _ = try capture.startTap(format: nil)
+        #expect(capture.isAwake)
+        capture.stopTap()
+        #expect(capture.isAwake, "stopTap でエンジンまで止まっている")
+
+        capture.sleep()
+        #expect(!capture.isAwake)
     }
 
     @Test("NFR-P1 / M1b: キー押下 → 最初の実バッファ到達")

@@ -52,6 +52,8 @@ struct HUDWiringTests {
             return stream
         }
         func stopTap() { tap.withLock { $0?.finish(); $0 = nil } }
+        var isAwake: Bool { true }
+        func sleep() {}
     }
 
     final class StubTranscriber: Transcribing, @unchecked Sendable {

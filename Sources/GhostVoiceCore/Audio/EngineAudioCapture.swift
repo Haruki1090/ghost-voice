@@ -77,6 +77,9 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
 
     private var isPrepared = false
     private var isTapped = false
+    /// エンジンが動いているか。**`engine.isRunning` の写しではなく、こちらの意思である。**
+    /// 再構成（`reconfigure`）が「起こしてよいか」を判断するのに要る。
+    private var isAwakeState = false
     private var requestedFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private var bufferContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
@@ -167,6 +170,11 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
             } catch {
                 throw AudioCaptureError.engineUnavailable
             }
+            // **捨て起動。** コールドの初回費用（実測 214.7 ms）をここで払い、
+            // 以後の起床を 63.0 ms にする。起動したまま待機しない理由は
+            // `AudioCapturing.prepare()` の doc を見ること。
+            engine.stop()
+            isAwakeState = false
             isPrepared = true
             observeConfigurationChanges()
         }
@@ -177,6 +185,9 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
         defer { lock.unlock() }
 
         guard isPrepared else { throw AudioCaptureError.notPrepared }
+
+        // **寝ていれば起こす。** 呼び出し側に起こす口を持たせない（契約の doc を見ること）。
+        try wakeLocked()
 
         // 前の発話が畳まれていなければ、ここで畳む。放置すると前の消費者が永久に待つ。
         teardownTap(finishStream: true)
@@ -190,6 +201,30 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
 
     public func stopTap() {
         lock.withLock { teardownTap(finishStream: true) }
+    }
+
+    public var isAwake: Bool { lock.withLock { isAwakeState } }
+
+    public func sleep() {
+        lock.withLock {
+            // **タップが張られている間は止めない。** 止めるとその発話が丸ごと消える。
+            // 方針側（`DictationSession`）でも塞いでいるが、機構の側にも帯を置く。
+            guard isPrepared, isAwakeState, !isTapped else { return }
+            engine.stop()
+            isAwakeState = false
+        }
+    }
+
+    /// エンジンを起こす。**呼び出し側は `lock` を保持していること。**
+    private func wakeLocked() throws {
+        guard !isAwakeState else { return }
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            throw AudioCaptureError.engineUnavailable
+        }
+        isAwakeState = true
     }
 
     // MARK: - タップ
@@ -258,7 +293,11 @@ public final class EngineAudioCapture: AudioCapturing, @unchecked Sendable {
     /// デバイスが切り替わった瞬間に発話が丸ごと失われる。
     private func reconfigure() {
         lock.withLock {
-            guard isPrepared else { return }
+            // **寝ている間は組み直さない。** ここで `engine.start()` すると、
+            // 待機中にデバイスが変わっただけで勝手に起きてしまう（オレンジ点が点く）。
+            // 入力形式の変化は、次に起きるとき `installTap` が
+            // `outputFormat(forBus:)` を読み直すので自然に追従する。
+            guard isPrepared, isAwakeState else { return }
             reconfigurations += 1
 
             let wasTapped = isTapped

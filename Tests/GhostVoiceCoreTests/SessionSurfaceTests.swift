@@ -273,6 +273,9 @@ final class LevelEmittingCapture: AudioCapturing, @unchecked Sendable {
             $0 = nil
         }
     }
+
+    var isAwake: Bool { true }
+    func sleep() {}
 }
 
 /// モデル導入の進捗を任意に流せる認識器の代役。

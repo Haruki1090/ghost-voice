@@ -171,6 +171,15 @@ public actor DictationSession {
     /// （1 件も無ければ暫定テキスト）で先へ進む。空で捨てるよりは残す。
     public static let defaultFinalizeDeadline: Duration = .seconds(2)
 
+    /// 最後の発話から、マイク（`AVAudioEngine`）を止めるまでの猶予。**既定 30 秒。**
+    ///
+    /// 常時起動したままだと `coreaudiod` に +15 ポイント（実測 19.6〜20.3% 対 4.3〜4.8%。
+    /// 2026-08-15 / M3 / macOS 26.5.2）を課し、マイクのオレンジ点が消えない。
+    /// 逆に発話ごとに止めると、**毎回** 起床の 63.0 ms（最大 129.6 ms）を払う。
+    /// 30 秒は「文を続けて喋る間は起きたまま、考え込んだら消える」ところに置いた裁定である
+    /// （設計書 2026-08-15 §3）。**要件値ではない。**
+    public static let defaultAudioIdleSleepDelay: Duration = .seconds(30)
+
     private let settings: SettingsStore
     private let hotkey: any HotkeyMonitor
     private let audio: any AudioCapturing
@@ -202,6 +211,9 @@ public actor DictationSession {
     /// この時間内に推論を投げていれば、デーモンはまだ温まっているとみなす
     /// （`warmRefinerForUtterance()`）。**既定 10 秒。要件値ではない。**
     private let refinerWarmthWindow: Duration
+    private let audioIdleSleepDelay: Duration
+    /// 待機が続いたらマイクを止める係。**押下のたびに取り消す。**
+    private var audioSleepTask: Task<Void, Never>?
 
     private let stateContinuation: AsyncStream<SessionState>.Continuation
     /// 状態の**単一消費者**の口（フェーズ 1 からのもの。CLI が使う）。
@@ -395,7 +407,8 @@ public actor DictationSession {
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() },
         postEventAuthorization: PostEventAuthorization = .shared,
         maxRecordingDuration: Duration = DictationSession.defaultMaxRecordingDuration,
-        finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline
+        finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline,
+        audioIdleSleepDelay: Duration = DictationSession.defaultAudioIdleSleepDelay
     ) {
         self.init(
             settings: settings, hotkey: hotkey, audio: audio, transcriber: transcriber,
@@ -403,7 +416,8 @@ public actor DictationSession {
             clipboard: insertion.clipboard, history: history, vocabulary: vocabulary,
             isSecureInputEnabled: isSecureInputEnabled,
             postEventAuthorization: postEventAuthorization,
-            maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline)
+            maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline,
+            audioIdleSleepDelay: audioIdleSleepDelay)
     }
 
     /// **テスト専用の組み立て。`internal` なので本番ターゲットからは到達できない。**
@@ -434,7 +448,8 @@ public actor DictationSession {
         postEventAuthorization: PostEventAuthorization = .shared,
         maxRecordingDuration: Duration = DictationSession.defaultMaxRecordingDuration,
         finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline,
-        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow
+        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow,
+        audioIdleSleepDelay: Duration = DictationSession.defaultAudioIdleSleepDelay
     ) -> DictationSession {
         DictationSession(
             settings: settings, hotkey: hotkey, audio: audio, transcriber: transcriber,
@@ -443,7 +458,8 @@ public actor DictationSession {
             isSecureInputEnabled: isSecureInputEnabled,
             postEventAuthorization: postEventAuthorization,
             maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline,
-            refinerWarmthWindow: refinerWarmthWindow)
+            refinerWarmthWindow: refinerWarmthWindow,
+            audioIdleSleepDelay: audioIdleSleepDelay)
     }
 
     private init(
@@ -461,7 +477,8 @@ public actor DictationSession {
         postEventAuthorization: PostEventAuthorization,
         maxRecordingDuration: Duration,
         finalizeDeadline: Duration,
-        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow
+        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow,
+        audioIdleSleepDelay: Duration = DictationSession.defaultAudioIdleSleepDelay
     ) {
         self.settings = settings
         self.hotkey = hotkey
@@ -483,6 +500,7 @@ public actor DictationSession {
         self.maxRecordingDuration = maxRecordingDuration
         self.finalizeDeadline = finalizeDeadline
         self.refinerWarmthWindow = refinerWarmthWindow
+        self.audioIdleSleepDelay = audioIdleSleepDelay
         // 消費者が居ない構成（常駐デーモン）で際限なく溜め込まないよう上限を置く。
         //
         // **1 発話が出す状態は 6 件ではない。** `.recording(volatileText:)` は暫定結果の
@@ -803,6 +821,10 @@ public actor DictationSession {
     // MARK: - 録音
 
     private func startRecording() async {
+        // 押された。マイクを止める予約が入っていれば取り消す。
+        // **`await` の手前で取り消す。** 後ろに置くと、待っている間に予約が発火しうる。
+        cancelAudioSleep()
+
         // 前の発話の確定〜挿入が走っていれば、終わるまで待つ。**押下は取りこぼさない。**
         // `run()` 側で待たないのは ESC を滞留させないためで、直列性はここが担う。
         await completionTask?.value
@@ -1821,6 +1843,37 @@ public actor DictationSession {
         }
     }
 
+    // MARK: - マイクをアイドルで寝かせる（設計書 2026-08-15）
+
+    /// 待機へ戻ったので、猶予を過ぎたらマイクを止める予約を入れる。
+    ///
+    /// **掛け金を `finishIdle()` に置いているのは、そこが待機へ戻る唯一の合流点だから**
+    /// である（正常終了・失敗・中断のすべてが通る）。押下側に対応する掛け金を
+    /// 置かなくて済む。
+    private func scheduleAudioSleep() {
+        audioSleepTask?.cancel()
+        audioSleepTask = Task { [weak self, audioIdleSleepDelay] in
+            try? await Task.sleep(for: audioIdleSleepDelay)
+            guard !Task.isCancelled else { return }
+            await self?.sleepAudioIfIdle()
+        }
+    }
+
+    /// 猶予が過ぎた。**まだ待機のままなら**止める。
+    ///
+    /// 取り消し（`cancelAudioSleep`）と二重の帯にしてある。取り消しが効かなかった場合でも、
+    /// **録音中にマイクを止めて発話を丸ごと失う**ことだけは起こらないようにする。
+    private func sleepAudioIfIdle() {
+        audioSleepTask = nil
+        guard phase == .idle else { return }
+        audio.sleep()
+    }
+
+    private func cancelAudioSleep() {
+        audioSleepTask?.cancel()
+        audioSleepTask = nil
+    }
+
     // MARK: - 待ち合わせ
 
     /// 供給タスクの完走を待つ。**ただし締め切りを過ぎたら待つのをやめる。**
@@ -1914,6 +1967,10 @@ public actor DictationSession {
         isCancelRequested = false
         phase = .idle
         emit(.idle)
+
+        // 待機へ戻った。猶予を過ぎたらマイクを止める（設計書 2026-08-15）。
+        // **`keepingSessionBusy` でも予約してよい**——保留中の差し替えはマイクを使わない。
+        scheduleAudioSleep()
     }
 
     private func emit(_ state: SessionState) {
