@@ -75,15 +75,15 @@ public typealias ReplacementCapableAccessibility = AccessibilityProbing & Access
 /// キーイベントの送出も要らないぶん副作用が小さい。ただし Electron 製アプリなど
 /// 一部で無言失敗するため、経路を一本に絞ることはできない（リスク R-4）。
 ///
-/// - Important: **無言失敗そのものは検出できない。** 成否は事前判定（`canInsert()` の
-///   4 条件）と `AXUIElementSetAttributeValue` のステータスだけで判断しており、
-///   **書き込み後の読み戻しは行わない。** 読み戻して「入っていない」と判定しても、
-///   それが失敗なのかアプリがテキストを変換しただけなのかを区別できず、
-///   誤ってフォールバックへ落とすと**二重に挿入する**（入らないことより悪い場合がある）。
+/// - Important: **無言失敗のうち「何ひとつ動かなかった」形だけを検知する**
+///   （`writeVanished(_:on:before:after:)`。2026-08-15 に Chrome のページ内フォーム欄で
+///   実観測して入れた）。**「読み戻して一致しなければ失敗」という形は採らない**——
+///   それが失敗なのかアプリがテキストを変換しただけなのかを区別できず、誤って
+///   フォールバックへ落とすと**二重に挿入する**（入らないことより悪い場合がある）。
 ///
-///   したがって **AX が `.success` を返しながら何も入らなかった場合、`.ax` が返り
-///   フォールバックは走らず、発話は失われる。** これは既知の残余リスクで、
-///   発生の有無は V-3 で確かめる（詳細設計書 §6.2 / 要件定義書 R-4）。
+///   したがって **判らない相手（キャレットが動いたのに何も入らない・範囲の読み戻しに
+///   応えない）では、依然として `.ax` が返り発話は失われる。** 残っている R-4 は
+///   この範囲である（詳細設計書 §6.2 / 要件定義書 R-4）。
 public struct AccessibilityInserter: PrimaryInserting {
 
     /// 書き込みを試してよい役割。詳細設計書 §6.2 の判定 2。
@@ -174,14 +174,86 @@ public struct AccessibilityInserter: PrimaryInserting {
 
             // **書き込みの前に選択位置を読む。** 書いた後では「どこから書いたか」が判らない
             // （下記）。読むのは整数 2 つで、文字は含まない。
-            let before = capturesReplacementAnchor ? accessibility.selectedRange(of: element) : nil
+            //
+            // **錨を取らない構成でも読む。** ここは無言失敗の検知（`writeVanished`）にも
+            // 要る。挿入の成否は錨の要否とは別の問題である。
+            let before = accessibility.selectedRange(of: element)
 
             guard accessibility.setSelectedText(text, on: element) else { return .failed }
 
+            let after = accessibility.selectedRange(of: element)
+
+            // **成功を返しながら何も入らない相手を、ここで落とす**（R-4。下記）。
+            guard !writeVanished(text, on: element, before: before, after: after) else {
+                return .failed
+            }
+
             // **ここから先で何が起きても、テキストは既に入っている。**
             // 錨が取れなければ差し替えを諦めるだけで、挿入は成功のまま返す。
-            return .inserted(anchor: anchor(for: text, on: element, pid: pid, before: before))
+            return .inserted(
+                anchor: anchor(for: text, on: element, pid: pid, before: before, after: after))
         }
+    }
+
+    /// **書き込みが `.success` を返したのに、欄には何も入っていないと断定できるか**（R-4）。
+    ///
+    /// ## 何を観測して入れたか（2026-08-15 / 実機 / macOS 26.5.2 / M3）
+    ///
+    /// Google Chrome のページ内の素の `<input>` は、`role=AXTextField` /
+    /// `kAXSelectedText` は settable=yes と答え、書き込みは `.success`(0) を返しながら
+    /// **1 文字も入らない。** キャレットも文字数も動かず、書いたはずの場所の読み取りは
+    /// 範囲外（-25212）になる。**利用者のアンケートフォームで発話が 2 回消えた**のが
+    /// これで、履歴には 2 件とも `ax`（成功）として残っていた。
+    ///
+    /// ## なぜ「読み戻して違えば失敗」ではないのか
+    ///
+    /// 読み戻しの不一致は失敗の証明にならない——相手がテキストを変換しただけかもしれず、
+    /// **誤って二段目（⌘V）へ落とすと二重に挿入する**（詳細設計書 §6.2 の裁定）。
+    /// そこで、断定するのは次の 3 つがそろったときだけにしてある:
+    ///
+    /// 1. **キャレットが位置も長さも動いていない。** 動いた相手は何かが起きているので
+    ///    従来どおり成功として扱う
+    /// 2. **相手が範囲の読み戻しに応える。** 判定は**長さ 0 の問い合わせ**で行うので、
+    ///    この確認そのものは中身を 1 文字も明かさない（NFR-V3）
+    /// 3. **書いたはずの場所に、書いたはずの文字列が無い。** 単位（V-23）が未実測なので
+    ///    3 通りの長さをすべて試し、**どれか 1 つでも一致すれば「入っている」側へ倒す**
+    ///
+    /// 1 だけで断定しないのは、書き込みに成功しつつキャレットを書き込み位置の先頭へ
+    /// 戻す相手（`FakeTextField.CaretAfterWrite.startOfRange`）と区別が付かないためである。
+    ///
+    /// - Important: **判らない相手は false（＝成功として扱う）。** 縮退の向きは
+    ///   「入っていないのに成功と答える」（従来と同じ）であって、二重挿入ではない。
+    /// - Note: **費用を払うのは失敗した発話だけである。** ふつうに入る相手は 1 の時点で
+    ///   抜けるので、読み戻しの往復は 1 度も増えない（`NFR-P5` の 50 ms）。
+    private func writeVanished(
+        _ text: String, on element: any FocusedElement, before: AXTextRange?, after: AXTextRange?
+    ) -> Bool {
+        guard !text.isEmpty, let before, let after,
+              after.location == before.location, after.length == before.length
+        else { return false }
+
+        // 相手が範囲の読み戻しに応えるか。**長さ 0 なので、応えても中身は空文字である。**
+        let empty = AXTextRange(location: before.location, length: 0)
+        guard accessibility.matches("", in: empty, of: element) == .matched else { return false }
+
+        for length in Self.candidateLengths(of: text) {
+            let written = AXTextRange(location: before.location, length: length)
+            if accessibility.matches(text, in: written, of: element) == .matched { return false }
+        }
+        return true
+    }
+
+    /// 書いた文字列が AX の範囲で何単位になりうるか（**V-23 が未実測なので 3 通り**）。
+    ///
+    /// **どれも `utf16.count` を超えない**ので、`AccessibilityRangeProbing.matches` の
+    /// 上限（NFR-V3 の条件 1）を破らない。多くの文字列では 3 つとも同じ値になる。
+    static func candidateLengths(of text: String) -> [Int] {
+        var lengths: [Int] = []
+        for length in [text.utf16.count, text.count, text.unicodeScalars.count]
+        where !lengths.contains(length) {
+            lengths.append(length)
+        }
+        return lengths
     }
 
     /// 書き込んだ場所の錨を作る。取れなければ nil（＝後から差し替えない）。
@@ -193,8 +265,13 @@ public struct AccessibilityInserter: PrimaryInserting {
     ///
     /// 最後に**読み戻して一致を確かめる**（設計 opus §2.2 の C-6）。ここで一致しない
     /// 相手は、そもそも差し替えても検証できないので錨を作らない。
+    ///
+    /// - Parameter after: 書き込みの後の選択位置。**呼び出し側が読んだものを受け取る**——
+    ///   無言失敗の検知（`writeVanished`）と同じ 1 回の読み取りを使うので、
+    ///   往復は増えない。
     private func anchor(
-        for text: String, on element: any FocusedElement, pid: pid_t, before: AXTextRange?
+        for text: String, on element: any FocusedElement, pid: pid_t, before: AXTextRange?,
+        after: AXTextRange?
     ) -> ReplacementAnchor? {
         guard capturesReplacementAnchor, let before else { return nil }
         // 書いた直後はキャレットが挿入文字列の直後にあるはず。**そうでない相手は諦める**
@@ -203,8 +280,7 @@ public struct AccessibilityInserter: PrimaryInserting {
         // キャレットが「書いた文字列の直後」より遥か後ろ（欄の末尾など）へ飛ぶ相手では
         // 範囲が伸び、**利用者が元から書いていたテキストを読み戻すことになる。**
         // そういう相手では錨を作らない——差し替えないだけで、生テキストは欄にある。
-        guard let after = accessibility.selectedRange(of: element),
-              after.length == 0,
+        guard let after, after.length == 0,
               let range = AXTextRange.written(text, from: before.location, to: after.location)
         else { return nil }
 
