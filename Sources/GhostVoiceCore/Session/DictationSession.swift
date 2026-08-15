@@ -1172,6 +1172,11 @@ public actor DictationSession {
     /// - Important: **暖機そのものが 1 回の推論である。** 直前に推論を投げたばかりなら
     ///   投げ直さない（`refinerWarmthWindow`）。投げ直すと発話ごとに推論が 2 回になり、
     ///   短い間隔で連射したときに**暖機が本番の後ろに並ぶ**。
+    /// - Note: **印を立てるのはここと `warmUp()` の 2 箇所だけである。**
+    ///   本番の整形（`startRefinement`）でも立てたくなるが、**立てていない**——
+    ///   立てても効くのは「長い発話の直後にすぐ次を押した」場合だけで、
+    ///   **その差を検査で固定する手段が無い**（時計を進められない）。
+    ///   立てないことの代償は**余計な暖機が 1 回走ること**だけで、発話は失われない。
     private func warmRefinerForUtterance() {
         guard settings.settings.refinementEnabled, refiner.isAvailable else { return }
         let now = ContinuousClock.now
@@ -1202,8 +1207,6 @@ public actor DictationSession {
     ///   （`awaitRefinement(_:within:)`）。
     private func startRefinement(raw: String, settings: Settings) -> Task<String?, Never>? {
         guard settings.refinementEnabled else { return nil }
-        // 本番の推論も「デーモンを温めた」印になる（`warmRefinerForUtterance()`）。
-        lastRefinerActivityAt = ContinuousClock.now
         let refiner = self.refiner
         let terms = vocabulary.terms
         let locale = settings.locale
