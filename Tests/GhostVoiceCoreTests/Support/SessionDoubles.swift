@@ -196,6 +196,8 @@ final class StubAudioCapture: AudioCapturing, @unchecked Sendable {
         /// `stopTap()` のたびに末尾として配るフレーム数。
         /// 実装（`removeTap` → コンバータ `drain` → `finish`）が末尾を配ることの写し。
         var tailFrames = 0
+        var sleepCount = 0
+        var awake = false
     }
 
     /// `prepare()` が投げるエラー。既定は成功。
@@ -211,6 +213,8 @@ final class StubAudioCapture: AudioCapturing, @unchecked Sendable {
     var prepareCount: Int { state.withLock(\.prepareCount) }
     var startCount: Int { state.withLock(\.startCount) }
     var stopCount: Int { state.withLock(\.stopCount) }
+    /// `sleep()` が呼ばれた回数。**方針（30 秒で寝る）の検査はこれを見る。**
+    var sleepCount: Int { state.withLock(\.sleepCount) }
 
     var level: AsyncStream<Float> { levelStream }
 
@@ -228,7 +232,10 @@ final class StubAudioCapture: AudioCapturing, @unchecked Sendable {
 
     func startTap(format: AVAudioFormat?) throws -> AsyncStream<AVAudioPCMBuffer> {
         order?.record("audio.startTap")
-        state.withLock { $0.startCount += 1 }
+        state.withLock {
+            $0.startCount += 1
+            $0.awake = true
+        }
         if let startError { throw startError }
         let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         state.withLock { $0.continuation = continuation }
@@ -247,6 +254,15 @@ final class StubAudioCapture: AudioCapturing, @unchecked Sendable {
             tail.0?.yield(buffer)
         }
         tail.0?.finish()
+    }
+
+    var isAwake: Bool { state.withLock(\.awake) }
+
+    func sleep() {
+        state.withLock {
+            $0.sleepCount += 1
+            $0.awake = false
+        }
     }
 
     /// 録音中の 1 バッファぶんを配る。

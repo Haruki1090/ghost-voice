@@ -60,6 +60,9 @@ final class ReplayAudioCapture: AudioCapturing, @unchecked Sendable {
         }
     }
 
+    var isAwake: Bool { true }
+    func sleep() {}
+
     /// 台本を流し終えるまで待つ。キー解放はこの後に送る。
     func waitForPlayback() async {
         await pump?.value

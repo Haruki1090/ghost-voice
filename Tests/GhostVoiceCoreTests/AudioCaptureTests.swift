@@ -197,13 +197,13 @@ struct AudioCaptureTapTests {
     private let target = AVAudioFormat(
         commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
 
-    @Test("prepare を二重に呼んでも例外を出さず、エンジンが動いている")
+    @Test("prepare を二重に呼んでも例外を出さず、寝たままである")
     func prepareIsIdempotent() throws {
         let rig = try ManualRenderingRig()
         let capture = makeCapture(on: rig)
         try capture.prepare()
         try capture.prepare()
-        #expect(capture.isEngineRunning)
+        #expect(!capture.isAwake, "prepare が起こしたまま返っている")
         capture.stopTap()
     }
 
@@ -236,6 +236,101 @@ struct AudioCaptureTapTests {
         #expect(capture.isTapping)
         capture.stopTap()
         #expect(!capture.isTapping, "stopTap した後も装着中のままになっている")
+    }
+
+    // MARK: - アイドルで寝る（設計書 2026-08-15）
+
+    @Test("prepare は捨て起動を通した上で寝た状態で返る")
+    func prepareLeavesEngineAsleep() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        #expect(!capture.isAwake, "prepare がエンジンを起動したまま返っている（点が消えない）")
+        #expect(!capture.isEngineRunning)
+    }
+
+    @Test("寝ていても startTap が自分で起こす")
+    func startTapWakesFromSleep() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        #expect(!capture.isAwake)
+
+        _ = try capture.startTap(format: nil)
+        #expect(capture.isAwake, "寝たまま張ろうとしている。音が一切届かない")
+        #expect(capture.isTapping)
+        capture.stopTap()
+    }
+
+    @Test("stopTap ではエンジンを止めない（連続発話のため）")
+    func stopTapKeepsEngineAwake() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()
+        #expect(capture.isAwake, "発話のたびに寝ると、次の押下が毎回 63 ms を払う")
+    }
+
+    @Test("sleep でエンジンが止まる")
+    func sleepStopsEngine() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()
+
+        capture.sleep()
+        #expect(!capture.isAwake)
+        #expect(!capture.isEngineRunning)
+    }
+
+    @Test("タップが張られている間の sleep は無視される")
+    func sleepIsIgnoredWhileTapping() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        _ = try capture.startTap(format: nil)
+
+        capture.sleep()
+        #expect(capture.isAwake, "録音中にエンジンを止めた。その発話が丸ごと消える")
+        #expect(capture.isTapping)
+        capture.stopTap()
+    }
+
+    @Test("sleep は冪等（二度呼んでも落ちない）")
+    func sleepIsIdempotent() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+        capture.sleep()
+        capture.sleep()
+        #expect(!capture.isAwake)
+    }
+
+    @Test("寝て起きてを繰り返しても音が流れる")
+    func sleepWakeCycling() async throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        try capture.prepare()
+
+        for _ in 0..<3 {
+            let stream = try capture.startTap(format: target)
+            try rig.render(frames: 4_800)
+            capture.stopTap()
+            let summary = await summarize(stream)
+            #expect(summary.frames > 0, "寝起きの後にバッファが 1 つも来ていない")
+            capture.sleep()
+            #expect(!capture.isAwake)
+        }
+    }
+
+    @Test("prepare していなければ sleep は何もしない")
+    func sleepBeforePrepareIsHarmless() throws {
+        let rig = try ManualRenderingRig()
+        let capture = makeCapture(on: rig)
+        capture.sleep()
+        #expect(!capture.isAwake)
     }
 
     @Test("変換に失敗したバッファは捨てた数として残る（タップが通る経路そのもの）")
@@ -310,7 +405,13 @@ struct AudioCaptureTapTests {
         let capture = makeCapture(on: rig)
         try capture.prepare()
         capture.stopTap()
-        #expect(capture.isEngineRunning)
+        // **`prepare()` は寝た状態で返る**（2026-08-15 改訂）ので、ここで見るのは
+        // 「エンジンが動いていること」ではなく「壊れていないこと」——
+        // 続けて張れば起きて張れる、という形で確かめる。
+        #expect(!capture.isAwake)
+        _ = try capture.startTap(format: nil)
+        #expect(capture.isAwake)
+        capture.stopTap()
     }
 
     @Test("stopTap でストリームが終了する")
@@ -618,7 +719,7 @@ struct AudioCapturePermissionTests {
         authorization.current = .denied      // ユーザーがシステム設定で取り消した
         // 門番があれば 2 回目は何もせず返る。無ければ microphoneAccessNotGranted を投げる。
         #expect(throws: Never.self) { try capture.prepare() }
-        #expect(capture.isEngineRunning)
+        #expect(!capture.isAwake)
     }
 
     @Test("手動レンダリングではマイクを開かないので TCC の状態を動かさない")
