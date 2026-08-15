@@ -55,6 +55,14 @@ struct HUDWindowContractTests {
         #expect(HUDWindowContract.isOpaque == false)
     }
 
+    /// **窓の出し入れをアニメーションさせない。**
+    /// 既定（`NSPanel` は `.utilityWindow`）だと縮小＋淡入が入り、**実測でその途中の窓は
+    /// `y=1`**——島が画面の一番上から 1 pt 離れて「浮いた板」に見える。
+    @Test("窓の出し入れを AppKit にアニメーションさせない")
+    func windowOrderingIsNotAnimated() {
+        #expect(HUDWindowContract.animationBehavior == .none)
+    }
+
     /// 効きは**未実測**（V-21。Space の切り替えとフルスクリーン化は実機の操作が要る）。
     /// 指定してあることだけを固定する。
     @Test("全 Space・フルスクリーンの上に出す指定がある")

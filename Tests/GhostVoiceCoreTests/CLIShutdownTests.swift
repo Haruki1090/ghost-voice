@@ -283,11 +283,16 @@ struct CLIShutdownTests {
             await Shutdown.perform(
                 gate: gate, grace: .milliseconds(150),
                 stopHotkey: { hotkey.stop() }, awaitRun: { await run.value },
-                isBusy: { await session.isBusy }, announce: { writer.announce($0) })
+                isBusy: { await session.isBusy },
+                // **本番と同じ配線で通す**（`GhostVoiceRuntime`）。
+                // ここを省くと `isBusy` に落ちるが、救出は `finishIdle()` まで走るので
+                // **成功直後の `isBusy` は偽**であり、打ち切ったことすら告げなくなる。
+                salvage: { await session.shutdownSalvage },
+                announce: { writer.announce($0) })
 
             #expect(inserter.inserted.isEmpty)
-            // **黙って捨ててはならない。** 発話が失われたことを言う。
-            #expect(writer.text.contains("挿入されませんでした"))
+            // **黙って捨ててはならない。** 打ち切った発話がどこに在るかまで言う。
+            #expect(writer.text.contains("履歴へ残しました"), "\(writer.text)")
             await narration.value
         }
     }

@@ -47,7 +47,8 @@ struct DictationSessionTests {
         audio: StubAudioCapture = StubAudioCapture(),
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { false },
         maxRecordingDuration: Duration = .seconds(120),
-        finalizeDeadline: Duration = .seconds(5)
+        finalizeDeadline: Duration = .seconds(5),
+        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow
     ) -> Rig {
         let hotkey = StubHotkeyMonitor()
         // 履歴だけ別のルートへ向けられるようにしてある（書けない状況を作るため）。
@@ -67,7 +68,8 @@ struct DictationSessionTests {
             // テストが機体の権限状態に依存しないよう偽物を挿す。
             postEventAuthorization: PostEventAuthorization(probe: { false }),
             maxRecordingDuration: maxRecordingDuration,
-            finalizeDeadline: finalizeDeadline
+            finalizeDeadline: finalizeDeadline,
+            refinerWarmthWindow: refinerWarmthWindow
         )
         return Rig(
             session: session, hotkey: hotkey, audio: audio, transcriber: transcriber,
@@ -1317,6 +1319,82 @@ struct DictationSessionTests {
             // **待たないことと、呼ばないことは違う。** 上の検査だけだと、捨て推論を
             // まるごと消す変更が素通りする（消せば当然「待っていない」ので通る）。
             try await waitUntil("捨て推論が投げられている") { refiner.prewarmCount == 1 }
+        }
+    }
+
+    /// **モデルは発話と発話のあいだに冷える**（実測 2026-08-15 / 詳細設計書 §5.2）。
+    /// 起動時に 1 度だけ暖めても、次の発話までに 45 秒空けば再ロード費用を払い、
+    /// **(b) の予算 750 ms がそれだけで尽きる**（実運用の 10 発話で 1/10 しか間に合わない）。
+    /// **押下の時点で暖め直す**ことでその費用を発話中へ寄せる。
+    @Test("録音の開始で整形器を暖め直す")
+    func warmsRefinerWhenRecordingStarts() async throws {
+        try await withTempRoot { root in
+            let refiner = SpyRefiner(result: "整形後テキストです")
+            // 冷えた状態を作る（起動の捨て推論から時間が経った状況に相当する）。
+            let rig = makeRig(root: root, refiner: refiner, refinerWarmthWindow: .zero)
+
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            try await waitUntil("起動時の捨て推論") { refiner.prewarmCount == 1 }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            try await waitUntil("録音の開始でもう一度暖める") { refiner.prewarmCount == 2 }
+        }
+    }
+
+    /// **暖機を待ってはならない。** 待つと「押しても何も起きない時間」ができる
+    /// （基本設計書 §6 / 詳細設計書 §4.1 の 9）。
+    @Test("録音の開始は暖機の完了を待たない")
+    func recordingStartDoesNotBlockOnWarmUp() async throws {
+        try await withTempRoot { root in
+            let refiner = SpyRefiner(result: "整形後テキストです")
+            refiner.prewarmDelay = .seconds(5)
+            let rig = makeRig(root: root, refiner: refiner, refinerWarmthWindow: .zero)
+
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+            let started = ContinuousClock.now
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            let elapsed = ContinuousClock.now - started
+
+            // **線は 2 秒（壊れ検知であって要件値ではない）。** 弁別するのは
+            // 「暖機を待たない（数 ms）」と「待つ（5 秒）」。
+            #expect(
+                elapsed < .seconds(2),
+                "録音の開始が暖機を待っている（線は壊れ検知。要件値ではない。実測 \(elapsed)）")
+        }
+    }
+
+    /// **暖機そのものが 1 回の推論である。** 連射のときまで投げ直すと、
+    /// 発話ごとに推論が 2 回になり、暖機が本番の前へ割り込む。
+    @Test("直前に推論を投げていれば暖め直さない")
+    func doesNotRewarmWhileStillWarm() async throws {
+        try await withTempRoot { root in
+            let refiner = SpyRefiner(result: "整形後テキストです")
+            let rig = makeRig(root: root, refiner: refiner, refinerWarmthWindow: .seconds(600))
+
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+            try await waitUntil("起動時の捨て推論") { refiner.prewarmCount == 1 }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.audio.emit(frames: 1_600)
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("2 回目の録音が始まる") {
+                await Self.label(rig.session.state) == "recording"
+            }
+
+            #expect(
+                refiner.prewarmCount == 1,
+                "温まっているのに暖機を投げ直している（連射で推論が 2 倍になる）")
         }
     }
 }

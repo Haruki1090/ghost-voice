@@ -21,6 +21,11 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
     /// `--shell-only` ではセッションが無く、誰も参照しないと解放されてしまう。
     private var services: AppServices?
     private var runtime: AppSessionRuntime?
+    /// 終了のときに段取りを通す相手。**本物のセッション、または素振り**（`--shutdown-check`）。
+    ///
+    /// **本物を名指ししない。** 名指しすると `.terminateLater` を返す経路が
+    /// 実発話でしか通らなくなり、実バンドルで一度も測れない（それがこの欠陥の温床だった）。
+    private var shutdownTarget: (any AppShutdownPerforming)?
     private var isTerminating = false
     /// シグナル源は**保持しないと即座に解放されて効かない。**
     private var signalSources: [any DispatchSourceSignal] = []
@@ -69,8 +74,10 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
         var hotkeyFailure: HotkeyError?
         if options.startsSession {
             do {
-                runtime = try AppSessionRuntime.start(
+                let started = try AppSessionRuntime.start(
                     settings: settings, history: history, vocabulary: vocabulary)
+                runtime = started
+                shutdownTarget = started
                 AppDiagnostics.note("Ghost Voice を起動しました。右 Option を押している間だけ録音します。")
             } catch let error as HotkeyError {
                 hotkeyFailure = error
@@ -78,6 +85,12 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 AppDiagnostics.note("キー監視を開始できませんでした: \(error)")
             }
+        } else if let seconds = options.shutdownRehearsalSeconds {
+            // **セッションは作らない。** 終了の段取りだけを本物と同じ形で通す。
+            shutdownTarget = ShutdownRehearsal(busyFor: .milliseconds(Int(seconds * 1000)))
+            AppDiagnostics.note(
+                "[--shutdown-check] 終了の素振りです。\(JapaneseDuration.text(.seconds(seconds))) のあいだ「発話を抱えている」ことにします。"
+                    + "終了要求（SIGTERM / ⌘Q / osascript の quit）を送ってください。")
         } else {
             AppDiagnostics.note("[--shell-only] セッションを作らずに器だけを起動しました。")
         }
@@ -105,6 +118,12 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [launchSequence, options] in
             launchSequence.enterRunLoop(services: services)
 
+            // **終了待ちの案内を出せる画面をここで繋ぐ。**
+            // 繋がなければ文言はログにしか出ず、**正しく待っているのに壊れて見える**
+            // （2026-08-15 の実機。利用者は案内を一度も見ないまま猶予を使い切った）。
+            AppShutdownAnnouncer.use(
+                launchSequence.surfaces.compactMap { $0 as? any ShutdownAnnouncingSurface }.first)
+
             if let seconds = options.hudRehearsalSeconds {
                 guard
                     let rehearsing = launchSequence.surfaces
@@ -114,7 +133,7 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
                     NSApp.terminate(nil)
                     return
                 }
-                AppDiagnostics.note("[--hud-check] HUD の素振りを \(seconds) 秒行います。")
+                AppDiagnostics.note("[--hud-check] HUD の素振りを \(JapaneseDuration.text(.seconds(seconds))) 行います。")
                 rehearsing.startRehearsal(seconds: seconds) {
                     // **`exit` しない。** 終了は器の段取り（`applicationShouldTerminate`）を通す。
                     NSApp.terminate(nil)
@@ -131,7 +150,7 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
                     NSApp.terminate(nil)
                     return
                 }
-                AppDiagnostics.note("[--window-check] 窓の素振りを \(seconds) 秒行います。")
+                AppDiagnostics.note("[--window-check] 窓の素振りを \(JapaneseDuration.text(.seconds(seconds))) 行います。")
                 rehearsing.startWindowRehearsal(seconds: seconds) {
                     NSApp.terminate(nil)
                 }
@@ -143,7 +162,7 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
 
     /// **素通しさせない。** ⌘V 送出後・クリップボード復元前に落ちると発話が失われる。
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let runtime else {
+        guard let shutdownTarget else {
             launchSequence.tearDown()
             return .terminateNow
         }
@@ -153,8 +172,12 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
             return .terminateLater
         }
         isTerminating = true
+        // **この `Task` はメインキューへ積まれる。**
+        // したがって、ここへ来るまでの経路がメインキューのブロックであってはならない
+        // （排出中のメインキューは入れ子のランループでは進まず、`.terminateLater` の
+        // 返事が永久に来ない）。受け口は `MainRunLoopHop` を通ること。
         Task {
-            await runtime.shutdown()
+            await shutdownTarget.shutdown()
             launchSequence.tearDown()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -165,16 +188,53 @@ public final class GhostVoiceAppDelegate: NSObject, NSApplicationDelegate {
     ///
     /// **既定の動作を殺してから**シグナル源を張る。既定のままだと、
     /// ハンドラが走る前にプロセスが消える（＝挿入の途中で落ちる）。
+    ///
+    /// ## 受け口をメインキューに置いてはならない（実機で 17 分止まった）
+    ///
+    /// 以前はここが `queue: .main` で、ハンドラから直に `NSApp.terminate(nil)` を
+    /// 呼んでいた。すると**メインキューのブロックの中で** `.terminateLater` の
+    /// 入れ子のランループへ入ることになり、**返事を出す `Task`（＝メインキュー）が
+    /// 二度と走らない。** `SIGTERM` も `pkill` も効かず、`kill -9` しか残らなかった。
+    /// 機序と実測は `MainRunLoopHop` の注記にある。
+    ///
+    /// 対策は 2 つ重ねてある。
+    ///
+    /// 1. **受け口を専用のキューに置く**（CLI と同じ形）。メインが何かで塞がっていても
+    ///    シグナル自体は必ず拾える
+    /// 2. **メインへは `MainRunLoopHop` で渡す。** ランループのブロックはメインキューの
+    ///    排出とは別経路なので、渡した先で入れ子のランループへ入っても詰まらない
     private func installSignalTrap() {
+        // **`.main` を使わないこと。** 上の注記の 1〜2 が理由である。
+        let queue = DispatchQueue(label: "ghost-voice.app.signals")
         for number in [SIGINT, SIGTERM] {
             signal(number, SIG_IGN)
-            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-            source.setEventHandler {
-                // `terminate` は `applicationShouldTerminate` を通る＝終了処理を必ず経由する。
-                NSApp.terminate(nil)
-            }
+            let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
+            // **ここにクロージャを書いてはならない**（`requestTermination` の注記）。
+            source.setEventHandler(handler: Self.requestTermination)
             source.resume()
             signalSources.append(source)
         }
+    }
+
+    /// シグナルを終了要求へ変える。**`nonisolated` でなければならない。**
+    ///
+    /// `@MainActor` の文脈で `source.setEventHandler { … }` とクロージャを直接書くと、
+    /// **そのクロージャは `@MainActor` を継ぎ、入口に隔離の実行時検査が入る。**
+    /// キューがメイン以外なら `dispatch_assert_queue` が失敗して **`SIGTRAP` で即死する。**
+    ///
+    /// 即死は「終わらない」より悪い。**終了処理を 1 行も通らずにプロセスが消えるので、
+    /// ⌘V 送出後・クリップボード復元前なら発話がそのまま失われる。**
+    ///
+    /// 実測（2026-08-15 / M3 / macOS 26.5.2。使い捨てプログラム `scratchpad/probe/probe3.swift`）:
+    ///
+    /// | ハンドラの書き方 | 背景キューでの結果 |
+    /// |---|---|
+    /// | `@MainActor` のメソッド内のクロージャ | **`SIGTRAP`（終了コード 133）** |
+    /// | `nonisolated static func` を渡す | 正常に走る |
+    ///
+    /// **メインへ渡すのは `MainRunLoopHop` の仕事である**（この関数はメインに触れない）。
+    /// `terminate` は `applicationShouldTerminate` を通る＝終了処理を必ず経由する。
+    private nonisolated static func requestTermination() {
+        MainRunLoopHop.perform { NSApp.terminate(nil) }
     }
 }

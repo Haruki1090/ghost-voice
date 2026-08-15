@@ -7,8 +7,10 @@ import os
 /// そこで unified log にも同じ内容を流す。読むときは:
 ///
 /// ```
-/// log stream --predicate 'subsystem == "com.haruki1090.GhostVoice"' --level info
+/// /usr/bin/log stream --predicate 'subsystem == "com.haruki1090.GhostVoice"' --level info
 /// ```
+///
+/// **`log` は絶対パスで書くこと。** 利用者の環境では同名のシェル関数と衝突する。
 ///
 /// **フェーズ 2 の HUD ができるまで、利用者が起動時の案内を読む唯一の経路である。**
 /// 音声・認識テキストは**絶対に流さない**（FR-12 / NFR-V2）。ここへ渡してよいのは

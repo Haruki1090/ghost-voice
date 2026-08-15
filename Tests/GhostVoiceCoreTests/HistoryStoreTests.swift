@@ -756,4 +756,56 @@ struct HistoryEntryTests {
         )
         #expect(entry.insertedText == "生")
     }
+
+    // MARK: - 暫定の印（終了で打ち切った発話）
+
+    @Test("既定では暫定ではない")
+    func entriesAreNotProvisionalByDefault() {
+        let entry = HistoryEntry(
+            rawText: "生", refinedText: nil, localeIdentifier: "ja-JP", insertionMethod: .ax)
+        #expect(!entry.isProvisional)
+    }
+
+    /// **鍵が無い古い `history.json` も読めること。**
+    ///
+    /// 合成された `init(from:)` は鍵が 1 つ足りないだけで**ファイル全体の復元に失敗**し、
+    /// `HistoryStore` はそれを「壊れている」と見て退避する——
+    /// **利用者の履歴がアプリの更新で消えることになる。**
+    @Test("暫定の鍵が無い古い履歴も読める")
+    func decodesEntriesWrittenBeforeTheFlagExisted() throws {
+        let json = """
+            {
+              "id": "3F2504E0-4F89-11D3-9A0C-0305E82C3301",
+              "timestamp": 770000000,
+              "rawText": "むかしの発話",
+              "localeIdentifier": "ja-JP",
+              "insertionMethod": "ax"
+            }
+            """
+        let entry = try JSONDecoder().decode(HistoryEntry.self, from: Data(json.utf8))
+        #expect(entry.rawText == "むかしの発話")
+        #expect(!entry.isProvisional)
+    }
+
+    @Test("暫定の印は保存して読み戻しても残る")
+    func provisionalSurvivesARoundTrip() throws {
+        let entry = HistoryEntry(
+            rawText: "とちゅうまで", refinedText: nil, localeIdentifier: "ja-JP",
+            insertionMethod: .notInserted, isProvisional: true)
+        let data = try JSONEncoder().encode(entry)
+        let restored = try JSONDecoder().decode(HistoryEntry.self, from: data)
+        #expect(restored == entry)
+        #expect(restored.isProvisional)
+    }
+
+    /// **暫定の発話を Undo の候補にしてはならない。** 一度も挿入していないので
+    /// 戻す先が無い（`refinedText` が nil であることと経路の 2 つで守られている）。
+    @Test("暫定の発話は Undo の候補にならない")
+    func provisionalIsNeverAnUndoCandidate() {
+        let entry = HistoryEntry(
+            rawText: "とちゅうまで", refinedText: nil, localeIdentifier: "ja-JP",
+            insertionMethod: .notInserted, isProvisional: true)
+        #expect(!entry.isAutomaticUndoCandidate)
+        #expect(!entry.isManualUndoFallbackCandidate)
+    }
 }

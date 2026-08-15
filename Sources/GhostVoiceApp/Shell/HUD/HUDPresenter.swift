@@ -85,6 +85,13 @@ public struct HUDPresenter: Sendable {
     /// **`holdUntil` を nil にするだけでは足りない。** 直後に必ず来る `.idle` が
     /// 「貼り付いた表示を畳む」側へ落ちて消してしまう。
     private var holdsIndefinitely = false
+    /// **終了待ちを出している期限。** ここまでは何が届いても譲らない。
+    ///
+    /// `holdUntil` では足りない——**`.recording` は保持中のどんな表示にも勝つ**ので、
+    /// 押しっぱなしで喋っている最中（＝この告知がいちばん要る場面）に、
+    /// 次の暫定テキストが 50 ms で上書きしてしまう。
+    private var shutdownUntil: ContinuousClock.Instant?
+
     /// 間引きで保留している録音中の中身。
     private var pendingRecording: HUDRecording?
     /// 最後に録音中の中身を反映した時刻。
@@ -104,6 +111,14 @@ public struct HUDPresenter: Sendable {
     public mutating func apply(_ event: HUDEvent, at now: ContinuousClock.Instant)
         -> ContinuousClock.Instant?
     {
+        // **終了待ちを出している間は、どんな出来事にも譲らない。**
+        // ここが要るのは、まさに譲ってはいけない場面でだけ届く出来事があるためである
+        // ——押しっぱなしで喋っている最中の `.recording` は 50 ms ごとに届き、
+        // 「保持中のどんな表示にも勝つ」ので、告知は一瞬で消える。
+        if let until = shutdownUntil {
+            if now < until { return nextWakeup(after: now) }
+            shutdownUntil = nil
+        }
         switch event {
         case .state(let state): applyState(state, at: now)
         case .level(let value): applyLevel(value, at: now)
@@ -128,6 +143,29 @@ public struct HUDPresenter: Sendable {
     ) -> ContinuousClock.Instant? {
         pendingRecording = nil
         display = .message(message)
+        holdUntil = now + hold
+        holdsIndefinitely = false
+        return nextWakeup(after: now)
+    }
+
+    /// **終了待ちを告げる**（`GhostVoiceCore.ShutdownAnnouncement`）。
+    ///
+    /// `announce(_:hold:at:)` と分けてあるのは、**譲らない期間を持つから**である。
+    /// 終了待ちがいちばん要るのは「PTT キーを押したまま喋っている」場面で、
+    /// そこでは `.recording` が 50 ms ごとに届く。ふつうの告知だと即座に消える。
+    ///
+    /// **文言も重さも Core が決める。** ここが決めるのは色と長さだけである。
+    ///
+    /// - Parameter hold: 譲らない長さ。次の「まだ待っています」が来るまでを覆えばよい。
+    /// - Returns: 起こし直してほしい時刻。
+    @discardableResult
+    public mutating func announceShutdown(
+        _ message: HUDMessage, hold: Duration, at now: ContinuousClock.Instant
+    ) -> ContinuousClock.Instant? {
+        pendingRecording = nil
+        level = 0
+        display = .message(message)
+        shutdownUntil = now + hold
         holdUntil = now + hold
         holdsIndefinitely = false
         return nextWakeup(after: now)

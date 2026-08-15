@@ -49,28 +49,50 @@ public struct AppLaunchOptions: Sendable, Equatable {
     ///   `CGEvent.tapCreate` も触らないので、**TCC のダイアログが出る余地が無い。**
     public let windowRehearsalSeconds: Double?
 
+    /// 終了の素振りで「発話を抱えている」ことにする秒数。nil なら行わない。
+    ///
+    /// **製品の機能ではなく、終了要求が本当に効くかを測るための入口である**（`--shutdown-check`）。
+    /// V-34（発話の途中の終了要求で発話が失われないか）は、これが無いと
+    /// **実発話でしか通らない経路**であり、実バンドルでは一度も測られていなかった。
+    /// その結果 `SIGTERM` で終わらない `.app` が利用者の手元に渡った（`bug-term`）。
+    ///
+    /// **`--shell-only` と同じくセッションを作らない。** マイクも `CGEvent.tapCreate` も
+    /// 触らないので、TCC のダイアログが出る余地が無い。
+    /// **0 を渡せる**——「発話を抱えていないときに終了要求が効くか」がまさに壊れていた形である。
+    public let shutdownRehearsalSeconds: Double?
+
     /// 解釈できなかった引数。**黙って捨てない**（標準エラーへ出す）。
     public let unrecognized: [String]
 
     public init(
         startsSession: Bool, requestsPermissions: Bool, hudRehearsalSeconds: Double? = nil,
         windowRehearsalSeconds: Double? = nil,
+        shutdownRehearsalSeconds: Double? = nil,
         unrecognized: [String] = []
     ) {
         self.startsSession = startsSession
         self.requestsPermissions = requestsPermissions
         self.hudRehearsalSeconds = hudRehearsalSeconds
         self.windowRehearsalSeconds = windowRehearsalSeconds
+        self.shutdownRehearsalSeconds = shutdownRehearsalSeconds
         self.unrecognized = unrecognized
     }
 
     public static let `default` = AppLaunchOptions(startsSession: true, requestsPermissions: true)
 
-    /// 素振りの既定の秒数。**筋書きを一巡できる長さ**（`HUDRehearsal.script` の総和は約 9 秒）。
-    public static let defaultHUDRehearsalSeconds: Double = 12
+    /// 素振りの既定の秒数。**2 つの筋書きを一巡できる長さ。**
+    ///
+    /// `HUDRehearsal.wiringScript`（製品と同じ経路。約 3 秒）＋
+    /// `HUDRehearsal.script`（見た目の網羅。約 12.4 秒）＝ 約 15.4 秒。
+    /// **足りないと後ろの表示を誰も見ない**ので、`HUDRehearsalTests` が総和と比べている。
+    public static let defaultHUDRehearsalSeconds: Double = 20
 
     /// 窓の素振りの既定の秒数。**4 つの区間を 3 秒ずつ測れる長さ。**
     public static let defaultWindowRehearsalSeconds: Double = 12
+
+    /// 終了の素振りの既定の秒数。**「抱えている」ことがログで判る長さ**
+    /// （猶予 10 秒より十分に短く、待ちが効いていることは目で見て判る）。
+    public static let defaultShutdownRehearsalSeconds: Double = 3
 
     /// - Parameter arguments: `CommandLine.arguments` の先頭（実行ファイル名）を除いたもの。
     public static func parse(_ arguments: [String]) -> AppLaunchOptions {
@@ -78,6 +100,7 @@ public struct AppLaunchOptions: Sendable, Equatable {
         var requestsPermissions = true
         var hudRehearsalSeconds: Double?
         var windowRehearsalSeconds: Double?
+        var shutdownRehearsalSeconds: Double?
         var unrecognized: [String] = []
 
         for argument in arguments {
@@ -121,6 +144,23 @@ public struct AppLaunchOptions: Sendable, Equatable {
                     unrecognized.append(other)
                     windowRehearsalSeconds = defaultWindowRehearsalSeconds
                 }
+            case "--shutdown-check":
+                // **セッションを作らない。** マイクにもタップにも触れない（ダイアログが出ない）。
+                startsSession = false
+                requestsPermissions = false
+                shutdownRehearsalSeconds = defaultShutdownRehearsalSeconds
+            case let other where other.hasPrefix("--shutdown-check="):
+                startsSession = false
+                requestsPermissions = false
+                let value = Double(other.dropFirst("--shutdown-check=".count))
+                // **0 は正しい入力である**（`--hud-check` と違う点。「抱えていないときの終了」を
+                // 測るための値であり、まさにそこが壊れていた）。負の値と読めない値だけを弾く。
+                if let value, value >= 0 {
+                    shutdownRehearsalSeconds = value
+                } else {
+                    unrecognized.append(other)
+                    shutdownRehearsalSeconds = defaultShutdownRehearsalSeconds
+                }
             case let other where other.hasPrefix("-psn_"):
                 // LaunchServices が付ける Process Serial Number。**誤りではない。**
                 continue
@@ -134,6 +174,7 @@ public struct AppLaunchOptions: Sendable, Equatable {
             requestsPermissions: requestsPermissions,
             hudRehearsalSeconds: hudRehearsalSeconds,
             windowRehearsalSeconds: windowRehearsalSeconds,
+            shutdownRehearsalSeconds: shutdownRehearsalSeconds,
             unrecognized: unrecognized)
     }
 }

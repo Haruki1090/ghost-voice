@@ -218,7 +218,7 @@ public final class HistoryStore: @unchecked Sendable {
             entries[index] = HistoryEntry(
                 id: old.id, timestamp: old.timestamp, rawText: old.rawText,
                 refinedText: refinedText, localeIdentifier: old.localeIdentifier,
-                insertionMethod: old.insertionMethod
+                insertionMethod: old.insertionMethod, isProvisional: old.isProvisional
             )
             updated = true
             return true

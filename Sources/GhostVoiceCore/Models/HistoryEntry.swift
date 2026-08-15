@@ -11,13 +11,27 @@ public struct HistoryEntry: Codable, Sendable, Equatable, Identifiable {
     public let localeIdentifier: String
     public let insertionMethod: InsertionMethod
 
+    /// **`rawText` が確定していない（暫定結果の）テキストか。**
+    ///
+    /// 真になるのは 1 経路だけである——**終了要求の猶予が尽きて、録音の途中で
+    /// 打ち切った発話**（`DictationSession` の救出）。認識器へ確定を撃っていないので、
+    /// **文の途中で切れていたり、後から直るはずだった語がそのまま残っていたりする。**
+    ///
+    /// **区別できる形で残すことが要件である。** 確定済みのものと同じ顔で並ぶと、
+    /// 利用者は「認識がおかしい」と読む（実際には打ち切られただけである）。
+    ///
+    /// - Note: **既定は偽で、古い `history.json` には鍵そのものが無い。**
+    ///   復元は `decodeIfPresent` で受けるので、フェーズ 1 以前の履歴も読める。
+    public let isProvisional: Bool
+
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
         rawText: String,
         refinedText: String?,
         localeIdentifier: String,
-        insertionMethod: InsertionMethod
+        insertionMethod: InsertionMethod,
+        isProvisional: Bool = false
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -25,6 +39,23 @@ public struct HistoryEntry: Codable, Sendable, Equatable, Identifiable {
         self.refinedText = refinedText
         self.localeIdentifier = localeIdentifier
         self.insertionMethod = insertionMethod
+        self.isProvisional = isProvisional
+    }
+
+    /// **鍵が無い古い履歴も読めること。**
+    ///
+    /// 合成された `init(from:)` は `isProvisional` が無いだけで**ファイル全体の復元に
+    /// 失敗する**（`HistoryStore` はそれを「壊れている」と見て退避する）。
+    /// **利用者の履歴がアプリの更新で消えることになる。**
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        timestamp = try container.decode(Date.self, forKey: .timestamp)
+        rawText = try container.decode(String.self, forKey: .rawText)
+        refinedText = try container.decodeIfPresent(String.self, forKey: .refinedText)
+        localeIdentifier = try container.decode(String.self, forKey: .localeIdentifier)
+        insertionMethod = try container.decode(InsertionMethod.self, forKey: .insertionMethod)
+        isProvisional = try container.decodeIfPresent(Bool.self, forKey: .isProvisional) ?? false
     }
 
     /// 実際に挿入された文字列。

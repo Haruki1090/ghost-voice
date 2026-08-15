@@ -31,10 +31,14 @@ public enum HUDDisplay: Sendable, Equatable {
     /// パネルを出すべきか。
     public var isVisible: Bool { self != .hidden }
 
-    /// 幅を広げる表示か。
+    /// **島を広げる表示か。**
     ///
-    /// **広げてよいのは切り欠きより下だけである**（左右の帯にはメニューバーが居る。
-    /// 詳細設計書 §7.2）。ここが真でも切り欠きの帯そのものは広がらない。
+    /// 島の幅も高さも**この 2 通りしか取らない。** 発話の長さで連続に変えない——
+    /// 変えると `.volatile` の更新のたびに形が動き、メインスレッドの予算に直に効く
+    /// （詳細設計書 §7.4）。**上限は `HUDIslandMetrics.volatileLineLimit` 行**である。
+    ///
+    /// - Note: 島はメニューバーの帯の一部を覆う（`HUDIslandMetrics` の「引き換えにしたもの」）。
+    ///   **クリックは奪わない**ので、隠れている項目もそのまま押せる。
     public var wantsWideLayout: Bool {
         switch self {
         case .recording(let recording): !recording.volatileText.isEmpty

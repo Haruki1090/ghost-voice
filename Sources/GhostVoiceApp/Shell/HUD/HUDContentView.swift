@@ -1,7 +1,7 @@
 import Observation
 import SwiftUI
 
-/// 描画の入力。**1 つの値しか持たない。**
+/// 描画の入力。**`HUDPanel` だけが書き換える。**
 ///
 /// `SessionMirror` を直接見ないのは、**暫定テキストの更新のたびにミラーが変わる**ためである。
 /// ミラーを `body` から読むと、間引き（`HUDPresenter`）を通す前の更新でも再描画が走る。
@@ -11,63 +11,85 @@ import SwiftUI
 @Observable
 final class HUDModel {
     var display: HUDDisplay = .hidden
-    /// 切り欠きの帯の高さ（フォールバック表示では 0）。
+    /// 切り欠きの帯の高さ（フォールバック表示では 0）。**中身はここより下にしか置かない。**
     var notchBandHeight: CGFloat = 0
-    /// 切り欠きの幅。**帯のうち黒く塗ってよいのはここだけ**（左右にはメニューバーが居る）。
-    var notchBandWidth: CGFloat = 0
+    /// 画面の上辺（＝切り欠き）へ吸い付いているか。偽ならメニューバーの下に浮かべる。
+    var isAttachedToScreenTop = false
+    /// **いまの島の大きさ。** 窓の大きさではない（窓は最大の島が収まる固定寸法）。
+    var islandSize: CGSize = .zero
+    /// **形が変わるときにアニメーションするか。**
+    ///
+    /// 偽にするのは**出し入れの瞬間だけ**である。出しっぱなしのときは真のまま——
+    /// 出す前の大きさから伸びていく様子は、窓が画面に無い間に起きるので誰も見ない。
+    var animatesShape = false
 }
 
-/// notch の直下に出す帯。
+/// **ダイナミックアイランド風の HUD。**
 ///
-/// ## 形（実測に基づく決めごと）
+/// ## 形
 ///
 /// ```
-///  ┌────────┬─────┬────────┐   ← 画面の一番上（frame.maxY）
-///  │ 透明   │ 黒  │ 透明   │   ← 切り欠きの帯（高さ = safeAreaInsets.top = 実測 38）
-///  ├────────┴─────┴────────┤      左右は**メニューバーが居る**ので塗らない
-///  │        中  身         │   ← 切り欠きより下。ここは横へ広げてよい
-///  └───────────────────────┘
+///        ┌ 画面の上辺（frame.maxY = 実測 1169）
+///        ↓
+///  ─────╮                       ╭─────   ← 逆アール（メニューバーの帯へ繋ぐ）
+///       │  ┌───────────┐        │
+///       │  │  切り欠き  │        │        ← **切り欠きは島の黒の中に埋まる**
+///       │  └───────────┘        │
+///       │   音量 言語 暫定文字   │        ← 中身はすべて帯より下（最大 3 行）
+///       ╰───────────────────────╯
 /// ```
 ///
-/// **切り欠きそのものに画素があるかは未実測である**（V-20）。
-/// 中身をすべて帯より下に置いてあるので、**画素が無くても表示は成立する。**
-/// 帯の黒は「切り欠きと連続して見せる」ためだけのもので、見えなくても失うものは無い。
+/// **切り欠きに画素があるかは未実測のまま**でよい（V-20）。島は切り欠きの
+/// **周囲を黒く塗る**ので、中に画素があれば繋がって塗られ、無ければ物理的に黒い——
+/// **どちらでも 1 枚の黒い面に見える。** 中身は帯より下にしか置かないので読めなくならない。
+///
+/// ## メインスレッドの予算（§7.4）
+///
+/// **アニメーションは `islandSize` が変わったときにしか走らない。**
+/// 暫定テキストは 50 ms ごとに届くが、**幅も高さも 2 通りしか取らない**ので、
+/// 1 発話あたり形が変わるのは数回である。**継続アニメーション（回り続ける印など）は 1 つも無い。**
 struct HUDContentView: View {
 
     let model: HUDModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            if model.notchBandHeight > 0 {
-                HStack(spacing: 0) {
-                    Color.clear
-                    Color.black.frame(width: model.notchBandWidth)
-                    Color.clear
-                }
-                .frame(height: model.notchBandHeight)
-            }
-            card
+        ZStack(alignment: .top) {
+            // **窓は島より大きい。** 島の外は塗らない（メニューバーを透かす）。
+            Color.clear
+            island
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // **アニメーションを掛けない。** メインスレッドを塞ぐと `CGEventTap` の配送が
-        // 悪化する（実測 p50 0.045 ms → 12.8 ms）。PTT の押下・解放の検知が鈍るほうが、
-        // 見た目が素っ気ないことより重い。
-        .animation(nil, value: model.display)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // **見るのは `islandSize` だけ。** 暫定テキストが変わっただけでは何も動かない。
+        .animation(
+            model.animatesShape ? .smooth(duration: HUDIslandMetrics.expansionSeconds) : nil,
+            value: model.islandSize)
     }
 
     @ViewBuilder
-    private var card: some View {
-        ZStack {
-            UnevenRoundedRectangle(
-                topLeadingRadius: 0, bottomLeadingRadius: 12,
-                bottomTrailingRadius: 12, topTrailingRadius: 0,
-                style: .continuous
+    private var island: some View {
+        ZStack(alignment: .top) {
+            HUDIslandShape(
+                screenEdgeRadius: model.isAttachedToScreenTop
+                    ? HUDIslandMetrics.screenEdgeCornerRadius : 0,
+                floatingTopRadius: HUDIslandMetrics.floatingTopCornerRadius,
+                bottomRadius: HUDIslandMetrics.bottomCornerRadius
             )
             .fill(Color.black)
-            content
-                .padding(.horizontal, 10)
+
+            VStack(spacing: 0) {
+                // **切り欠きの帯には何も描かない**（画素が無いかもしれない）。
+                Color.clear.frame(height: model.notchBandHeight)
+                content
+                    .padding(
+                        .horizontal,
+                        HUDIslandMetrics.contentInset(
+                            isAttachedToScreenTop: model.isAttachedToScreenTop)
+                    )
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
-        .frame(height: HUDMetrics.contentHeight)
+        .frame(width: model.islandSize.width, height: model.islandSize.height)
     }
 
     @ViewBuilder
@@ -88,9 +110,12 @@ struct HUDContentView: View {
                     Spacer(minLength: 0)
                 } else {
                     Text(recording.volatileText)
-                        .font(.system(size: 11))
+                        .font(.system(size: HUDIslandMetrics.volatileFontSize))
                         .foregroundStyle(Color.white.opacity(0.85))
-                        .lineLimit(2)
+                        // **複数行見せる**（利用者の「1 行分しか見えない」への対応）。
+                        // 上限を置くのは、長い発話で高さが伸び続けないためである。
+                        .lineLimit(HUDIslandMetrics.volatileLineLimit)
+                        .multilineTextAlignment(.leading)
                         // **末尾を見せる。** 暫定テキストは伸びていくので、
                         // 先頭を残すと「いま何を喋っているか」が見えない。
                         .truncationMode(.head)
@@ -108,15 +133,16 @@ struct HUDContentView: View {
             .opacity(processing.isSubdued ? 0.55 : 1)
         case .completed:
             Image(systemName: "checkmark")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(Color.green)
         case .message(let message):
             HStack(spacing: 6) {
                 Image(systemName: message.severity.symbolName)
                     .font(.system(size: 11, weight: .semibold))
                 Text(message.text)
-                    .font(.system(size: 11))
-                    .lineLimit(2)
+                    .font(.system(size: HUDIslandMetrics.volatileFontSize))
+                    .lineLimit(HUDIslandMetrics.volatileLineLimit)
+                    .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .foregroundStyle(message.severity.tint)
@@ -164,7 +190,7 @@ struct HUDLevelBar: View {
     }
 }
 
-/// 処理中の印。**動かさない**（`HUDContentView` の `animation(nil)` と同じ理由）。
+/// 処理中の印。**動かさない**（継続アニメーションを 1 つも置かないという規律。§7.4）。
 struct HUDDots: View {
     var body: some View {
         HStack(spacing: 2) {

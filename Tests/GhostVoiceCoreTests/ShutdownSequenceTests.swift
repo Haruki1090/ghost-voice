@@ -300,8 +300,75 @@ struct ShutdownSequenceTests {
             announce: { log.record($0) })
 
         #expect(log.announcements.contains(.gaveUp(grace: .milliseconds(100))))
-        #expect(log.announcements.contains(.utteranceLost))
+        // **救出の口を渡していないので `.lost` として告げる。**
+        // 知らないのに「履歴にあります」と言うほうが害が大きい。
+        #expect(log.announcements.contains(.utteranceInterrupted(.lost)))
         #expect(log.announcements.last == .finished)
+    }
+
+    /// **打ち切った発話がどこへ行ったかを、必ず告げること。**
+    ///
+    /// 「挿入されませんでした」だけでは、どこにも無いのか履歴にはあるのかが判らず、
+    /// **利用者が次に何をすべきか決められない**（実機 2026-08-15。猶予切れで
+    /// 打ち切られた発話が欄にもクリップボードにも履歴にも無かった）。
+    @Test(
+        "打ち切った発話の行き先をそのまま告げる",
+        arguments: [
+            ShutdownSalvage.retainedInHistory(provisional: true),
+            .retainedInHistory(provisional: false),
+            .lost,
+            .refusedSecureInput,
+        ])
+    func announcesWhereTheInterruptedUtteranceWent(_ salvage: ShutdownSalvage) async {
+        let log = AnnouncementLog()
+        await Shutdown.perform(
+            grace: .milliseconds(100), poll: .milliseconds(10),
+            stopHotkey: {}, awaitRun: {}, isBusy: { true },
+            salvage: { salvage },
+            announce: { log.record($0) })
+
+        #expect(log.announcements.contains(.utteranceInterrupted(salvage)))
+        #expect(log.announcements.last == .finished)
+    }
+
+    /// **抱えていなかったのなら、打ち切りのことは言わない。**
+    /// 毎回言うと、本当に打ち切った回が埋もれる。
+    @Test("何も抱えていなければ打ち切りのことは言わない")
+    func saysNothingWhenNothingWasHeld() async {
+        let log = AnnouncementLog()
+        await Shutdown.perform(
+            grace: .seconds(1), poll: .milliseconds(10),
+            stopHotkey: {}, awaitRun: {}, isBusy: { false },
+            salvage: { .nothingHeld },
+            announce: { log.record($0) })
+
+        #expect(!log.announcements.contains { if case .utteranceInterrupted = $0 { true } else { false } })
+        #expect(log.announcements.last == .finished)
+    }
+
+    /// **待っている間、一定間隔で「まだ待っている」と言うこと。**
+    ///
+    /// 静止した文言では「待っている」と「固まった」を区別できない——
+    /// **このプロジェクトが直したばかりの欠陥がまさにそれである**
+    /// （メインキューが詰まって `@MainActor` が全部死んでいた）。
+    @Test("待っている間、残り時間を刻んで言い続ける")
+    func repeatsWhileWaiting() async {
+        let log = AnnouncementLog()
+        _ = await Shutdown.waitUntilIdle(
+            grace: .milliseconds(500), poll: .milliseconds(10),
+            heartbeat: .milliseconds(100),
+            onHeartbeat: { log.record(.stillWaiting(remaining: $0)) },
+            isBusy: { true })
+
+        let beats = log.announcements.compactMap { announcement -> Duration? in
+            if case .stillWaiting(let remaining) = announcement { return remaining }
+            return nil
+        }
+        // 合否線は要件値ではない。**1 回も刻まない**（＝止まって見える）ことだけを弾く。
+        #expect(beats.count >= 2, "刻んでいない: \(beats)")
+        // **残りは減っていくこと。** 増えたり止まったりすると「進んでいない」と読まれる。
+        #expect(beats == beats.sorted(by: >), "残り時間が減っていない: \(beats)")
+        #expect(beats.allSatisfy { $0 >= .zero }, "残り時間が負になっている: \(beats)")
     }
 
     // MARK: - 文言
@@ -313,21 +380,110 @@ struct ShutdownSequenceTests {
     func waitingTextTellsTheUserWhatToDo() {
         let text = ShutdownAnnouncement.waiting(grace: .seconds(10)).text
         #expect(text.contains("録音中なら PTT キーを離してください"))
-        #expect(text.contains("失われます"))
         // 猶予そのものを言う（何秒待たれているのか判らないと、離す判断ができない）。
-        #expect(text.contains("\(Duration.seconds(10))"))
+        // **`"\(Duration.seconds(10))"` と比べてはならない**——それは `10.0 seconds` である。
+        #expect(text.contains("10 秒"))
         // **前後の余白は出力先が決める。** ここが改行で始まったり終わったりしていると、
         // 端末と `.app` のどちらかで体裁が壊れる。
         #expect(!text.hasPrefix("\n"))
         #expect(!text.hasSuffix("\n"))
     }
 
-    @Test("猶予が尽きたこと・発話が失われたことを、それぞれ別の文言で言う")
+    @Test("猶予が尽きたこと・発話の行き先を、それぞれ別の文言で言う")
     func outcomeTexts() {
         #expect(ShutdownAnnouncement.gaveUp(grace: .seconds(3)).text.contains("打ち切ります"))
-        #expect(ShutdownAnnouncement.utteranceLost.text.contains("挿入されませんでした"))
+        #expect(
+            ShutdownAnnouncement.utteranceInterrupted(.retainedInHistory(provisional: true))
+                .text.contains("履歴へ残しました"))
+        #expect(
+            ShutdownAnnouncement.utteranceInterrupted(.lost).text.contains("どこにも残せませんでした"))
         #expect(ShutdownAnnouncement.finished.text.contains("終了しました"))
     }
+
+    /// **利用者が読む文言に、`Duration` の素の記述が混ざらないこと。**
+    ///
+    /// 実機のログに `[終了] 10.0 seconds 待っても待機へ戻りませんでした。` が出た
+    /// （2026-08-15）。他がすべて日本語なので、ここだけが英語で浮く。
+    /// **注意書きでは守れない**ので、文言そのものに対して固定する。
+    @Test("終了の文言に Duration の素の記述が混ざらない")
+    func announcementsAreJapanese() {
+        // Swift の `Duration.description` が使う語。1 つでも出たら素で補間している。
+        let raw = ["seconds", "milliseconds", "microseconds", "nanoseconds", "attoseconds"]
+        for announcement in Self.everyAnnouncement {
+            for word in raw {
+                #expect(
+                    !announcement.text.contains(word),
+                    "ログの文言に `\(word)` が混ざっている: \(announcement.text)")
+                #expect(
+                    !(announcement.hudText ?? "").contains(word),
+                    "HUD の文言に `\(word)` が混ざっている: \(announcement.hudText ?? "")")
+            }
+        }
+    }
+
+    /// **HUD に出すものと出さないものを固定する。**
+    ///
+    /// `.waiting` を出さないのは決めごとである——待機中に終了要求が来ると 0.13 秒で
+    /// 終わるので（実測 V-34）、そこで出すと一瞬光って消えるだけになる。
+    /// **本当に待つことになったときにだけ出す**（`.stillWaiting`。1 秒後）。
+    @Test("HUD へ出すのは「まだ待っている」以降で、案内は 1 行に収まる")
+    func hudTexts() {
+        #expect(ShutdownAnnouncement.waiting(grace: .seconds(10)).hudText == nil)
+        #expect(ShutdownAnnouncement.finished.hudText == nil)
+        // **`#require` は使わない。** `hudText` はここでは定数畳み込みで nil でないと
+        // 判るため「冗長」と警告される（`.stillWaiting` が nil を返さないこと自体は
+        // 上の `!= nil` 群と `everyAnnouncement` の走査が押さえている）。
+        let waiting = ShutdownAnnouncement.stillWaiting(remaining: .seconds(9)).hudText ?? ""
+        #expect(waiting.contains("離して"), "取るべき行動を言っていない")
+        #expect(waiting.contains("9 秒"), "残り時間を言っていない")
+        for announcement in Self.everyAnnouncement {
+            #expect(
+                !(announcement.hudText ?? "").contains("\n"),
+                "HUD の帯は 1 行である: \(announcement.hudText ?? "")")
+        }
+    }
+
+    /// **終了待ちは失敗ではない。** 赤く出すと「壊れた」と読まれる——
+    /// 利用者が正しく待っているアプリを見て「全然反応しません」と言ったのがこの欠陥である。
+    @Test("終了待ちの重さは失敗ではなく「行動が要る」")
+    func waitingIsNotAFailure() {
+        #expect(ShutdownAnnouncement.stillWaiting(remaining: .seconds(9)).weight == .actionRequired)
+        #expect(ShutdownAnnouncement.utteranceInterrupted(.lost).weight == .lost)
+        #expect(
+            ShutdownAnnouncement.utteranceInterrupted(.retainedInHistory(provisional: true)).weight
+                == .actionRequired)
+    }
+
+    /// 文言の検査が見る全ケース。
+    ///
+    /// **網羅はコンパイラが守る。** 下の `switch` は `default` を持たないので、
+    /// `ShutdownAnnouncement` にケースを足すとここが赤くなる——**それが
+    /// 「この配列にも足せ」という合図である**（`SessionFailure` と同じ形）。
+    static let everyAnnouncement: [ShutdownAnnouncement] = {
+        let all: [ShutdownAnnouncement] = [
+            .waiting(grace: .seconds(10)),
+            .stillWaiting(remaining: .seconds(9)),
+            .stillWaiting(remaining: .milliseconds(1500)),
+            .gaveUp(grace: .seconds(10)),
+            .gaveUp(grace: .milliseconds(100)),
+            .utteranceInterrupted(.nothingHeld),
+            .utteranceInterrupted(.retainedInHistory(provisional: true)),
+            .utteranceInterrupted(.retainedInHistory(provisional: false)),
+            .utteranceInterrupted(.lost),
+            .utteranceInterrupted(.refusedSecureInput),
+            .finished,
+        ]
+        for announcement in all {
+            switch announcement {
+            case .waiting, .stillWaiting, .gaveUp, .finished: break
+            case .utteranceInterrupted(let salvage):
+                switch salvage {
+                case .nothingHeld, .retainedInHistory, .lost, .refusedSecureInput: break
+                }
+            }
+        }
+        return all
+    }()
 
     // MARK: - ソースそのものへの検査
 

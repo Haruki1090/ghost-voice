@@ -199,6 +199,9 @@ public actor DictationSession {
     private let postEventAuthorization: PostEventAuthorization
     private let maxRecordingDuration: Duration
     private let finalizeDeadline: Duration
+    /// この時間内に推論を投げていれば、デーモンはまだ温まっているとみなす
+    /// （`warmRefinerForUtterance()`）。**既定 10 秒。要件値ではない。**
+    private let refinerWarmthWindow: Duration
 
     private let stateContinuation: AsyncStream<SessionState>.Continuation
     /// 状態の**単一消費者**の口（フェーズ 1 からのもの。CLI が使う）。
@@ -259,6 +262,20 @@ public actor DictationSession {
     private var latestVolatile = ""
     private var latestFinal = ""
     private var droppedAtStart = 0
+
+    /// **終了要求で録音を打ち切ったとき、その発話をどこへ残せたか。**
+    ///
+    /// `run()` が戻った後に終了処理が読む（`Shutdown.perform` の `salvage`）。
+    /// **`.nothingHeld` のままなら打ち切っていない**（＝発話は普通に完走した）。
+    ///
+    /// `isBusy` で代用してはならない——救出は `finishIdle()` まで走るので、
+    /// **救出に成功した直後の `isBusy` は偽である。** それを「何も抱えていなかった」と
+    /// 読むと、**打ち切ったことも履歴に在ることも一切告げないまま終わる。**
+    public private(set) var shutdownSalvage: ShutdownSalvage = .nothingHeld
+
+    /// 整形器へ最後に推論を投げた時刻。**冷え直しの判定にだけ使う**
+    /// （`warmRefinerForUtterance()`）。
+    private var lastRefinerActivityAt: ContinuousClock.Instant?
 
     /// 発話の通し番号。**前の発話の結果ストリームを消費しているタスクが、
     /// 次の発話の状態を触るのを防ぐために要る。**
@@ -416,7 +433,8 @@ public actor DictationSession {
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() },
         postEventAuthorization: PostEventAuthorization = .shared,
         maxRecordingDuration: Duration = DictationSession.defaultMaxRecordingDuration,
-        finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline
+        finalizeDeadline: Duration = DictationSession.defaultFinalizeDeadline,
+        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow
     ) -> DictationSession {
         DictationSession(
             settings: settings, hotkey: hotkey, audio: audio, transcriber: transcriber,
@@ -424,7 +442,8 @@ public actor DictationSession {
             history: history, vocabulary: vocabulary,
             isSecureInputEnabled: isSecureInputEnabled,
             postEventAuthorization: postEventAuthorization,
-            maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline)
+            maxRecordingDuration: maxRecordingDuration, finalizeDeadline: finalizeDeadline,
+            refinerWarmthWindow: refinerWarmthWindow)
     }
 
     private init(
@@ -441,7 +460,8 @@ public actor DictationSession {
         isSecureInputEnabled: @escaping @Sendable () -> Bool,
         postEventAuthorization: PostEventAuthorization,
         maxRecordingDuration: Duration,
-        finalizeDeadline: Duration
+        finalizeDeadline: Duration,
+        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow
     ) {
         self.settings = settings
         self.hotkey = hotkey
@@ -462,6 +482,7 @@ public actor DictationSession {
         self.postEventAuthorization = postEventAuthorization
         self.maxRecordingDuration = maxRecordingDuration
         self.finalizeDeadline = finalizeDeadline
+        self.refinerWarmthWindow = refinerWarmthWindow
         // 消費者が居ない構成（常駐デーモン）で際限なく溜め込まないよう上限を置く。
         //
         // **1 発話が出す状態は 6 件ではない。** `.recording(volatileText:)` は暫定結果の
@@ -597,6 +618,10 @@ public actor DictationSession {
             emit(.idle)
         }
 
+        // **起動の捨て推論も「デーモンを温めた」印である。** 印を付けないと、
+        // 起動直後に押した発話が**捨て推論の後ろへもう 1 本暖機を積む**
+        // （実運用で、起動 1.6 秒後に押した発話がこの形で落ちていた）。
+        lastRefinerActivityAt = ContinuousClock.now
         let refiner = self.refiner
         Task.detached(priority: .utility) { await refiner.prewarm() }
     }
@@ -728,6 +753,10 @@ public actor DictationSession {
             case .undoRequested: beginUndo()
             }
         }
+        // **イベント列が尽きた時点でまだ録音中なら、その発話を救う。**
+        // ここへ来る経路は「終了処理がホットキーを止めた」だけである
+        // （監視器の死は `.interrupted` で来るので、そちらは確定として扱われる）。
+        salvageAbandonedRecording()
         await completionTask?.value
         completionTask = nil
         // **保留中の差し替えは見届けない。** 捨てても生テキストは欄にあり、
@@ -839,6 +868,10 @@ public actor DictationSession {
         }
 
         emit(.recording(volatileText: ""))
+
+        // **喋っている間に整形器を暖める。** 冷えたまま解放を迎えると、(b) の分岐の
+        // 予算（既定 750 ms）が再ロードだけで尽きる（`warmRefinerForUtterance()`）。
+        warmRefinerForUtterance()
 
         let transcriber = self.transcriber
         feedTask = Task {
@@ -1111,6 +1144,70 @@ public actor DictationSession {
     }
 
     // MARK: - (a) 生テキストを先に挿入し、整形は後から差し替える（FR-5(a)）
+
+    /// **録音の開始で整形器を暖める。投げっぱなしにする（待たない）。**
+    ///
+    /// ## なぜ起動時の `prewarm()` だけでは足りないのか（実測 / 2026-08-15 / M3 / macOS 26.5.2）
+    ///
+    /// モデルの常駐は**プロセス外のデーモン**にある（§5.2）。これは
+    /// 「プロセスを作り直しても速いまま」という良い面と、
+    /// **「しばらく使わないと、プロセスが生きていても冷える」という悪い面**の
+    /// 両方を意味する。後者は測るまで正本に無かった。
+    ///
+    /// 同じ 9 字の発話を、間隔を変えて実 LLM へ通した値（`generate` の実時間）:
+    ///
+    /// | 直前の推論からの間隔 | 1 発目 | **その直後の 2 発目** |
+    /// |---|---|---|
+    /// | 連続（0 秒） | 454 ms | — |
+    /// | 5 秒 | 2134 ms | 492 ms |
+    /// | 10 秒 | 369 ms | 331 ms |
+    /// | 15 秒 | 1082 ms | 399 ms |
+    /// | 20 秒 | 1094 ms | 380 ms |
+    /// | 30 秒 | 1838 ms | 362 ms |
+    /// | 45 秒 | 760 ms | 336 ms |
+    /// | 60 秒 | 960 ms | 336 ms |
+    ///
+    /// **1 発目だけが遅く、直後の 2 発目は必ず 330〜490 ms に戻る。**
+    /// 眠らずに 60 秒待つ対照（`Task.sleep` を使わない忙しい待ち）でも 909 ms だったので、
+    /// **プロセスの休止（App Nap）ではなくデーモン側の冷えである。**
+    ///
+    /// **実運用の発話間隔は 6 秒〜2.5 分**（利用者の履歴 / 2026-08-15）。
+    /// つまり**ほぼ毎回この費用を払っており、(b) の予算 750 ms は再ロードだけで尽きる。**
+    /// 実運用の 10 発話を 45 秒間隔で再現すると **1/10 しか間に合わなかった**
+    /// のに対し、**同じ 10 発話を連続で投げれば 8/10 が検査も通って受理される。**
+    /// **落としていたのは検査ではなく打ち切りである。**
+    ///
+    /// ## だから「発話が始まった時点」で暖める
+    ///
+    /// 押下から解放までの間に暖機を済ませれば、解放の時点ではデーモンが温まっている。
+    /// **待たないので「押しても何も起きない時間」は作らない**（基本設計書 §6 /
+    /// 詳細設計書 §4.1 の 9。認識器の捨て往復 `warmUpTranscriber()` と同じ方針である）。
+    ///
+    /// - Important: **暖機そのものが 1 回の推論である。** 直前に推論を投げたばかりなら
+    ///   投げ直さない（`refinerWarmthWindow`）。投げ直すと発話ごとに推論が 2 回になり、
+    ///   短い間隔で連射したときに**暖機が本番の後ろに並ぶ**。
+    /// - Note: **印を立てるのはここと `warmUp()` の 2 箇所だけである。**
+    ///   本番の整形（`startRefinement`）でも立てたくなるが、**立てていない**——
+    ///   立てても効くのは「長い発話の直後にすぐ次を押した」場合だけで、
+    ///   **その差を検査で固定する手段が無い**（時計を進められない）。
+    ///   立てないことの代償は**余計な暖機が 1 回走ること**だけで、発話は失われない。
+    private func warmRefinerForUtterance() {
+        guard settings.settings.refinementEnabled, refiner.isAvailable else { return }
+        let now = ContinuousClock.now
+        if let last = lastRefinerActivityAt, now - last < refinerWarmthWindow { return }
+        lastRefinerActivityAt = now
+        let refiner = self.refiner
+        Task.detached(priority: .utility) { await refiner.prewarm() }
+    }
+
+    /// `refinerWarmthWindow` の既定。
+    ///
+    /// **要件値ではない。** 上の実測で「1 発目が遅くなる」は 5 秒の間隔でも起きているので、
+    /// **温まっている保証がある区間は「直前の推論の直後」だけ**である。
+    /// ここを 0 にすると発話ごとに推論が必ず 2 回になり、連射時に暖機が本番の前へ割り込む。
+    /// **10 秒は「連射のときだけ省く」ための保守的な値**で、
+    /// 実運用の発話間隔（6 秒〜2.5 分）の下側の端に置いてある。
+    static let defaultRefinerWarmthWindow: Duration = .seconds(10)
 
     /// 整形を起動する。**待たない。** 打ち切りは経路で決まる。
     ///
@@ -1606,6 +1703,76 @@ public actor DictationSession {
             fail(.historyUnavailable(insertedElsewhere: false))
             return
         }
+        finishIdle()
+    }
+
+    /// **終了要求で録音の途中を打ち切るときの、最後の写し。**
+    ///
+    /// ## なぜ要るのか（実機 2026-08-15 / 利用者の機体）
+    ///
+    /// 利用者が PTT キーを押したまま喋っている最中に `SIGTERM` が届いた。
+    /// 猶予 10 秒を使い切って打ち切られ——**そこまでの発話は欄にもクリップボードにも
+    /// 履歴にも、どこにも残らなかった。** 打ち切りそのものは設計どおりである
+    /// （無限に待つと終了できないプロセスになる。それは直前に直した欠陥そのものである）。
+    /// **穴は「打ち切ったあとに何もしていない」ことだった。**
+    ///
+    /// ## ESC との非対称を埋める
+    ///
+    /// **ESC による中断は `.notInserted` として履歴へ残す**（基本設計書 §4 /
+    /// `InsertionMethod.notInserted`）。同じ「発話の途中でやめる」なのに、
+    /// 終了の打ち切りだけ穴が空いていた。**ここで同じ扱いに揃える。**
+    ///
+    /// ## 確定を撃たない理由
+    ///
+    /// ここは**終了処理の中**であり、既に猶予を使い切っている。認識器へ確定
+    /// （`finish()`）を撃って結果ストリームの終端を待つと、**打ち切ったはずの終了が
+    /// さらに最大 `finalizeDeadline` 延びる。** 終了を延ばさないことがこの経路の要件なので、
+    /// **その時点でメモリに在るものをそのまま残す**——確定済みの前半（`latestFinal`）＋
+    /// 未確定の末尾（`latestVolatile`）である。
+    ///
+    /// **したがってこのテキストは確定していない。** `isProvisional: true` を立てて、
+    /// 利用者が履歴で見たときに確定済みのものと区別できるようにする。
+    ///
+    /// - Important: **secure input 中は何も残さない**（基本設計書 §7 / FR-4 の唯一の例外）。
+    ///   `completeUtterance` が整形の手前で同じ判定をしているのと同じ理由で、
+    ///   ここを抜くとパスワードが `history.json` へ入る。
+    private func salvageAbandonedRecording() {
+        guard phase == .recording else { return }
+        phase = .processing
+        // 録音の後片付け。**タップを外さないとマイクを掴んだままプロセスが消える。**
+        audio.stopTap()
+        maxDurationTask?.cancel()
+        maxDurationTask = nil
+
+        guard !isSecureInputEnabled() else {
+            shutdownSalvage = .refusedSecureInput
+            fail(.refusedSecureInput)
+            return
+        }
+
+        // **確定済みの前半と未確定の末尾を繋ぐ。** `completeUtterance` の
+        // 「`latestFinal` が空なら `latestVolatile`」とは条件が違う——あちらは
+        // 確定を撃った後なので末尾も `latestFinal` に入っている。ここは撃っていない。
+        let raw = (latestFinal + latestVolatile).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else {
+            // 一言も認識されていなかった。**失うものが無いので告げない。**
+            shutdownSalvage = .nothingHeld
+            finishIdle()
+            return
+        }
+
+        let stored = record(
+            HistoryEntry(
+                rawText: raw, refinedText: nil,
+                localeIdentifier: settings.settings.localeIdentifier,
+                insertionMethod: .notInserted, isProvisional: true))
+        guard stored == .stored else {
+            // **この発話はどこにも残っていない。** 挿入していないので手元にも無い。
+            shutdownSalvage = .lost
+            fail(.historyUnavailable(insertedElsewhere: false))
+            return
+        }
+        shutdownSalvage = .retainedInHistory(provisional: true)
         finishIdle()
     }
 

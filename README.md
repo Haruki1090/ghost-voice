@@ -106,21 +106,30 @@ Scripts/make-app.sh --help
 | （なし） | 常駐して PTT ディクテーションを行う。足りない権限があれば要求を出す（**ダイアログが出る**） |
 | `--shell-only` | **器だけを起動する。** マイクもキー監視も一切触らないので TCC のダイアログが出ない。フォーカスや配置の確認用 |
 | `--no-permission-prompts` | セッションは動かすが、権限の要求は出さない |
-| `--hud-check` / `--hud-check=秒` | **HUD の表示を一巡させて自分で終了する。** マイクもキー監視も触らない（**権限が無くても実施できる**）。既定は 12 秒。下記「HUD の目視確認」 |
+| `--hud-check` / `--hud-check=秒` | **製品と同じ経路で 1 発話ぶんを通してから、表示を一巡させて自分で終了する。** マイクもキー監視も触らない（**権限が無くても実施できる**）。既定は 20 秒。**既に走っている `Ghost Voice.app` があると引数は黙って捨てられる**ので、先に落とすこと。下記「HUD の目視確認」 |
 | `--window-check` / `--window-check=秒` | **設定・履歴の窓を順に開いて閉じ、自分で終了する。** マイクもキー監視も触らない。既定は 12 秒。**フォーカスの受け渡しを測るための入口である**（下記「窓のフォーカスの確認」） |
 
 ```bash
 open ".build/app/Ghost Voice.app"                          # 通常起動
 open ".build/app/Ghost Voice.app" --args --shell-only      # 器だけ
+pkill -9 -x GhostVoice; sleep 1                            # **先に落とす**（走っていると --args が届かない）
 open ".build/app/Ghost Voice.app" --args --hud-check=60    # HUD の目視確認（60 秒）
 open ".build/app/Ghost Voice.app" --args --window-check=16 # 窓のフォーカスの確認
+open ".build/app/Ghost Voice.app" --args --shutdown-check=3 # 終了要求が効くかの確認
 ```
+
+`--shell-only` / `--hud-check` / `--window-check` / `--shutdown-check` は
+**マイクにもキー監視にも触らない**（TCC のダイアログが出る余地が無い）。
+
+`--shutdown-check=<秒>` は「その秒数だけ発話を抱えている」ことにして終了要求を待つ。
+`SIGTERM` / `osascript` の quit を送り、**抱えている間は終わらないこと**と
+**抱えていなければすぐ終わること**を測る（引き渡し検証 V-34）。
 
 起動時の案内（権限の 4 項目など）は**標準エラーと unified log の両方**へ出る。
 Finder から起動すると標準エラーはどこにも出ないので、こちらで読む:
 
 ```bash
-log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
+/usr/bin/log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
 ```
 
 ## 窓のフォーカスの確認（`--window-check`）
@@ -158,8 +167,19 @@ log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"'
 
 ## HUD の目視確認（`--hud-check`）
 
-**HUD について、目でしか確かめられないことが 5 つ残っている**（切り欠きの見え方・全 Space・
-クラムシェル・抜き差し・表示先の固定）。**どれもコードでは判定できない。**
+**HUD について、目でしか確かめられないことが残っている**（**終了待ちの案内**・**島の見た目**・切り欠きの見え方・
+全 Space・クラムシェル・抜き差し・表示先の固定）。**どれもコードでは判定できない。**
+
+**2026-08-15 に HUD を「島」の形へ作り直した**（詳細設計書 §7.3）。
+以前は切り欠きと同じ幅の帯が下へ伸びる形で、利用者の言葉では
+「**部分的に何か突き出して大きくなっている感じ**」だった。
+いまは**切り欠きを覆う 1 枚の黒い面**が浮き、**状態に応じて広がって縮む。**
+**寸法・角丸・速さ・行数の上限はすべて決めごとであり、実測値ではない**
+（正本は `HUDIslandMetrics`。1 箇所を直せば全部が変わる）。
+
+**素振りには「終了待ち」が入っている**（`終了待ち: PTT キーを離してください（残り N 秒）`）。
+**これが出ないまま利用者が終了の猶予 10 秒を使い切ったのが 2026-08-15 の欠陥である。**
+一覧で 1 度、素振りの最後に**製品と同じ経路**でもう 1 度出る。
 
 **手順と判定は [引き渡し手順書](docs/04-handover-verification.md) の「段 7: HUD の目視」にある。**
 `--hud-check` はマイクにもキー監視にも触らないので、**権限を 1 つも付けていない状態でも実施できる。**
