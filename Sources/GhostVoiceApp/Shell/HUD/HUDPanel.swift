@@ -62,13 +62,18 @@ final class HUDPanel {
     /// **`kCGWindowLayer` が 0 でないこと**を外から確かめるための値（検査と診断のため）。
     var windowLevelRawValue: Int { panel.level.rawValue }
 
+    /// **検査のための覗き口。** 窓が実際に order-in されているか。
+    var isVisibleForTests: Bool { panel.isVisible }
+
     /// 表示を差し替える。**変わっていなければ何もしない。**
     func render(_ display: HUDDisplay) {
         guard model.display != display else { return }
+        let wasVisible = model.display.isVisible
         model.display = display
 
         guard display.isVisible else {
             panel.orderOut(nil)
+            if wasVisible { noteWindowState("引っ込めました") }
             return
         }
 
@@ -80,6 +85,22 @@ final class HUDPanel {
         }
         // **`makeKeyAndOrderFront` は使わない。** あちらはキーウィンドウにしてしまう。
         panel.orderFrontRegardless()
+        if !wasVisible { noteWindowState("出しました") }
+    }
+
+    /// **出し入れの瞬間だけ、窓の実際の姿を 1 行で言う。**
+    ///
+    /// 2026-08-15 の実機欠陥では、**窓は作られていたのに一度も order-in されておらず、
+    /// それを示す手がかりがログに 1 行も無かった。** 「出したつもり」と「本当に出た」を
+    /// 外から区別できる唯一の行がこれである。
+    ///
+    /// **中身（暫定テキスト・発話）は 1 文字も含めない**（FR-12 / NFR-V2）。
+    /// **表示の切り替わりでしか呼ばない**ので、暫定テキストの更新回数では増えない。
+    private func noteWindowState(_ what: String) {
+        AppDiagnostics.note(
+            "[HUD] 窓を\(what): 矩形 \(Int(panel.frame.minX)),\(Int(panel.frame.minY)) "
+                + "\(Int(panel.frame.width))x\(Int(panel.frame.height)) / level \(panel.level.rawValue) "
+                + "/ 可視 \(panel.isVisible) / 画面 \(panel.screen == nil ? "なし" : "あり")")
     }
 
     /// ディスプレイ構成が変わったとき（抜き差し・配置変更）に呼ぶ。

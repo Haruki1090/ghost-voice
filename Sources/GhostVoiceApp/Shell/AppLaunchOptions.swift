@@ -66,8 +66,12 @@ public struct AppLaunchOptions: Sendable, Equatable {
 
     public static let `default` = AppLaunchOptions(startsSession: true, requestsPermissions: true)
 
-    /// 素振りの既定の秒数。**筋書きを一巡できる長さ**（`HUDRehearsal.script` の総和は約 9 秒）。
-    public static let defaultHUDRehearsalSeconds: Double = 12
+    /// 素振りの既定の秒数。**2 つの筋書きを一巡できる長さ。**
+    ///
+    /// `HUDRehearsal.wiringScript`（製品と同じ経路。約 3 秒）＋
+    /// `HUDRehearsal.script`（見た目の網羅。約 9 秒）＝ 約 12.1 秒。
+    /// **足りないと後ろの表示を誰も見ない**ので、`HUDRehearsalTests` が総和と比べている。
+    public static let defaultHUDRehearsalSeconds: Double = 16
 
     /// 窓の素振りの既定の秒数。**4 つの区間を 3 秒ずつ測れる長さ。**
     public static let defaultWindowRehearsalSeconds: Double = 12

@@ -106,12 +106,13 @@ Scripts/make-app.sh --help
 | （なし） | 常駐して PTT ディクテーションを行う。足りない権限があれば要求を出す（**ダイアログが出る**） |
 | `--shell-only` | **器だけを起動する。** マイクもキー監視も一切触らないので TCC のダイアログが出ない。フォーカスや配置の確認用 |
 | `--no-permission-prompts` | セッションは動かすが、権限の要求は出さない |
-| `--hud-check` / `--hud-check=秒` | **HUD の表示を一巡させて自分で終了する。** マイクもキー監視も触らない（**権限が無くても実施できる**）。既定は 12 秒。下記「HUD の目視確認」 |
+| `--hud-check` / `--hud-check=秒` | **製品と同じ経路で 1 発話ぶんを通してから、表示を一巡させて自分で終了する。** マイクもキー監視も触らない（**権限が無くても実施できる**）。既定は 16 秒。**既に走っている `Ghost Voice.app` があると引数は黙って捨てられる**ので、先に落とすこと。下記「HUD の目視確認」 |
 | `--window-check` / `--window-check=秒` | **設定・履歴の窓を順に開いて閉じ、自分で終了する。** マイクもキー監視も触らない。既定は 12 秒。**フォーカスの受け渡しを測るための入口である**（下記「窓のフォーカスの確認」） |
 
 ```bash
 open ".build/app/Ghost Voice.app"                          # 通常起動
 open ".build/app/Ghost Voice.app" --args --shell-only      # 器だけ
+pkill -9 -x GhostVoice; sleep 1                            # **先に落とす**（走っていると --args が届かない）
 open ".build/app/Ghost Voice.app" --args --hud-check=60    # HUD の目視確認（60 秒）
 open ".build/app/Ghost Voice.app" --args --window-check=16 # 窓のフォーカスの確認
 ```
@@ -120,7 +121,7 @@ open ".build/app/Ghost Voice.app" --args --window-check=16 # 窓のフォーカ�
 Finder から起動すると標準エラーはどこにも出ないので、こちらで読む:
 
 ```bash
-log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
+/usr/bin/log show --last 5m --info --predicate 'subsystem == "com.haruki1090.GhostVoice"' --style compact
 ```
 
 ## 窓のフォーカスの確認（`--window-check`）

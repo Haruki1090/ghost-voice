@@ -78,6 +78,15 @@ public final class NotchHUDSurface: AppSurface {
         }
     }
 
+    /// **検査のための覗き口。** いま何を出すことになっているか（`HUDPresenter` の結論）。
+    var currentDisplayForTests: HUDDisplay { presenter.display }
+
+    /// **検査のための覗き口。** 窓が実際に出ているか。窓を作れていなければ nil。
+    ///
+    /// **`presenter.display` だけを見る検査では足りない**——2026-08-15 の実機欠陥は
+    /// 「出すつもりになっていたか」ではなく「窓が order-in されたか」の側で起きた。
+    var panelIsVisibleForTests: Bool? { panel?.isVisibleForTests }
+
     public func teardown() {
         rehearsalTask?.cancel()
         wakeTask?.cancel()
@@ -96,6 +105,7 @@ public final class NotchHUDSurface: AppSurface {
     private func subscribe() {
         guard let session = services.session else {
             // `--shell-only` / キー監視を開始できなかったとき。**HUD は出るが何も映らない。**
+            AppDiagnostics.note("[HUD] セッションがありません。HUD は出ますが何も映りません。")
             return
         }
         tasks.append(
@@ -110,6 +120,10 @@ public final class NotchHUDSurface: AppSurface {
                     }
                     self.handle(.state(state))
                 }
+                // **ここへ落ちたら HUD は永久に何も映さない。**
+                // `SessionBroadcast` は終端後に購読すると即座に終端したものを返すので、
+                // 「一度も回らずにここへ来る」形もありうる。**黙って抜けさせない。**
+                AppDiagnostics.note("[HUD] 状態の購読が終わりました。以後 HUD は何も映しません。")
             })
         tasks.append(
             Task { [weak self] in
@@ -123,6 +137,25 @@ public final class NotchHUDSurface: AppSurface {
             Task { [weak self] in
                 for await event in session.assetInstallationEvents() {
                     self?.handle(.installation(event))
+                }
+            })
+        // **購読が成立したことを起動時に 1 行で言う。**
+        //
+        // 分配器は登録済みの購読者にしか配らない（`SessionBroadcast.yield`）。
+        // ここが 0 のままなら、録音しても状態は誰にも届かない——
+        // **利用者から見れば「HUD がまったく出ない」としか見えず、ログにも何も出なかった**
+        // （2026-08-15 の実機欠陥。窓は作られていたのに一度も order-in されていなかった）。
+        tasks.append(
+            Task { [weak self] in
+                // 購読の登録は上の各タスクが最初に走ったときに起きる。1 回譲ってから数える。
+                await Task.yield()
+                guard self != nil else { return }
+                let count = session.stateSubscriberCount
+                if count > 0 {
+                    AppDiagnostics.note("[HUD] 状態の購読を開始しました（購読者 \(count)）。")
+                } else {
+                    AppDiagnostics.note(
+                        "[HUD] **状態を購読できていません。** 録音しても HUD は何も映しません。")
                 }
             })
     }
@@ -195,6 +228,21 @@ extension NotchHUDSurface: HUDRehearsing {
         rehearsalTask?.cancel()
         rehearsalTask = Task { [weak self] in
             let deadline = ContinuousClock.now + .seconds(seconds)
+
+            // **まず配線を通す。**
+            //
+            // 素振りが `HUDPanel.render` を直に叩いていた頃、この確認は
+            // **`HUDPresenter` も `handle(_:)` も 1 行も通らなかった**——
+            // つまり「素振りは出るのに録音では出ない」を切り分けられなかった。
+            // ここは製品と同じ経路（`HUDEvent` → `HUDPresenter` → `HUDPanel`）である。
+            for step in HUDRehearsal.wiringScript {
+                guard !Task.isCancelled, ContinuousClock.now < deadline else { break }
+                guard let self else { return }
+                AppDiagnostics.note("[HUD 素振り/配線] \(step.note)")
+                self.handle(step.event)
+                try? await Task.sleep(for: step.duration)
+            }
+
             while !Task.isCancelled, ContinuousClock.now < deadline {
                 for step in HUDRehearsal.script {
                     guard !Task.isCancelled, ContinuousClock.now < deadline else { break }
@@ -219,6 +267,42 @@ public enum HUDRehearsal {
         public let duration: Duration
         public let note: String
     }
+
+    /// 配線を通す 1 手。**`HUDDisplay` ではなく `HUDEvent` を持つ**——
+    /// 製品が受け取るのはこちらであり、`HUDPresenter` を通らない確認は
+    /// 「録音では出ない」を一度も捕まえられない。
+    public struct EventStep: Sendable, Equatable {
+        public let event: HUDEvent
+        public let duration: Duration
+        public let note: String
+
+        public init(event: HUDEvent, duration: Duration, note: String) {
+            self.event = event
+            self.duration = duration
+            self.note = note
+        }
+    }
+
+    /// **製品と同じ経路で 1 発話ぶんを通す筋書き。**
+    ///
+    /// `script` は `HUDPanel` を直に叩く（見た目の網羅が目的）。こちらは
+    /// **`stateStream()` から届くのと同じ `HUDEvent` を `handle(_:)` へ入れる**ので、
+    /// 「窓は作れているのに録音で出ない」形の欠陥をここで踏める。
+    ///
+    /// - Important: **`.idle` で終わること。** 終わらないと素振りの後に表示が残る。
+    public static let wiringScript: [EventStep] = [
+        EventStep(
+            event: .state(.recording(volatileText: "")), duration: .milliseconds(600),
+            note: "録音開始（状態 → 間引き → 窓）"),
+        EventStep(event: .level(0.15), duration: .milliseconds(200), note: "音量が届く"),
+        EventStep(
+            event: .state(.recording(volatileText: "これは配線の確認です")),
+            duration: .milliseconds(600), note: "暫定テキストが届く"),
+        EventStep(event: .state(.finalizing), duration: .milliseconds(400), note: "確定中"),
+        EventStep(event: .state(.inserting), duration: .milliseconds(400), note: "挿入中"),
+        EventStep(
+            event: .state(.idle), duration: .milliseconds(800), note: "完了 → 畳む"),
+    ]
 
     /// **`HUDDisplay` の全種類を 1 度ずつ通る。**
     ///
