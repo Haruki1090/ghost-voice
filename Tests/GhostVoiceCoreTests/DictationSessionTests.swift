@@ -48,7 +48,8 @@ struct DictationSessionTests {
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { false },
         maxRecordingDuration: Duration = .seconds(120),
         finalizeDeadline: Duration = .seconds(5),
-        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow
+        refinerWarmthWindow: Duration = DictationSession.defaultRefinerWarmthWindow,
+        audioIdleSleepDelay: Duration = DictationSession.defaultAudioIdleSleepDelay
     ) -> Rig {
         let hotkey = StubHotkeyMonitor()
         // 履歴だけ別のルートへ向けられるようにしてある（書けない状況を作るため）。
@@ -69,7 +70,8 @@ struct DictationSessionTests {
             postEventAuthorization: PostEventAuthorization(probe: { false }),
             maxRecordingDuration: maxRecordingDuration,
             finalizeDeadline: finalizeDeadline,
-            refinerWarmthWindow: refinerWarmthWindow
+            refinerWarmthWindow: refinerWarmthWindow,
+            audioIdleSleepDelay: audioIdleSleepDelay
         )
         return Rig(
             session: session, hotkey: hotkey, audio: audio, transcriber: transcriber,
@@ -1395,6 +1397,103 @@ struct DictationSessionTests {
             #expect(
                 refiner.prewarmCount == 1,
                 "温まっているのに暖機を投げ直している（連射で推論が 2 倍になる）")
+        }
+    }
+
+    // MARK: - マイクをアイドルで寝かせる（設計書 2026-08-15）
+
+    @Test("既定は 30 秒")
+    func audioIdleSleepDefaultIs30Seconds() {
+        #expect(DictationSession.defaultAudioIdleSleepDelay == .seconds(30))
+    }
+
+    @Test("発話が終わって猶予を過ぎるとマイクが寝る")
+    func sleepsAfterIdleDelay() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root, audioIdleSleepDelay: .milliseconds(50))
+            try await speak(rig)
+            try await waitUntil("マイクが寝る") { rig.audio.sleepCount == 1 }
+            #expect(!rig.audio.isAwake)
+        }
+    }
+
+    /// **前の発話の予約が生きたまま次の録音に入る窓**を作って、そこで寝ないことを見る。
+    ///
+    /// 発話を 1 回も挟まずに押しただけでは、そもそも予約が 1 本も入っていないので
+    /// **この検査は何も証明しない**（最初にそう書いて、変異が素通りした）。
+    /// 猶予より短い間隔で押し直し、猶予を跨いで録音を続けるのが危険な形である。
+    @Test("前の発話の予約を跨いで録音していても寝ない")
+    func doesNotSleepWhileRecording() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root, audioIdleSleepDelay: .milliseconds(200))
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            // 1 本目。これが終わると 200 ms 後の予約が入る。
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("録音が始まる") { await Self.label(rig.session.state) == "recording" }
+            rig.audio.emit(frames: 1_600)
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+
+            // 猶予が切れる前に押し直し、**切れた後も録音を続ける。**
+            rig.hotkey.emit(.pressed)
+            try await waitUntil("2 本目の録音が始まる") {
+                await Self.label(rig.session.state) == "recording"
+            }
+
+            // **「起きない」ことの検査なので、有界で待つしかない。**
+            // 猶予（200 ms）の 2 倍待って、それでも呼ばれていなければ良い。
+            try await Task.sleep(for: .milliseconds(400))
+            #expect(rig.audio.sleepCount == 0, "録音中にマイクを止めた。その発話が丸ごと消える")
+
+            rig.audio.emit(frames: 1_600)
+            rig.hotkey.emit(.released)
+            try await waitUntil("待機へ戻る") { await rig.session.state == .idle }
+        }
+    }
+
+    @Test("次の発話が始まると前の予約は取り消される")
+    func nextUtteranceCancelsPendingSleep() async throws {
+        try await withTempRoot { root in
+            let rig = makeRig(root: root, audioIdleSleepDelay: .milliseconds(200))
+            // **`speak` を 2 回呼ばない。** あれは 1 回ごとに `run()` を畳むので、
+            // 2 回目の押下がイベントループの居ない場所へ落ちる。連射は 1 本の中で行う。
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            for label in ["1 本目", "2 本目"] {
+                rig.hotkey.emit(.pressed)
+                try await waitUntil("\(label)の録音が始まる") {
+                    await Self.label(rig.session.state) == "recording"
+                }
+                rig.audio.emit(frames: 1_600)
+                rig.hotkey.emit(.released)
+                try await waitUntil("\(label)が待機へ戻る") { await rig.session.state == .idle }
+            }
+
+            try await waitUntil("マイクが寝る") { rig.audio.sleepCount >= 1 }
+
+            // **取り消しに失敗していれば 1 本目も別に発火して 2 回になる。**
+            // その差はここで有界に待たないと観測できない。
+            try await Task.sleep(for: .milliseconds(400))
+            #expect(rig.audio.sleepCount == 1, "前の発話の予約が取り消されていない（二重に寝ている）")
+        }
+    }
+
+    @Test("失敗で終わった発話でも予約される")
+    func schedulesAfterFailedUtterance() async throws {
+        try await withTempRoot { root in
+            let audio = StubAudioCapture()
+            audio.startError = AudioCaptureError.engineUnavailable
+            let rig = makeRig(root: root, audio: audio, audioIdleSleepDelay: .milliseconds(50))
+            let run = Task { await rig.session.run() }
+            defer { run.cancel() }
+
+            rig.hotkey.emit(.pressed)
+
+            // 失敗経路も `finishIdle()` を通る。通っていなければ永久に寝ない。
+            try await waitUntil("マイクが寝る") { rig.audio.sleepCount == 1 }
         }
     }
 }
