@@ -886,6 +886,13 @@ struct AudioCaptureMicrophoneTests {
         let capture = EngineAudioCapture()
         try capture.prepare()
 
+        // **測る前に起こす。** 改訂後の NFR-P1 が 50 ms を要求するのは連続する発話
+        // （＝エンジンが起きている状態）であり、スリープからの初回は別枠である
+        // （下の `wakeLatency` がそちらを測る）。ここで起こしておかないと、
+        // 30 回のうち 1 回目だけが起床ぶんを含んで壊れ検知の線を割る。
+        _ = try capture.startTap(format: nil)
+        capture.stopTap()
+
         var samples: [Double] = []
         for _ in 0..<30 {
             let start = ContinuousClock.now
@@ -901,6 +908,52 @@ struct AudioCaptureMicrophoneTests {
         #expect(
             s.max < 75,
             "壊れ検知の線を割った（線は要件値ではない。要件 NFR-P1 は 50 ms）: 最大 \(s.max) ms")
+    }
+
+    /// **スリープからの起床費用**（設計書 2026-08-15 / V-46）。
+    ///
+    /// 改訂後の NFR-P1 は、アイドル 30 秒を超えて眠った後の最初の 1 回について
+    /// この量を許容している。**合否線ではなく計測である**——印字された中央値と最大を
+    /// 読んで判断すること。線は壊れ検知として 300 ms に置く（設計時の実測は
+    /// 中央値 63.0 ms / 最大 129.6 ms。2026-08-15 / M3 / macOS 26.5.2 / n=20）。
+    @Test("M1c: スリープからの起床 → タップ武装")
+    func wakeLatency() throws {
+        let capture = EngineAudioCapture()
+        try capture.prepare()
+
+        var samples: [Double] = []
+        for _ in 0..<20 {
+            capture.sleep()
+            #expect(!capture.isAwake)
+            let start = ContinuousClock.now
+            _ = try capture.startTap(format: nil)
+            samples.append(milliseconds(ContinuousClock.now - start))
+            capture.stopTap()
+        }
+        let s = stats(samples)
+        print(String(format: "M1c 起床 → タップ武装: 中央値 %.1f ms / 最小 %.1f / 最大 %.1f（20 回・実 HAL）",
+                     s.median, s.min, s.max))
+        #expect(
+            s.max < 300,
+            "壊れ検知の線を割った（線は要件値ではない。設計時の実測は最大 129.6 ms）: 最大 \(s.max) ms")
+    }
+
+    /// **オレンジ点を点けているのはタップではなくエンジンである**（設計書 §2.1）。
+    /// この対応が崩れると、寝かせても点が消えなくなる。
+    @Test("エンジンの起動状態が入力デバイスの使用状態に一致する")
+    func engineStateMatchesDeviceUsage() throws {
+        let capture = EngineAudioCapture()
+        try capture.prepare()
+        capture.sleep()
+        #expect(!capture.isAwake)
+
+        _ = try capture.startTap(format: nil)
+        #expect(capture.isAwake)
+        capture.stopTap()
+        #expect(capture.isAwake, "stopTap でエンジンまで止まっている")
+
+        capture.sleep()
+        #expect(!capture.isAwake)
     }
 
     @Test("NFR-P1 / M1b: キー押下 → 最初の実バッファ到達")
