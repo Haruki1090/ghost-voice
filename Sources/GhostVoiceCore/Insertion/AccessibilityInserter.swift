@@ -23,6 +23,52 @@ public protocol AccessibilityProbing: Sendable {
     func setSelectedText(_ text: String, on element: any FocusedElement) -> Bool
 }
 
+/// **差し替え（FR-5(a) / FR-7）のためだけの継ぎ目。**
+///
+/// `AccessibilityProbing` と分けてあるのは規約ではなく**線引きのため**である。
+/// 承認された NFR-V3 の最小例外——「自分が直前に書き込んだ範囲の文字列だけを読む」——は
+/// **この protocol の中にしか存在しない。** 主たる挿入経路（`AccessibilityInserter.tryInsert`
+/// の書き込みと `CompositeInserter`）は読み戻しを一切行わない（詳細設計書 §6.2 の裁定は
+/// そのまま）。どこまで読んでいるかを問われたら、見るのはこの protocol の実装だけでよい。
+///
+/// - Important: **`kAXValue`（欄の全文）・`kAXNumberOfCharacters`（全長）・
+///   `kAXVisibleCharacterRange`（画面に見えている範囲）は、この継ぎ目に置かない。**
+///   置いた時点で「周辺テキストを読み取らない」が守れなくなる（設計 opus §2.3 の表）。
+public protocol AccessibilityRangeProbing: Sendable {
+    /// 選択範囲属性へ書き込めるか（設計 opus §2.2 の C-5）。
+    ///
+    /// **SDK ヘッダの `Writable? Yes` は根拠にならない。** 唯一の根拠は
+    /// `AXUIElementIsAttributeSettable` の実行時の答えである（同 §2.3 の注記）。
+    func isSelectedTextRangeSettable(_ element: any FocusedElement) -> Bool
+
+    /// 現在の選択範囲。**返るのは位置と長さの整数 2 つで、文字を含まない。**
+    func selectedRange(of element: any FocusedElement) -> AXTextRange?
+
+    /// 選択範囲を設定する。成功したら true。
+    func setSelectedRange(_ range: AXTextRange, on element: any FocusedElement) -> Bool
+
+    /// **指定した範囲の文字列が `expected` と完全に一致するかだけを返す。**
+    ///
+    /// **文字列そのものは返さない。** これが NFR-V3 の最小例外を型で閉じ込めている
+    /// 箇所である（承認された 4 条件のうち 2・3・4）。実装は読み取った値を
+    /// 比較に使い終えたらその場で捨てること。ログにも出さない。
+    ///
+    /// 呼び出し側は**自分が書いた範囲以外を渡してはならない**（条件 1）。
+    /// この約束は `TextReplacer` の単体検査で固定してある
+    /// （`ReplacementPrivacyTests`）。
+    func matches(_ expected: String, in range: AXTextRange, of element: any FocusedElement)
+        -> RangeMatch
+
+    /// 2 つの要素が同じ入力欄を指すか（設計 opus §2.2 の C-4）。
+    ///
+    /// - Note: **時間を跨いだ要素の同一性が期待どおりかは未実測**（検証項目 V-27）。
+    ///   外しても「別の欄だ」と判定して中止に倒れる。
+    func isSameElement(_ lhs: any FocusedElement, _ rhs: any FocusedElement) -> Bool
+}
+
+/// 挿入と差し替えの両方を行える AX の継ぎ目。
+public typealias ReplacementCapableAccessibility = AccessibilityProbing & AccessibilityRangeProbing
+
 /// Accessibility API でフォーカス中の入力欄へ直接書き込む経路。
 ///
 /// 一段目に置く。Pasteboard 経路と違ってユーザーのクリップボードを触らず、
@@ -47,15 +93,27 @@ public struct AccessibilityInserter: PrimaryInserting {
         kAXComboBoxRole as String,
     ]
 
-    private let accessibility: any AccessibilityProbing
+    private let accessibility: any ReplacementCapableAccessibility
     private let ownProcessIdentifier: pid_t
+    private let epoch: InsertionEpoch
+    private let capturesReplacementAnchor: Bool
 
+    /// - Parameters:
+    ///   - epoch: 挿入の世代。**差し替え器と同じものを渡すこと**（`CompositeInserter.systemStack`
+    ///     が本番の組み立てを行う）。別物を渡すと差し替えが常に「失効した」と判定される。
+    ///   - capturesReplacementAnchor: 差し替えの錨を取るか。取ると挿入の後に
+    ///     **AX の読みが 3 往復**増える（実測 0.1〜5.5 ms / 往復。合計は未実測 = V-28）。
+    ///     false にすると差し替えも Undo も効かなくなるが、挿入そのものは変わらない。
     public init(
-        accessibility: any AccessibilityProbing = SystemAccessibility(),
-        ownProcessIdentifier: pid_t = getpid()
+        accessibility: any ReplacementCapableAccessibility = SystemAccessibility(),
+        ownProcessIdentifier: pid_t = getpid(),
+        epoch: InsertionEpoch = InsertionEpoch(),
+        capturesReplacementAnchor: Bool = true
     ) {
         self.accessibility = accessibility
         self.ownProcessIdentifier = ownProcessIdentifier
+        self.epoch = epoch
+        self.capturesReplacementAnchor = capturesReplacementAnchor
     }
 
     /// 4 条件をすべて満たす場合のみ AX 経路を使う。
@@ -81,13 +139,81 @@ public struct AccessibilityInserter: PrimaryInserting {
         return accessibility.isSelectedTextSettable(element)
     }
 
-    public func tryInsert(_ text: String) async -> Bool {
-        // `canInsert()` とは別にフォーカスを取り直す。その隙にフォーカスが動きうるので、
-        // 自プロセス判定はここでも掛ける。
-        guard let element = accessibility.focusedElement(), isSafeTarget(element) else {
-            return false
+    /// **挿入の前に「後から差し替えられる見込みか」を答える**（FR-5(a) の分岐判定）。
+    ///
+    /// `canInsert()` の 4 条件に **C-5 の片割れ（`kAXSelectedTextRange` が settable か）**
+    /// を足したもの。錨を作るのに要るのはこの 1 つだけで、残りの条件
+    /// （キャレット位置が読めるか・読み戻しが一致するか）は**書いてみないと判らない。**
+    /// したがって**真は「見込み」であり、偽は確実である。**
+    ///
+    /// - Important: **AX の往復が `canInsert()` のぶんと重複する**（役割・settable の
+    ///   問い合わせを 2 度行う）。往復は実測 0.1〜5.5 ms で、(a) の分岐ではこの費用が
+    ///   NFR-P6a の予算に乗る。**重複を消すには判定結果を持ち回る形にする必要があり、
+    ///   その持ち回りはフォーカスが動いた瞬間に嘘になる**ので採らない。
+    ///   実測は未取得（検証項目 V-28）。
+    /// - Note: `capturesReplacementAnchor: false` で作った挿入器は常に false を返す。
+    ///   差し替えを切った構成では (a) の分岐へ載せない、という意味になる。
+    public func canCaptureAnchor() -> Bool {
+        guard capturesReplacementAnchor, canInsert(),
+              let element = accessibility.focusedElement()
+        else { return false }
+        return accessibility.isSelectedTextRangeSettable(element)
+    }
+
+    /// - Important: **書き込みは世代の錠の中で行う**（`InsertionEpoch.withExclusiveWrite`）。
+    ///   同じ組の差し替え（`TextReplacer.replace`）と重なると、片方が読み戻した内容と
+    ///   実際の内容がずれる。以前は「差し替えを actor 上で同期に走らせる」ことで
+    ///   重なりを塞いでいたが、**その代償として最大 6 秒 actor が塞がっていた。**
+    public func tryInsert(_ text: String) async -> InsertionAttempt {
+        epoch.withExclusiveWrite {
+            // `canInsert()` とは別にフォーカスを取り直す。その隙にフォーカスが動きうるので、
+            // 自プロセス判定はここでも掛ける。
+            guard let element = accessibility.focusedElement(),
+                  let pid = safeTargetProcessIdentifier(element)
+            else { return .failed }
+
+            // **書き込みの前に選択位置を読む。** 書いた後では「どこから書いたか」が判らない
+            // （下記）。読むのは整数 2 つで、文字は含まない。
+            let before = capturesReplacementAnchor ? accessibility.selectedRange(of: element) : nil
+
+            guard accessibility.setSelectedText(text, on: element) else { return .failed }
+
+            // **ここから先で何が起きても、テキストは既に入っている。**
+            // 錨が取れなければ差し替えを諦めるだけで、挿入は成功のまま返す。
+            return .inserted(anchor: anchor(for: text, on: element, pid: pid, before: before))
         }
-        return accessibility.setSelectedText(text, on: element)
+    }
+
+    /// 書き込んだ場所の錨を作る。取れなければ nil（＝後から差し替えない）。
+    ///
+    /// **長さを自分で数えない。** `text.count` も `text.utf16.count` も使わない。
+    /// AX の範囲の単位は未実測で、3 通りに割れうる（`AXTextRange` の注記）。
+    /// **書き込みの前後で選択位置を読み、その差だけを長さとして使う。**
+    /// これなら単位が何であっても、相手が数えた値をそのまま使うことになる。
+    ///
+    /// 最後に**読み戻して一致を確かめる**（設計 opus §2.2 の C-6）。ここで一致しない
+    /// 相手は、そもそも差し替えても検証できないので錨を作らない。
+    private func anchor(
+        for text: String, on element: any FocusedElement, pid: pid_t, before: AXTextRange?
+    ) -> ReplacementAnchor? {
+        guard capturesReplacementAnchor, let before else { return nil }
+        // 書いた直後はキャレットが挿入文字列の直後にあるはず。**そうでない相手は諦める**
+        // （V-26。前提が外れても「錨を作らない」に倒れるだけ）。
+        // **上限は `AXTextRange.written` が型の側で掛ける**（NFR-V3 の条件 1）。
+        // キャレットが「書いた文字列の直後」より遥か後ろ（欄の末尾など）へ飛ぶ相手では
+        // 範囲が伸び、**利用者が元から書いていたテキストを読み戻すことになる。**
+        // そういう相手では錨を作らない——差し替えないだけで、生テキストは欄にある。
+        guard let after = accessibility.selectedRange(of: element),
+              after.length == 0,
+              let range = AXTextRange.written(text, from: before.location, to: after.location)
+        else { return nil }
+
+        guard accessibility.matches(text, in: range, of: element) == .matched else { return nil }
+
+        return ReplacementAnchor(
+            element: element, processIdentifier: pid, range: range, text: text,
+            previousText: nil, epoch: epoch.current
+        )
     }
 
     /// 書き込んでも安全な相手か。**自分自身のプロセスは除外する。**
@@ -113,8 +239,15 @@ public struct AccessibilityInserter: PrimaryInserting {
     ///
     /// プロセスが判らない要素も除外する。「自分ではない」と断言できないため。
     private func isSafeTarget(_ element: any FocusedElement) -> Bool {
-        guard let pid = accessibility.processIdentifier(of: element) else { return false }
-        return pid != ownProcessIdentifier
+        safeTargetProcessIdentifier(element) != nil
+    }
+
+    /// 安全な相手ならそのプロセス ID。錨に載せるので `Bool` ではなく pid を返す形にしてある。
+    private func safeTargetProcessIdentifier(_ element: any FocusedElement) -> pid_t? {
+        guard let pid = accessibility.processIdentifier(of: element),
+              pid != ownProcessIdentifier
+        else { return nil }
+        return pid
     }
 }
 
@@ -193,7 +326,41 @@ public struct SystemAccessibility: AccessibilityProbing {
     ///
     /// `kCGWindowLayer == 0` は通常のアプリケーションウィンドウを指す。メニューバーや
     /// カーソルなどは別のレイヤに載るので、それらを飛ばして最初に見つかったものを返す。
-    static func frontmostProcessIdentifier() -> pid_t? {
+    ///
+    /// ## 何のために公開しているか
+    ///
+    /// **「挿入先がどこになるか」を、挿入する前に知るためである。**
+    /// この規則はプロセス全体でここ 1 箇所にしかなく、`focusedElement()` は
+    /// **必ずこれを通って**挿入先のアプリを決める。したがって
+    /// **「いま挿入したらどこへ入るか」を問うには、これを呼ぶしかない。**
+    ///
+    /// 実際の呼び出し側は `GhostVoiceApp` の `AppWindow.dismissAndReturnFocus` である。
+    /// 設定・履歴の窓を閉じた後、**この値が自分の pid でなくなるまで待ってから**
+    /// 再挿入する（待たないと再挿入が Ghost Voice 自身の窓へ入る）。
+    /// 待つ側が別の規則（`NSApp.isActive` / `NSWorkspace.frontmostApplication`）を
+    /// 使うと**原理的に足りない**——それらは活性の帳簿であって、
+    /// この規則が読む window server の窓の並びとは 24〜32 ms ずれる（詳細設計書 §13 の V-43）。
+    ///
+    /// ## 呼び出し側が仮定してよいこと / してはいけないこと
+    ///
+    /// - **仮定してよい**: 返り値は `focusedElement()` が挿入先として名指しするのと
+    ///   **同一の pid** である（同じ関数を呼んでいる）。
+    /// - **仮定してよい**: 副作用も内部状態も持たない。何度呼んでもよく、順序も問わない。
+    /// - **仮定してよい**: TCC の許可を要さない。ウィンドウ名を読まないので
+    ///   画面収録の許可も要らない（`focusedElement()` の注記）。
+    /// - **仮定してはいけない**: 「返った pid が次の瞬間もまだ最前面である」こと。
+    ///   これは**その瞬間の観測**であって予約ではない。呼んでから挿入するまでの間に
+    ///   利用者が窓を切り替えれば挿入先は変わる。
+    /// - **仮定してはいけない**: `nil` が異常であること。`nil` は「`kCGWindowLayer == 0`
+    ///   の窓が画面に 1 つも無い」であり、**正常に起こりうる**（全アプリを隠した状態など）。
+    ///   `nil` のとき `focusedElement()` も `nil` を返す——つまり**挿入先が自分になることは
+    ///   ない**ので、「自分でなくなるのを待つ」用途では `nil` は成立とみなしてよい。
+    ///
+    /// - Note: **1 プロセスの最初の 1 回だけ約 38〜52 ms 掛かる**（window server との
+    ///   接続の確立。実測 2026-08-15 / MacBook Pro Mac15,3 / M3 / macOS 26.5.2）。
+    ///   2 回目以降は 0.3〜1.1 ms（n=1500 / p50 0.65 ms / p95 1.05 ms）。
+    ///   **窓を出したことのあるプロセスでは接続が既にあるので、この初回費用は掛からない。**
+    public static func frontmostProcessIdentifier() -> pid_t? {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
             as? [[String: Any]]
@@ -259,10 +426,252 @@ public struct SystemAccessibility: AccessibilityProbing {
     }
 }
 
+// MARK: - 差し替えのための読み書き（NFR-V3 の最小例外はここだけ）
+
+extension SystemAccessibility: AccessibilityRangeProbing {
+
+    public func isSelectedTextRangeSettable(_ element: any FocusedElement) -> Bool {
+        guard let element = element as? Element else { return false }
+        var settable: DarwinBoolean = false
+        let status = AXUIElementIsAttributeSettable(
+            element.ax, kAXSelectedTextRangeAttribute as CFString, &settable
+        )
+        return status == .success && settable.boolValue
+    }
+
+    public func selectedRange(of element: any FocusedElement) -> AXTextRange? {
+        guard let element = element as? Element else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element.ax, kAXSelectedTextRangeAttribute as CFString, &value
+        ) == .success else { return nil }
+        return Self.range(from: value)
+    }
+
+    /// `AXValue` から `CFRange` を取り出す。**強制キャストしてはならない**
+    /// （`element(from:)` と同じ理由。落ちれば発話が失われる）。
+    ///
+    /// 関数として切り出してあるのは検査のため。実要素からは AX 権限が無いと何も返らない。
+    static func range(from value: CFTypeRef?) -> AXTextRange? {
+        guard let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = unsafeDowncast(value, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cfRange else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range) else { return nil }
+        return AXTextRange(location: range.location, length: range.length)
+    }
+
+    /// `AXTextRange` を AX の値へ包む。包めなければ nil。
+    static func axValue(for range: AXTextRange) -> AXValue? {
+        var cfRange = CFRange(location: range.location, length: range.length)
+        return AXValueCreate(.cfRange, &cfRange)
+    }
+
+    public func setSelectedRange(_ range: AXTextRange, on element: any FocusedElement) -> Bool {
+        guard let element = element as? Element, let value = Self.axValue(for: range) else {
+            return false
+        }
+        return AXUIElementSetAttributeValue(
+            element.ax, kAXSelectedTextRangeAttribute as CFString, value
+        ) == .success
+    }
+
+    /// **承認された NFR-V3 の最小例外の全部がこの関数である。**
+    ///
+    /// 読み取った文字列はこの関数を出ない。呼び出し側へ返るのは `RangeMatch` の
+    /// 3 値だけで、**一致しなかった場合にその内容を知る手段は無い**（条件 2・3・4）。
+    /// 範囲を自分が書いた場所に限る責任は呼び出し側にある（条件 1。`TextReplacer`）。
+    ///
+    /// - Note: **実アプリが `AXStringForRange` に応えるかは未実測**（検証項目 V-24）。
+    ///   応えなければ `.unreadable` が返り、差し替えは中止される（＝生テキストが残る）。
+    public func matches(
+        _ expected: String, in range: AXTextRange, of element: any FocusedElement
+    ) -> RangeMatch {
+        // **条件 1 をここでも掛ける（二重の守り）。**
+        //
+        // 範囲を作る側（`AXTextRange.written`）で上限は掛かっているが、
+        // **`AXStringForRange` を実際に撃つのはプロセス全体でこの 1 箇所だけ**なので、
+        // 規則をここにも置いておく。比較対象より長い範囲を読む理由は原理的に無い
+        // （長ければ一致しようがない）ので、**読まずに「違った」で降りる。**
+        guard Self.isReadable(range: range, comparedTo: expected) else { return .differed }
+        guard let element = element as? Element, let parameter = Self.axValue(for: range) else {
+            return .unreadable
+        }
+        var value: CFTypeRef?
+        let status = AXUIElementCopyParameterizedAttributeValue(
+            element.ax, kAXStringForRangeParameterizedAttribute as CFString, parameter, &value
+        )
+        guard status == .success, let string = value as? String else { return .unreadable }
+        // ここで真偽値 1 つへ落とす。**`string` はこの行より先へ出ない。**
+        return string == expected ? .matched : .differed
+    }
+
+    /// **読みにいってよい範囲か**（NFR-V3 の条件 1）。
+    ///
+    /// 比較対象より長い範囲を読む理由は無い。単位は未実測（V-23）だが、
+    /// `count` / `unicodeScalars` / `utf16` のどれであっても長さは
+    /// `expected.utf16.count` を超えないので、**これが安全な上限である。**
+    ///
+    /// 関数として切り出してあるのは検査のため（実要素は AX 権限が無いと何も返さない）。
+    static func isReadable(range: AXTextRange, comparedTo expected: String) -> Bool {
+        range.location >= 0 && range.length >= 0 && range.length <= expected.utf16.count
+    }
+
+    public func isSameElement(_ lhs: any FocusedElement, _ rhs: any FocusedElement) -> Bool {
+        guard let lhs = lhs as? Element, let rhs = rhs as? Element else { return false }
+        return CFEqual(lhs.ax, rhs.ax)
+    }
+}
+
 // MARK: - テスト用
 
+/// テスト用の入力欄。**差し替えの全経路を決定的に駆動するために要る。**
+///
+/// 実機のアプリへ書き込む検査は行えない（安全制約）。R-4 の無言失敗も「消えるだけ」も
+/// 実機では未観測なので、**代役でしか再現できない。**
+///
+/// - Important: **この欄の範囲の単位は `Character` である。** 実機の AX が何を単位に
+///   するかは未実測（V-23）。`TextReplacer` は長さを自分で数えず、この欄が返した
+///   位置の差だけを使うので、単位が違っても通る作りになっている。
+public final class FakeTextField: Sendable {
+
+    /// `kAXSelectedText` への書き込みが実際に何を起こすか。
+    public enum WriteBehavior: Sendable, Equatable {
+        /// 素直に置き換える。
+        case normal
+        /// AX がエラーを返す（何も起きない）。
+        case rejected
+        /// **成功を返しながら何も入らない（R-4 の無言失敗）。**
+        case silentNoOp
+        /// 成功を返すが、書いたのとは別の内容になる。**喪失の疑い。**
+        case replaces(with: String)
+        /// 選択範囲を消すだけで、新しい文字列を書かない。**喪失そのもの。**
+        case erases
+    }
+
+    /// 書き込みの後にキャレットがどこへ行くか。
+    public enum CaretAfterWrite: Sendable, Equatable {
+        /// 実際に置かれた文字列の直後（ふつうの挙動）。
+        case endOfWrittenText
+        /// 書き込んだ範囲の先頭。
+        case startOfRange
+        /// 動かない（選択したままになる）。
+        case unchanged
+        /// 選択範囲が読めなくなる。
+        case unreadable
+        /// **書いた場所より遥か後ろ——欄の末尾——へ飛ぶ。**
+        ///
+        /// 書き込みを受けて欄全体を再整形する相手や、書式付きの欄で正規化が走る相手を模す。
+        /// **この挙動が代役に無かったために、NFR-V3 の条件 1 の破れ（読み戻す範囲に
+        /// 上限が無い）が検査から永久に到達できなかった**（最終レビュー 視点5 の P-1）。
+        case endOfContent
+    }
+
+    private struct State {
+        var content: [Character]
+        var selection: AXTextRange
+    }
+
+    private let state: Mutex<State>
+    private let behavior: WriteBehavior
+    private let caret: CaretAfterWrite
+    /// `AXStringForRange` に応えるか。false の相手は差し替えられない。
+    private let respondsToStringForRange: Bool
+    /// 「書き込み可能」と答えるのに、選択範囲の設定が実際には失敗する相手。
+    private let selectionWriteFails: Bool
+
+    public init(
+        content: String = "",
+        selection: AXTextRange? = nil,
+        behavior: WriteBehavior = .normal,
+        caret: CaretAfterWrite = .endOfWrittenText,
+        respondsToStringForRange: Bool = true,
+        selectionWriteFails: Bool = false
+    ) {
+        let characters = Array(content)
+        self.state = Mutex(
+            State(
+                content: characters,
+                selection: selection ?? AXTextRange(location: characters.count, length: 0)
+            ))
+        self.behavior = behavior
+        self.caret = caret
+        self.respondsToStringForRange = respondsToStringForRange
+        self.selectionWriteFails = selectionWriteFails
+    }
+
+    /// 欄の中身。**検査からのみ見る。** 製品コードはここを読まない（NFR-V3）。
+    public var content: String { state.withLock { String($0.content) } }
+
+    /// **利用者が手で編集した状況を作る。** 検査からのみ呼ぶ。
+    public func userEdits(to content: String) {
+        state.withLock {
+            $0.content = Array(content)
+            $0.selection = AXTextRange(location: $0.content.count, length: 0)
+        }
+    }
+
+    fileprivate var currentSelection: AXTextRange? {
+        caret == .unreadable ? nil : state.withLock { $0.selection }
+    }
+
+    fileprivate func select(_ range: AXTextRange) -> Bool {
+        guard !selectionWriteFails else { return false }
+        return state.withLock {
+            guard range.location >= 0, range.length >= 0, range.end <= $0.content.count else {
+                return false
+            }
+            $0.selection = range
+            return true
+        }
+    }
+
+    fileprivate func write(_ text: String) -> Bool {
+        guard behavior != .rejected else { return false }
+        return state.withLock { state in
+            let range = state.selection
+            guard range.location >= 0, range.length >= 0, range.end <= state.content.count else {
+                return false
+            }
+            let written: [Character]
+            switch behavior {
+            case .normal: written = Array(text)
+            case .replaces(let other): written = Array(other)
+            case .erases: written = []
+            case .silentNoOp: written = Array(state.content[range.location..<range.end])
+            case .rejected: return false
+            }
+            state.content.replaceSubrange(range.location..<range.end, with: written)
+
+            switch caret {
+            case .endOfWrittenText, .unreadable:
+                state.selection = AXTextRange(
+                    location: range.location + written.count, length: 0)
+            case .endOfContent:
+                state.selection = AXTextRange(location: state.content.count, length: 0)
+            case .startOfRange:
+                state.selection = AXTextRange(location: range.location, length: 0)
+            case .unchanged:
+                state.selection = AXTextRange(location: range.location, length: written.count)
+            }
+            return true
+        }
+    }
+
+    fileprivate func matches(_ expected: String, in range: AXTextRange) -> RangeMatch {
+        guard respondsToStringForRange else { return .unreadable }
+        return state.withLock { state in
+            guard range.location >= 0, range.length >= 0, range.end <= state.content.count else {
+                return .unreadable
+            }
+            return String(state.content[range.location..<range.end]) == expected
+                ? .matched : .differed
+        }
+    }
+}
+
 /// テスト用。AX の応答を指定した値で返し、問い合わせられ方を記録する。
-public struct FakeAccessibility: AccessibilityProbing {
+public struct FakeAccessibility: ReplacementCapableAccessibility {
 
     /// 偽の要素。AX から読み取れる事実をそのまま持つ。
     public struct Element: FocusedElement {
@@ -270,16 +679,25 @@ public struct FakeAccessibility: AccessibilityProbing {
         public let isSelectedTextSettable: Bool
         public let processIdentifier: pid_t?
         /// 書き込みを受け入れるか。AX が成功を返すかどうかを模す。
+        /// **`field` を渡した場合はそちらの `WriteBehavior` が優先する。**
         public let acceptsWrite: Bool
+        /// 選択範囲属性へ書き込めるか（C-5）。
+        public let isSelectedTextRangeSettable: Bool
+        /// 要素の同一性（C-4）。**同じ欄を指す要素には同じ値を使うこと。**
+        public let identity: UUID
 
         public init(
             role: String?, isSelectedTextSettable: Bool,
-            processIdentifier: pid_t?, acceptsWrite: Bool
+            processIdentifier: pid_t?, acceptsWrite: Bool,
+            isSelectedTextRangeSettable: Bool = true,
+            identity: UUID = UUID()
         ) {
             self.role = role
             self.isSelectedTextSettable = isSelectedTextSettable
             self.processIdentifier = processIdentifier
             self.acceptsWrite = acceptsWrite
+            self.isSelectedTextRangeSettable = isSelectedTextRangeSettable
+            self.identity = identity
         }
     }
 
@@ -288,21 +706,37 @@ public struct FakeAccessibility: AccessibilityProbing {
         private let roles = Atomic<Int>(0)
         private let settables = Atomic<Int>(0)
         private let texts = Mutex<[String]>([])
+        private let ranges = Mutex<[AXTextRange]>([])
+        private let reads = Mutex<[AXTextRange]>([])
 
         public var roleCount: Int { roles.load(ordering: .relaxed) }
         public var settableCount: Int { settables.load(ordering: .relaxed) }
+        /// `kAXSelectedText` へ書き込んだ文字列。**これが欄の内容を変える唯一の操作。**
         public var writtenTexts: [String] { texts.withLock { $0 } }
+        /// `kAXSelectedTextRange` へ書き込んだ範囲。**内容は変えない**（選択の移動だけ）。
+        public var writtenRanges: [AXTextRange] { ranges.withLock { $0 } }
+        /// **読み戻しを行った範囲。** NFR-V3 の条件 1（自分が書いた場所に限る）を
+        /// 検査で押さえるために記録する。
+        public var readRanges: [AXTextRange] { reads.withLock { $0 } }
 
         fileprivate func recordRole() { roles.add(1, ordering: .relaxed) }
         fileprivate func recordSettable() { settables.add(1, ordering: .relaxed) }
         fileprivate func recordWrite(_ text: String) { texts.withLock { $0.append(text) } }
+        fileprivate func recordRangeWrite(_ range: AXTextRange) {
+            ranges.withLock { $0.append(range) }
+        }
+        fileprivate func recordRead(_ range: AXTextRange) { reads.withLock { $0.append(range) } }
     }
 
     public let calls = Calls()
     private let focused: Element?
+    private let field: FakeTextField?
 
-    public init(focused: Element?) {
+    /// - Parameter field: 差し替えを駆動する場合に渡す。省略すると範囲の読み書きは
+    ///   すべて「使えない」相手として振る舞う（＝差し替えは常に中止される）。
+    public init(focused: Element?, field: FakeTextField? = nil) {
         self.focused = focused
+        self.field = field
     }
 
     public func focusedElement() -> (any FocusedElement)? { focused }
@@ -323,7 +757,44 @@ public struct FakeAccessibility: AccessibilityProbing {
 
     public func setSelectedText(_ text: String, on element: any FocusedElement) -> Bool {
         guard let element = element as? Element, element.acceptsWrite else { return false }
+        guard let field else {
+            calls.recordWrite(text)
+            return true
+        }
+        guard field.write(text) else { return false }
         calls.recordWrite(text)
         return true
+    }
+
+    public func isSelectedTextRangeSettable(_ element: any FocusedElement) -> Bool {
+        guard let element = element as? Element else { return false }
+        return field != nil && element.isSelectedTextRangeSettable
+    }
+
+    public func selectedRange(of element: any FocusedElement) -> AXTextRange? {
+        guard element is Element else { return nil }
+        return field?.currentSelection
+    }
+
+    public func setSelectedRange(_ range: AXTextRange, on element: any FocusedElement) -> Bool {
+        guard let element = element as? Element, element.isSelectedTextRangeSettable,
+              let field
+        else { return false }
+        guard field.select(range) else { return false }
+        calls.recordRangeWrite(range)
+        return true
+    }
+
+    public func matches(
+        _ expected: String, in range: AXTextRange, of element: any FocusedElement
+    ) -> RangeMatch {
+        calls.recordRead(range)
+        guard element is Element, let field else { return .unreadable }
+        return field.matches(expected, in: range)
+    }
+
+    public func isSameElement(_ lhs: any FocusedElement, _ rhs: any FocusedElement) -> Bool {
+        guard let lhs = lhs as? Element, let rhs = rhs as? Element else { return false }
+        return lhs.identity == rhs.identity
     }
 }

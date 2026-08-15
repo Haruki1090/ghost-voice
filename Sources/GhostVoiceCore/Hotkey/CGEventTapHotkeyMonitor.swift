@@ -111,7 +111,6 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     public let events: AsyncStream<HotkeyEvent>
     private let continuation: AsyncStream<HotkeyEvent>.Continuation
 
-    private let binding: HotkeyBinding
     private let listenAccessProbe: @Sendable () -> Bool
     private let accessibilityProbe: @Sendable () -> Bool
     private let tapController: any EventTapControlling
@@ -125,14 +124,27 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
     /// 無制限に張り直すと、無効化と `.interrupted` の応酬が止まらなくなる。
     static let maxReEnableAttempts = 10
 
-    /// 下の 5 つを守る。**`tap` と `runLoopSource` も含める。**
-    /// コールバックはランループのスレッドから、`start` / `stop` は別のスレッドから来る。
+    /// 下の 6 つを守る。**`binding` / `tap` / `runLoopSource` も含める。**
+    /// コールバックはランループのスレッドから、`start` / `stop` / `rebind` は
+    /// 別のスレッドから来る。
     private let lock = NSLock()
+    /// 監視している PTT のバインド。**`rebind(to:)` で差し替わる**ので、
+    /// 読むときは必ずロックの中で読むこと（`handle` は既にそうしている）。
+    private var binding: HotkeyBinding
+    /// 監視している Undo のバインド（FR-7）。**タップのマスクには影響しない**
+    /// （`keyDown` しか見ないので、既に必ず入っている）。
+    private var undoBinding: HotkeyBinding
+    /// いま Undo で戻せるものがあるか（`setUndoAvailable`）。**抑止の可否だけを決める。**
+    private var isUndoAvailable = false
     private var phase: Phase = .idle
     private var isRecording = false
     /// セッションが確定〜整形の処理中か（`setSessionBusy`）。
     /// **`isRecording` とは別の量である。** キーを離した後も真でありうる。
     private var isSessionBusy = false
+    /// 捕獲モードの受け取り手。**nil なら捕獲していない**（＝ hot path の分岐は nil 比較 1 つ）。
+    private var captureHandler: (@Sendable (HotkeyCaptureOutcome) -> Void)?
+    /// 捕獲モードの状態。**押している修飾キーを覚えるだけの純粋な値。**
+    private var captureState = HotkeyCaptureState()
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     /// タップが無効化され、張り直さないと決めた。以後ホットキーは反応しない。
@@ -152,14 +164,21 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.withLock { phase == .running && !tapDead }
     }
 
+    /// いま監視している PTT のバインド（`HotkeyMonitor` の契約）。
+    public var currentBinding: HotkeyBinding {
+        lock.withLock { binding }
+    }
+
     public init(
         binding: HotkeyBinding,
+        undoBinding: HotkeyBinding = .controlCommandZ,
         listenAccessProbe: @escaping @Sendable () -> Bool = { CGPreflightListenEventAccess() },
         accessibilityProbe: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
         tapController: any EventTapControlling = SystemEventTapController(),
         runLoop: CFRunLoop = CFRunLoopGetMain()
     ) {
         self.binding = binding
+        self.undoBinding = undoBinding
         self.listenAccessProbe = listenAccessProbe
         self.accessibilityProbe = accessibilityProbe
         self.tapController = tapController
@@ -201,10 +220,11 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         case .idle:
             phase = .starting
         }
+        let current = binding
         lock.unlock()
 
         do {
-            try openTap()
+            try openTap(binding: current)
         } catch {
             // **失敗しても .idle へ戻す。** 権限を与えたユーザーが
             // もう一度試せなくなるのは、権限フローとして成立しない。
@@ -220,7 +240,9 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         }
     }
 
-    private func openTap() throws {
+    /// - Parameter binding: **ロックの中で読み取った写しを渡すこと。**
+    ///   `rebind(to:)` と競合しうるので、生成の最中に差し替わった値を使ってはならない。
+    private func openTap(binding: HotkeyBinding) throws {
         let context = Unmanaged.passUnretained(self).toOpaque()
 
         let created = tapController.create(
@@ -283,8 +305,134 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         lock.withLock { isSessionBusy = busy }
     }
 
+    /// いま監視している Undo のバインド（`HotkeyMonitor` の契約）。
+    public var currentUndoBinding: HotkeyBinding {
+        lock.withLock { undoBinding }
+    }
+
+    /// Undo のバインドを差し替える（`HotkeyMonitor` の契約）。
+    ///
+    /// **`rebind(to:)` と違ってタップを張り替えない。** Undo は `keyDown` しか見ず、
+    /// それは PTT のバインドに関わらず常にマスクへ入っているためである
+    /// （`eventMask(for:)`）。したがって録音を巻き添えにしない。
+    public func rebindUndo(to newBinding: HotkeyBinding) throws {
+        try lock.withLock {
+            guard phase != .stopped else { throw HotkeyError.stopped }
+            undoBinding = newBinding
+        }
+    }
+
+    /// 戻せるものがあるかを知らせる（`HotkeyMonitor` の契約）。
+    ///
+    /// **hot path から見えるのはこのフラグの読み取りだけ**（`setSessionBusy` と同じ理由）。
+    public func setUndoAvailable(_ available: Bool) {
+        lock.withLock { isUndoAvailable = available }
+    }
+
+    // MARK: - 捕獲モード（FR-11）
+
+    /// いま捕獲モードか（`HotkeyMonitor` の契約）。
+    public var isCapturingHotkey: Bool {
+        lock.withLock { captureHandler != nil }
+    }
+
+    /// 打鍵の捕獲を始める（`HotkeyMonitor` の契約）。
+    ///
+    /// **タップは張り替えない。** 捕獲に要るイベント種別（`flagsChanged` と `keyDown`）は
+    /// **バインドに関わらず必ずマスクへ入っている**（`eventMask(for:)`）。
+    /// 張り替えると実測 40 ms 掛かるうえ、録音中なら巻き添えで `.interrupted` が要る。
+    ///
+    /// - Important: **2 本目の `CGEventTap` を立てない**ための口である（統括の裁定）。
+    public func beginHotkeyCapture(_ onEvent: @escaping @Sendable (HotkeyCaptureOutcome) -> Void) {
+        let wasRecording: Bool = lock.withLock {
+            captureHandler = onEvent
+            captureState = HotkeyCaptureState()
+            let recording = isRecording
+            // **捕獲中は PTT を見ないので、押しっぱなしの録音を終わらせられない。**
+            // ここで畳んでおかないと「録音中のまま二度と終わらない」状態が残る。
+            isRecording = false
+            return recording
+        }
+        if wasRecording { continuation.yield(.interrupted) }
+    }
+
+    /// 捕獲モードを閉じる（`HotkeyMonitor` の契約）。**決着は配らない。**
+    public func endHotkeyCapture() {
+        lock.withLock {
+            captureHandler = nil
+            captureState = HotkeyCaptureState()
+        }
+    }
+
+    /// PTT のバインドを差し替える（`HotkeyMonitor` の契約。欠落 9 / 持ち越し項目 10）。
+    ///
+    /// **タップを張り替える。** 監視するイベント種別はバインドで変わる（修飾キー単独では
+    /// `keyUp` を含めない。詳細設計書 §2.1）ので、`binding` を書き換えるだけでは
+    /// **⌃⌘Z へ変えたときに解放を検出できず、録音が永遠に終わらない。**
+    ///
+    /// **ストリームは終端しない。** `stop()` して作り直す形にすると、`DictationSession` が
+    /// `let` で握っている監視器を差し替える必要があり、公開 API か組み立て方の変更になる
+    /// （持ち越し項目 10 の指摘）。同じインスタンスの中でタップだけを替えれば波及しない。
+    ///
+    /// - Important: **録音中に呼ぶと `.interrupted` を出す。** 古いキーの解放はもう
+    ///   届かないので、出さないと録音が終わらない状態で固まる（項目 14 と同じ形）。
+    ///   `.cancelled` ではないので、そこまでの発話は確定して挿入される。
+    public func rebind(to newBinding: HotkeyBinding) throws {
+        lock.lock()
+        switch phase {
+        case .stopped:
+            lock.unlock()
+            throw HotkeyError.stopped
+        case .starting:
+            // 起動の最中。`create` は実測で約 40 ms 掛かる。ここで割り込むと、
+            // 開きかけのタップと張り替えたタップが二重になる。
+            lock.unlock()
+            throw HotkeyError.alreadyRunning
+        case .idle:
+            binding = newBinding
+            let wasRecording = isRecording
+            isRecording = false
+            lock.unlock()
+            if wasRecording { continuation.yield(.interrupted) }
+            return
+        case .running:
+            let oldTap = tap
+            let oldSource = runLoopSource
+            let wasRecording = isRecording
+            binding = newBinding
+            tap = nil
+            runLoopSource = nil
+            isRecording = false
+            // 新しいタップには再有効化の予算を渡し直す。古いタップの回数を持ち越すと、
+            // 張り替えたのに 1 回で諦めることがある。
+            tapDead = false
+            reEnables.store(0, ordering: .relaxed)
+            // **`.starting` を通る。** 一旦 `.idle` にすると、その隙に `start()` が
+            // 成功してタップが二枚になる。
+            phase = .starting
+            lock.unlock()
+
+            teardown(tap: oldTap, source: oldSource)
+            if wasRecording { continuation.yield(.interrupted) }
+
+            do {
+                try openTap(binding: newBinding)
+            } catch {
+                // **動いているふりをしない。** 権限を直した利用者が `start()` で
+                // やり直せるよう `.idle` へ戻す（`stop()` が付けた `.stopped` は巻き戻さない）。
+                lock.lock()
+                if phase == .starting { phase = .idle }
+                lock.unlock()
+                throw error
+            }
+        }
+    }
+
     /// 停止する。**ストリームは終端し、以後この監視器は再起動できない**
     /// （`AsyncStream` は終端を取り消せない）。再開したい場合は作り直すこと。
+    ///
+    /// - Note: PTT キーを変えたいだけなら `rebind(to:)` を使うこと。こちらを通すと
+    ///   ストリームが終端し、監視器を作り直すしかなくなる。
     public func stop() {
         lock.lock()
         let currentTap = tap
@@ -294,17 +442,31 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         runLoopSource = nil
         isRecording = false
         isSessionBusy = false
+        // 止めた監視器が打鍵を奪い続けてはならない（タップは畳むので実効は無いが、
+        // フラグを残すと「停止済みなのに Undo キーを抑止する」状態を表現してしまう）。
+        isUndoAvailable = false
+        // **捕獲モードも畳む。** 残すと、止めた監視器が「捕獲中」を名乗り続ける
+        // （設定画面が「キーを押してください」を出したまま二度と決着しない）。
+        captureHandler = nil
+        captureState = HotkeyCaptureState()
         phase = .stopped
         lock.unlock()
 
-        if let currentTap {
-            tapController.setEnabled(currentTap, false)
-            CFMachPortInvalidate(currentTap)
+        teardown(tap: currentTap, source: source)
+        if !wasStopped { continuation.finish() }
+    }
+
+    /// タップとランループソースを捨てる。**順序は無効化 → 取り外し → invalidate。**
+    /// `stop()` と `rebind(to:)` で同じ手順を使う（片方だけ順序が違うと、
+    /// 捨てたはずのタップへコールバックが飛ぶ窓ができる）。
+    private func teardown(tap: CFMachPort?, source: CFRunLoopSource?) {
+        if let tap {
+            tapController.setEnabled(tap, false)
+            CFMachPortInvalidate(tap)
         }
         if let source {
             CFRunLoopRemoveSource(runLoop, source, .commonModes)
         }
-        if !wasStopped { continuation.finish() }
     }
 
     private static let callback: CGEventTapCallBack = { _, type, event, refcon in
@@ -326,20 +488,64 @@ public final class CGEventTapHotkeyMonitor: HotkeyMonitor, @unchecked Sendable {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
 
+        // **捕獲モードを先に見る。** ここで戻るので `HotkeyDecision.decide` を
+        // 一度も通らない＝**捕獲中に PTT も Undo も ESC の中断も発火しない。**
+        // hot path に増えたのは nil 比較 1 つだけである（2 本目のタップを立てない裁定）。
+        if case .consumed(let suppress) = handleCapture(type: type, keyCode: keyCode, flags: flags) {
+            return suppress ? nil : Unmanaged.passUnretained(event)
+        }
+
         lock.lock()
         let decision = HotkeyDecision.decide(
             type: type, keyCode: keyCode, flags: flags,
-            binding: binding, isRecording: isRecording, isSessionBusy: isSessionBusy
+            binding: binding, isRecording: isRecording, isSessionBusy: isSessionBusy,
+            undoBinding: undoBinding, isUndoAvailable: isUndoAvailable
         )
         switch decision.event {
         case .pressed: isRecording = true
         case .released, .cancelled, .interrupted: isRecording = false
-        case nil: break
+        // **Undo は録音状態を動かさない。** 録音中に Undo キーを押しても、
+        // 進行中の発話は続く（戻す対象は「直前に差し替えた発話」である）。
+        case .undoRequested, nil: break
         }
         lock.unlock()
 
         if let hotkeyEvent = decision.event { continuation.yield(hotkeyEvent) }
         return decision.suppress ? nil : Unmanaged.passUnretained(event)
+    }
+
+    /// 捕獲モードがそのイベントをどう扱ったか。
+    private enum CaptureDisposition {
+        /// 捕獲モードではない。**呼び出し側は通常の判定へ進む。**
+        case notCapturing
+        /// 捕獲モードが消費した。**通常の判定は通らない。**
+        case consumed(suppress: Bool)
+    }
+
+    /// 捕獲モードならこのイベントを消費する。
+    private func handleCapture(
+        type: CGEventType, keyCode: Int64, flags: CGEventFlags
+    ) -> CaptureDisposition {
+        let (outcome, suppress, handler): (
+            HotkeyCaptureOutcome?, Bool, (@Sendable (HotkeyCaptureOutcome) -> Void)?
+        ) = lock.withLock {
+            guard captureHandler != nil else { return (nil, false, nil) }
+            let result = captureState.consume(type: type, keyCode: keyCode, flags: flags)
+            switch result.outcome {
+            case .pending:
+                return (result.outcome, result.suppress, nil)
+            case .captured, .cancelled:
+                // **1 打鍵で閉じる。** 閉じ忘れで打鍵を食い続ける状態を構造で作らない。
+                let handler = captureHandler
+                captureHandler = nil
+                captureState = HotkeyCaptureState()
+                return (result.outcome, result.suppress, handler)
+            }
+        }
+        guard outcome != nil else { return .notCapturing }
+        // **ロックの外で配る。** 受け取り手が何をするかは監視器の関心ではない。
+        if let handler, let outcome { handler(outcome) }
+        return .consumed(suppress: suppress)
     }
 
     /// タップが無効化されたときの通知。**2 種類あり、意味が違う。**

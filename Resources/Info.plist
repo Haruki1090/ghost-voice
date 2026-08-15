@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Ghost Voice.app の Info.plist。**Scripts/make-app.sh がこのファイルをそのまま複製する**
+  （置換も生成もしない。誰が走らせても同じ物ができるようにするため）。
+
+  ## 書いていないキーにも理由がある
+
+  - NSSpeechRecognitionUsageDescription … **要らない。** SpeechAnalyzer は
+    kTCCServiceSpeechRecognition を要求しない（実測 V-14）
+  - NSAppleEventsUsageDescription … **要らない。** Apple Events でアプリを操作しない。
+    書くと「Ghost Voice が他のアプリを制御しようとしています」という無関係なダイアログの
+    余地を作るだけである
+  - アクセシビリティ / 入力監視 / キー送出 … **対応するキーが存在しない。**
+    tccd が参照する NS…UsageDescription を列挙して確かめた（app-bundle.md §6.1）。
+    NSAccessibilityUsageDescription のような名前を書いても無視されるだけである。
+    この 3 つは利用者がシステム設定で明示的に追加する形式である
+  - NSCameraUsageDescription / NSAudioCaptureUsageDescription /
+    NSMicrophoneInjectionUsageDescription / NSLocalNetworkUsageDescription … 使わない
+
+  ## CFBundleIdentifier は二度と変えないこと
+
+  署名の designated requirement に identifier として焼き込まれる。変えると
+  **TCC の許可はすべて失われ、システム設定の一覧に古い項目が残る**（app-bundle.md §4.7）。
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.haruki1090.GhostVoice</string>
+	<key>CFBundleName</key>
+	<string>Ghost Voice</string>
+	<key>CFBundleDisplayName</key>
+	<string>Ghost Voice</string>
+	<key>CFBundleExecutable</key>
+	<string>GhostVoice</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>右 Option を押している間の音声を、この Mac の中だけで文字にするために使います。音声は外部へ送信されず、ディスクにも保存されません。</string>
+</dict>
+</plist>

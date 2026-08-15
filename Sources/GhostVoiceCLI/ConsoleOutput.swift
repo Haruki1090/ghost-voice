@@ -1,9 +1,29 @@
 import Foundation
+import GhostVoiceCore
 
 /// 出力先。**差し替え口にしてあるのは検査のため。**
 /// 実体は標準出力・標準エラーだが、テストからは溜め込むものを挿す。
 public protocol ConsoleWriting: Sendable {
     func write(_ text: String)
+}
+
+extension ConsoleWriting {
+
+    /// 終了時の文言を端末へ流す。
+    ///
+    /// **文言そのものはここには無い**（`GhostVoiceCore.ShutdownAnnouncement` が持つ）。
+    /// ここが決めるのは前後の余白だけである——CLI と `.app` で文言が別々に育たないよう、
+    /// 端末向けの体裁と文言を分けてある。
+    public func announce(_ announcement: ShutdownAnnouncement) {
+        switch announcement {
+        case .waiting:
+            // 進行表示（`SessionNarration` が `\r` で行を上書きする）の途中に割り込む。
+            // **必ず行を改めてから出す。**
+            write("\n" + announcement.text + "\n")
+        case .gaveUp, .utteranceLost, .finished:
+            write(announcement.text + "\n")
+        }
+    }
 }
 
 /// 進行状況の出力先。

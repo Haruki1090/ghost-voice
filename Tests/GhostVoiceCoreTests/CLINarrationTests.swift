@@ -35,7 +35,7 @@ struct CLINarrationTests {
         #expect(line == "[metrics] finalize 70ms / refine 400ms / insert 5ms / total 475ms OK\n")
     }
 
-    /// **NFR-P6 を超えた発話が「OK」に紛れてはならない。**
+    /// **NFR-P6a を超えた発話が「OK」に紛れてはならない。**
     @Test("合計が 1000 ms を超えたら目標超過と出す")
     func idleMarksBudgetOverrun() throws {
         let sample = Metrics.Sample(
@@ -184,4 +184,67 @@ struct CLINarrationTests {
         #expect(line.hasPrefix("\r\u{1B}[K"), "消去の制御が無いと前の文字が残る")
     }
 
+}
+
+/// **CLI に `SessionNotice` の顛末が 1 行も出ていなかった**（統括の裁定で回収）。
+/// `ghost-voice` から Undo を撃つと何も起きていないように見えるのは、
+/// フェーズ 1 で潰した「無言で失敗する」と同じ形である。
+@Suite("CLI: 通知の表示（FR-7 の顛末）")
+struct CLINoticeNarrationTests {
+
+    @Test("Undo の 4 つの結末が、それぞれ端末へ出る")
+    func undoOutcomesAreAllPrinted() throws {
+        let notices: [SessionNotice] = [
+            .undone, .undoCopiedRawTextToClipboard,
+            .undoDeclined(.sourceMismatch), .undoUnavailable,
+        ]
+        let lines = try notices.map { try #require(SessionNarration.line(for: $0)) }
+        #expect(Set(lines).count == 4, "1 つでも同じなら、利用者は次に何をすべきか判らない")
+        for line in lines { #expect(line.hasSuffix("\n")) }
+    }
+
+    /// **文言は Core から来る。** CLI と HUD で別々に持たない。
+    @Test("文言は Core の翻訳器そのものである")
+    func wordingComesFromCore() throws {
+        let line = try #require(SessionNarration.line(for: .undoCopiedRawTextToClipboard))
+        let announcement = try #require(
+            SessionNoticeAnnouncement(.undoCopiedRawTextToClipboard))
+        #expect(line.contains(announcement.summary))
+        #expect(line.contains(announcement.detail))
+    }
+
+    /// **発話を失った疑いの回だけ強調する。** 毎回強調すると、本当に失った回が埋もれる。
+    @Test("喪失の疑いだけを強調する")
+    func onlyLostIsEmphasised() throws {
+        let lost = try #require(SessionNarration.line(for: .textMayHaveBeenLost))
+        let announcement = try #require(SessionNoticeAnnouncement(.textMayHaveBeenLost))
+        #expect(lost.contains("**\(announcement.summary)**"))
+
+        let undone = try #require(SessionNarration.line(for: .undone))
+        let undoneAnnouncement = try #require(SessionNoticeAnnouncement(.undone))
+        #expect(!undone.contains("**\(undoneAnnouncement.summary)**"))
+    }
+
+    @Test("整形の結末は端末にも出さない（判断は Core が持つ）")
+    func silentNoticesStaySilent() {
+        #expect(SessionNarration.line(for: .refinementApplied) == nil)
+        #expect(SessionNarration.line(for: .refinementNotApplied(nil)) == nil)
+        #expect(SessionNarration.line(for: .refinementNotApplied(.focusChanged)) != nil)
+    }
+
+    @Test("通知の列を読み切って書き出す")
+    func consumesTheWholeStream() async {
+        let (stream, continuation) = AsyncStream<SessionNotice>.makeStream()
+        let writer = CollectingWriter()
+        continuation.yield(.undone)
+        continuation.yield(.refinementApplied)  // 出さない
+        continuation.yield(.undoUnavailable)
+        continuation.finish()
+
+        await SessionNarration.consumeNotices(stream, writer: writer)
+
+        #expect(writer.text.contains("整形前のテキストに戻しました"))
+        #expect(writer.text.contains("戻せるものがありません"))
+        #expect(writer.writes.count == 2, "出さないはずの通知が出ている: \(writer.writes)")
+    }
 }

@@ -1,6 +1,60 @@
 import Testing
 import Foundation
+import Synchronization
 @testable import GhostVoiceCore
+
+/// 変更通知を記録する。
+///
+/// **通知はロックの外・書き込みを行ったスレッドから届く**ので、記録側で守る。
+private final class ChangeRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshots: [[HistoryEntry]] = []
+    private var deliveredOnMainThread: [Bool] = []
+
+    var record: @Sendable ([HistoryEntry]) -> Void {
+        { [self] entries in
+            lock.withLock {
+                snapshots.append(entries)
+                deliveredOnMainThread.append(Thread.isMainThread)
+            }
+        }
+    }
+
+    var count: Int { lock.withLock { snapshots.count } }
+    var latest: [HistoryEntry]? { lock.withLock { snapshots.last } }
+    var latestRawTexts: [String]? { latest?.map(\.rawText) }
+    var everDeliveredOnMainThread: Bool { lock.withLock { deliveredOnMainThread.contains(true) } }
+}
+
+/// ストリームの先頭 1 件を期限付きで取る。**期限を切らないと、届かない不具合が停止になる。**
+private func firstValue(
+    _ stream: AsyncStream<[HistoryEntry]>, timeout: Duration = .seconds(3)
+) async -> [HistoryEntry]? {
+    await withTaskGroup(of: [HistoryEntry]??.self, returning: [HistoryEntry]?.self) { group in
+        group.addTask {
+            for await value in stream { return value }
+            return [HistoryEntry]?.none
+        }
+        group.addTask {
+            try? await Task.sleep(for: timeout)
+            return [HistoryEntry]??.none
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first ?? nil
+    }
+}
+
+/// `Thread.isMainThread` は async 文脈から直接読めないので、同期の関数へ包む。
+@MainActor
+private func isOnMainThread() -> Bool { Thread.isMainThread }
+
+/// **MainActor から呼ぶ。** 履歴画面が居る場所と同じ文脈で待つことに意味がある。
+@MainActor
+private func removeAllFromMainActor(_ store: HistoryStore) async throws {
+    #expect(isOnMainThread(), "この検査の前提（MainActor = メインスレッド）が崩れている")
+    try await store.removeAll()
+}
 
 @Suite("HistoryStore")
 struct HistoryStoreTests {
@@ -11,11 +65,12 @@ struct HistoryStoreTests {
     private func makeEntry(
         raw: String = "生テキスト",
         refined: String? = "整形後テキスト",
-        at date: Date = Date()
+        at date: Date = Date(),
+        method: InsertionMethod = .ax
     ) -> HistoryEntry {
         HistoryEntry(
             id: UUID(), timestamp: date, rawText: raw, refinedText: refined,
-            localeIdentifier: "ja-JP", insertionMethod: .ax
+            localeIdentifier: "ja-JP", insertionMethod: method
         )
     }
 
@@ -200,7 +255,14 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("10 秒以内に整形挿入した履歴は Undo 対象になる")
+    // MARK: - undoCandidate（履歴側の述語）
+    //
+    // **`undoCandidate` は Undo（FR-7）の門ではない**（要件定義書 FR-7 の細目 / 詳細設計書 §8.3）。
+    // 自動で戻せるのは差し替えできる経路で挿入した発話だけで、その門は
+    // **メモリ上に生きている差し替えハンドル**である。以下の検査が固定しているのは
+    // 「直近・整形済み・猶予内」という履歴側の述語であって、「戻せること」ではない。
+
+    @Test("10 秒以内に整形挿入した履歴は undoCandidate に載る")
     func undoCandidateWithinWindow() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -212,7 +274,7 @@ struct HistoryStoreTests {
     }
 
     /// 猶予ちょうどは受け付けること。これが無いと `<=` と `<` の取り違えを見逃す。
-    @Test("ちょうど 10 秒前の履歴は Undo 対象になる")
+    @Test("ちょうど 10 秒前の履歴は undoCandidate に載る")
     func undoCandidateAtWindowBoundary() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -223,7 +285,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("10 秒を超えた履歴は Undo 対象にならない")
+    @Test("10 秒を超えた履歴は undoCandidate に載らない")
     func undoCandidateExpires() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -234,7 +296,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("整形していない履歴は Undo 対象にならない")
+    @Test("整形していない履歴は undoCandidate に載らない")
     func undoCandidateRequiresRefinement() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -247,7 +309,7 @@ struct HistoryStoreTests {
 
     /// 下限は 0 を含むこと。挿入直後に Undo を押した場合、記録時刻と現在時刻は
     /// ほぼ同じになる。上限側の境界テストと対になる。
-    @Test("記録時刻ちょうどの履歴は Undo 対象になる")
+    @Test("記録時刻ちょうどの履歴は undoCandidate に載る")
     func undoCandidateAtSameInstant() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -260,7 +322,7 @@ struct HistoryStoreTests {
 
     /// `history.json` は手編集でき、システムクロックが巻き戻ることもある。猶予に
     /// 下限が無いと、未来の日時を持つ履歴がいつまでも Undo 対象になり続ける。
-    @Test("未来の日時を持つ履歴は Undo 対象にならない")
+    @Test("未来の日時を持つ履歴は undoCandidate に載らない")
     func undoCandidateRejectsFutureTimestamp() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -271,7 +333,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("履歴が空なら Undo 対象は無い")
+    @Test("履歴が空なら undoCandidate は無い")
     func undoCandidateWithoutEntries() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -281,7 +343,7 @@ struct HistoryStoreTests {
 
     /// Undo が戻すのは直前に挿入した文字列だけ。直近が対象外のときに 1 つ前まで
     /// 遡ると、ユーザーが見ていない箇所の文字列を書き換えることになる。
-    @Test("直近が整形なしなら、さらに前の整形済み履歴は Undo 対象にならない")
+    @Test("直近が整形なしなら、さらに前の整形済み履歴は undoCandidate に載らない")
     func undoCandidateDoesNotLookPastUnrefinedLatest() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -293,7 +355,7 @@ struct HistoryStoreTests {
         }
     }
 
-    @Test("直近が猶予切れなら、さらに前の新しい履歴は Undo 対象にならない")
+    @Test("直近が猶予切れなら、さらに前の新しい履歴は undoCandidate に載らない")
     func undoCandidateDoesNotLookPastExpiredLatest() throws {
         try withTempRoot { root in
             let store = HistoryStore(rootURL: root, limit: 50)
@@ -302,6 +364,376 @@ struct HistoryStoreTests {
             try store.append(makeEntry(raw: "直近の発話", at: now.addingTimeInterval(-30)))
 
             #expect(store.undoCandidate(now: now) == nil)
+        }
+    }
+
+    /// **持ち越し項目 16。挿入経路を見ないと、挿入していない発話まで候補になる。**
+    ///
+    /// とくに `.clipboardOnly` は**どこにも挿入していない。**
+    /// そこへ Undo を撃つと、挿入していないテキストを消そうとして**別の何かを消す。**
+    @Test(
+        "挿入していない経路の履歴は undoCandidate に載らない",
+        arguments: [InsertionMethod.pasteboard, .clipboardOnly, .notInserted]
+    )
+    func undoCandidateExcludesNonReplaceableMethods(method: InsertionMethod) throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let now = Date()
+            try store.append(makeEntry(at: now, method: method))
+
+            #expect(store.undoCandidate(now: now) == nil, "\(method) が候補になっている")
+        }
+    }
+
+    @Test("差し替えできる経路（.ax）の履歴だけが undoCandidate に載る")
+    func undoCandidateAcceptsTheAXMethod() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let now = Date()
+            try store.append(makeEntry(at: now, method: .ax))
+
+            #expect(store.undoCandidate(now: now) != nil)
+        }
+    }
+
+    // MARK: - update（FR-5(a) が整形結果を後から入れる）
+
+    @Test("後から整形結果を入れられる")
+    func updatesRefinedTextLater() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let entry = makeEntry(raw: "生テキスト", refined: nil)
+            try store.append(entry)
+
+            #expect(try store.update(id: entry.id, refinedText: "整形後"))
+            #expect(store.entries.first?.refinedText == "整形後")
+            #expect(store.entries.first?.rawText == "生テキスト", "生テキストを変えてはならない")
+            #expect(store.entries.first?.id == entry.id, "別の項目になっている")
+        }
+    }
+
+    @Test("更新はファイルにも反映される")
+    func updatePersists() throws {
+        try withTempRoot { root in
+            let entry = makeEntry(refined: nil)
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(entry)
+            try store.update(id: entry.id, refinedText: "整形後")
+
+            let reloaded = HistoryStore(rootURL: root, limit: 50)
+            #expect(reloaded.entries.first?.refinedText == "整形後")
+        }
+    }
+
+    /// 上限で押し出された後に差し替えが成功した場合。**何も書かず false を返す。**
+    @Test("存在しない id の更新は何も変えず false を返す")
+    func updateOfAMissingEntryChangesNothing() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(makeEntry(refined: nil))
+
+            #expect(try store.update(id: UUID(), refinedText: "整形後") == false)
+            #expect(store.entries.first?.refinedText == nil)
+        }
+    }
+
+    @Test("更新も購読者へ届く")
+    func updateNotifiesObservers() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let entry = makeEntry(refined: nil)
+            try store.append(entry)
+
+            let received = Mutex<[[HistoryEntry]]>([])
+            let subscription = store.observe { snapshot in
+                received.withLock { $0.append(snapshot) }
+            }
+            defer { subscription.cancel() }
+
+            try store.update(id: entry.id, refinedText: "整形後")
+            #expect(received.withLock { $0.count } == 1)
+            #expect(received.withLock { $0.first?.first?.refinedText } == "整形後")
+        }
+    }
+
+    @Test("同じ整形結果での更新は通知しない")
+    func updateWithTheSameValueIsANoOp() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let entry = makeEntry(refined: "整形後")
+            try store.append(entry)
+
+            let received = Mutex<Int>(0)
+            let subscription = store.observe { _ in received.withLock { $0 += 1 } }
+            defer { subscription.cancel() }
+
+            #expect(try store.update(id: entry.id, refinedText: "整形後") == false)
+            #expect(received.withLock { $0 } == 0)
+        }
+    }
+
+    // MARK: - 変更通知（欠落 6）
+
+    @Test("append が購読者へ届く")
+    func appendNotifiesObserver() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let recorder = ChangeRecorder()
+            let subscription = store.observe(recorder.record)
+
+            try store.append(makeEntry(raw: "1つ目"))
+            try store.append(makeEntry(raw: "2つ目"))
+
+            #expect(recorder.count == 2)
+            #expect(recorder.latestRawTexts == ["2つ目", "1つ目"])
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    /// **これが欠落 6 の要**。HUD・履歴一覧・設定画面が同時に見るので、
+    /// `AsyncStream` のような単一消費者の口では足りない（A-4 の罠）。
+    @Test("複数の購読者が同じ変更を受け取る")
+    func multipleObserversAllReceiveChanges() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let first = ChangeRecorder()
+            let second = ChangeRecorder()
+            let subscriptions = [store.observe(first.record), store.observe(second.record)]
+
+            try store.append(makeEntry(raw: "両方へ"))
+
+            #expect(first.latestRawTexts == ["両方へ"])
+            #expect(second.latestRawTexts == ["両方へ"])
+            withExtendedLifetime(subscriptions) {}
+        }
+    }
+
+    @Test("購読を解除すると通知が止まる")
+    func cancelledSubscriptionStopsReceiving() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let recorder = ChangeRecorder()
+            let subscription = store.observe(recorder.record)
+
+            try store.append(makeEntry(raw: "届く"))
+            subscription.cancel()
+            try store.append(makeEntry(raw: "届かない"))
+
+            #expect(recorder.count == 1)
+            #expect(recorder.latestRawTexts == ["届く"])
+        }
+    }
+
+    /// **通知はロックの外で配る。** 履歴一覧の再読込は `entries` を読むのが自然なので、
+    /// ロックを保持したまま呼ぶと `NSLock` は非再帰なので自己デッドロックする。
+    @Test("購読者は通知の中から entries を読める")
+    func observerMayReadEntriesFromHandler() throws {
+        try withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let seen = ChangeRecorder()
+            let subscription = store.observe { _ in seen.record(store.entries) }
+
+            try store.append(makeEntry(raw: "読み直す"))
+
+            #expect(seen.latestRawTexts == ["読み直す"])
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    @Test("changes() は呼ぶたびに独立したストリームを返す")
+    func changesReturnsIndependentStreams() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let first = store.changes()
+            let second = store.changes()
+
+            try store.append(makeEntry(raw: "配る"))
+
+            #expect(await firstValue(first)?.map(\.rawText) == ["配る"])
+            #expect(await firstValue(second)?.map(\.rawText) == ["配る"])
+        }
+    }
+
+    // MARK: - 削除と全消去（欠落 7 / FR-9）
+
+    @Test("id を指定して削除でき、ファイルにも反映される")
+    func removesEntryByID() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let doomed = makeEntry(raw: "消す")
+            try store.append(makeEntry(raw: "残る"))
+            try store.append(doomed)
+
+            #expect(try await store.remove(id: doomed.id))
+            #expect(store.entries.map(\.rawText) == ["残る"])
+            #expect(HistoryStore(rootURL: root, limit: 50).entries.map(\.rawText) == ["残る"])
+        }
+    }
+
+    /// 見つからない削除で保存し直すと、壊れたファイルの退避だけが走る等の副作用が出る。
+    /// **何も変えないこと**を明示的に固定する。
+    @Test("存在しない id の削除は何も変えず false を返す")
+    func removingUnknownIDChangesNothing() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let recorder = ChangeRecorder()
+            try store.append(makeEntry(raw: "残る"))
+            let subscription = store.observe(recorder.record)
+
+            #expect(try await store.remove(id: UUID()) == false)
+            #expect(store.entries.map(\.rawText) == ["残る"])
+            #expect(recorder.count == 0, "何も変わっていないのに通知している")
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    @Test("複数の id をまとめて削除できる")
+    func removesMultipleEntries() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let a = makeEntry(raw: "a")
+            let b = makeEntry(raw: "b")
+            let c = makeEntry(raw: "c")
+            for entry in [a, b, c] { try store.append(entry) }
+
+            #expect(try await store.remove(ids: [a.id, c.id]) == 2)
+            #expect(store.entries.map(\.rawText) == ["b"])
+        }
+    }
+
+    @Test("全消去できる")
+    func removesAllEntries() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(makeEntry(raw: "1"))
+            try store.append(makeEntry(raw: "2"))
+
+            try await store.removeAll()
+
+            #expect(store.entries.isEmpty)
+            #expect(HistoryStore(rootURL: root, limit: 50).entries.isEmpty)
+            #expect(store.undoCandidate() == nil, "消したのに undoCandidate が残っている")
+        }
+    }
+
+    @Test("削除と全消去も購読者へ届く")
+    func removalNotifiesObservers() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            let entry = makeEntry(raw: "消す")
+            try store.append(entry)
+            try store.append(makeEntry(raw: "残る"))
+
+            let recorder = ChangeRecorder()
+            let subscription = store.observe(recorder.record)
+
+            _ = try await store.remove(id: entry.id)
+            #expect(recorder.latestRawTexts == ["残る"])
+
+            try await store.removeAll()
+            #expect(recorder.latestRawTexts == [])
+            #expect(recorder.count == 2)
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    /// **A-4 の罠をそのまま UI の事故にしないための契約。** 履歴画面は MainActor に居る。
+    /// 削除系は同期 I/O を含むので、Core 側が背景へ逃がす。
+    @Test("削除系はメインスレッドを塞がない")
+    func removalRunsOffTheMainThread() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(makeEntry(raw: "消す"))
+
+            let recorder = ChangeRecorder()
+            let subscription = store.observe(recorder.record)
+            try await removeAllFromMainActor(store)
+
+            #expect(recorder.count == 1)
+            #expect(
+                !recorder.everDeliveredOnMainThread,
+                "同期のファイル I/O がメインスレッドで走っている")
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    // MARK: - 上限の実行時変更（欠落 10）
+
+    @Test("上限を下げると即座に切り詰められ、ファイルにも反映される")
+    func loweringLimitTrimsImmediately() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            for i in 1...5 { try store.append(makeEntry(raw: "\(i)")) }
+
+            try await store.setLimit(2)
+
+            #expect(store.limit == 2)
+            #expect(store.entries.map(\.rawText) == ["5", "4"])
+            #expect(HistoryStore(rootURL: root, limit: 50).entries.map(\.rawText) == ["5", "4"])
+        }
+    }
+
+    @Test("上限を下げたあとの append は新しい上限で切り詰める")
+    func appendRespectsUpdatedLimit() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try await store.setLimit(2)
+            for i in 1...4 { try store.append(makeEntry(raw: "\(i)")) }
+
+            #expect(store.entries.map(\.rawText) == ["4", "3"])
+        }
+    }
+
+    @Test("上限を上げても既存の履歴は消えない")
+    func raisingLimitKeepsEntries() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 2)
+            for i in 1...2 { try store.append(makeEntry(raw: "\(i)")) }
+
+            try await store.setLimit(10)
+
+            #expect(store.limit == 10)
+            #expect(store.entries.map(\.rawText) == ["2", "1"])
+        }
+    }
+
+    /// 切り詰めが起きない上限変更で通知すると、履歴一覧が無駄に再描画される。
+    @Test("切り詰めが起きない上限変更では通知しない")
+    func limitChangeWithoutTrimDoesNotNotify() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(makeEntry(raw: "1"))
+            let recorder = ChangeRecorder()
+            let subscription = store.observe(recorder.record)
+
+            try await store.setLimit(10)
+
+            #expect(recorder.count == 0)
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    /// 負数の扱いは `init` と同じ規則でなければならない。片方だけ直すと、
+    /// 設定画面から負数を入れたときにだけ履歴が全部消える、という差が生まれる。
+    @Test("負の上限は既定値へフォールバックする（init と同じ規則）")
+    func negativeLimitFallsBackToDefault() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try await store.setLimit(-1)
+            #expect(store.limit == Settings.default.historyLimit)
+        }
+    }
+
+    @Test("上限 0 への変更は尊重され、履歴を空にする")
+    func zeroLimitClearsHistory() async throws {
+        try await withTempRoot { root in
+            let store = HistoryStore(rootURL: root, limit: 50)
+            try store.append(makeEntry(raw: "消える"))
+
+            try await store.setLimit(0)
+
+            #expect(store.limit == 0)
+            #expect(store.entries.isEmpty)
         }
     }
 }

@@ -21,31 +21,60 @@ import Foundation
 ///   ├─ 成功 → .inserted(.pasteboard)
 ///   └─ 失敗 → クリップボードへ残置 → .inserted(.clipboardOnly)
 /// ```
-public struct CompositeInserter: TextInserting {
+public struct CompositeInserter: AnchoringTextInserting {
 
     private let primary: any PrimaryInserting
     private let fallback: any PrimaryInserting
     private let lastResort: any ClipboardLeaving
     private let isSecureInputEnabled: @Sendable () -> Bool
 
+    /// 挿入の世代。**差し替え器と共有する。**
+    ///
+    /// 新しい挿入が始まった時点で、保留中の差し替えを失効させるために持つ
+    /// （設計 opus §3.3「直列性と後始末」）。
+    public let epoch: InsertionEpoch
+
     /// - Parameters:
     ///   - primary: 一段目。成功すると `.ax` を報告する。
     ///   - fallback: 二段目。成功すると `.pasteboard` を報告する。
     ///   - lastResort: 最後の砦。**省略できないようにしてある**（下記）。
+    ///   - epoch: 挿入の世代。`TextReplacer` へ同じものを渡すこと。
     ///   - isSecureInputEnabled: secure input の判定。既定は実 API。
     public init(
         primary: any PrimaryInserting,
         fallback: any PrimaryInserting,
         lastResort: any ClipboardLeaving,
+        epoch: InsertionEpoch = InsertionEpoch(),
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) {
         self.primary = primary
         self.fallback = fallback
         self.lastResort = lastResort
+        self.epoch = epoch
         self.isSecureInputEnabled = isSecureInputEnabled
     }
 
-    public func insert(_ text: String) async -> InsertionOutcome {
+    /// **挿入の前に、この発話を (a) の分岐（生テキスト先行挿入）へ載せてよいかを答える。**
+    ///
+    /// 一段目が錨を作れる見込みのときだけ真になる。**二段目（Pasteboard 経路）は
+    /// 常に偽である**——貼り付いたことすら確認できず、範囲も持てない（設計 opus §2.2 の C-1）。
+    ///
+    /// - Important: **secure input 中は偽を返す。** 有効なら挿入そのものを拒否するので、
+    ///   (a) の分岐へ載せる意味が無い。**判定は実測 0.000 ms なので毎回呼んでよい。**
+    /// - Important: **副作用を持たない。** とくに世代（`InsertionEpoch`）を進めない——
+    ///   進めるのは実際に挿入するときだけである（進めると、この判定を呼ぶだけで
+    ///   前の発話の保留中の差し替えが消える）。
+    public func canCaptureAnchor() -> Bool {
+        guard !isSecureInputEnabled() else { return false }
+        return primary.canCaptureAnchor()
+    }
+
+    /// テキストを挿入し、経路と**差し替えの錨**を返す。
+    ///
+    /// - Important: **呼ばれた時点で、前の発話の差し替えは失効する**（世代が進む）。
+    ///   拒否された場合も同じ。**失効しても生テキストは欄に残る**ので、
+    ///   縮退の向きは常に安全側である。
+    public func insertCapturingAnchor(_ text: String) async -> AnchoredInsertion {
         // **secure input が有効な間は、どの経路も試さずに拒否する。**
         //
         // secure input が有効なのは、ユーザーがパスワードを入力しているときである。
@@ -66,10 +95,31 @@ public struct CompositeInserter: TextInserting {
         //
         // 判定は挿入のたびに行う。ユーザーはパスワード欄に出入りするので、
         // 起動時の値を握っていては意味が無い（実測 0.000 ms なので毎回呼べる）。
-        guard !isSecureInputEnabled() else { return .refusedSecureInput }
+        //
+        // **世代を進めるのは判定より前。** 拒否された場合も前の錨を失効させる。
+        // 失効の縮退先は「差し替えない」＝生テキストが欄に残る、なので安全側である。
+        epoch.advance()
 
-        if primary.canInsert(), await primary.tryInsert(text) { return .inserted(.ax) }
-        if fallback.canInsert(), await fallback.tryInsert(text) { return .inserted(.pasteboard) }
+        guard !isSecureInputEnabled() else {
+            return AnchoredInsertion(outcome: .refusedSecureInput, anchor: nil)
+        }
+
+        if primary.canInsert() {
+            let attempt = await primary.tryInsert(text)
+            if attempt.didInsert {
+                return AnchoredInsertion(outcome: .inserted(.ax), anchor: attempt.anchor)
+            }
+        }
+        if fallback.canInsert() {
+            let attempt = await fallback.tryInsert(text)
+            if attempt.didInsert {
+                // **二段目の錨は受け取らない**（設計 opus §2.2 の C-1）。
+                // Pasteboard 経路は範囲を持てず、貼り付いたことすら確認できない
+                // （`CGEvent.post` は `Void`）。ここを通すと、位置の算術だけを頼りに
+                // 他アプリのテキストを書き換える経路ができる。
+                return AnchoredInsertion(outcome: .inserted(.pasteboard), anchor: nil)
+            }
+        }
 
         // **`.clipboardOnly` を返す前に、実際にクリップボードへ残す。**
         //
@@ -77,8 +127,15 @@ public struct CompositeInserter: TextInserting {
         // つまり Pasteboard 経路がクリップボードへ書く機会が無い。ここを塞がないと
         // 「クリップボードへ残した」と報告しながら発話がどこにも無い状態になる。
         // 音声は再現できないので、これはこの製品で最も重い失敗である（基本設計書 §7）。
-        lastResort.leave(text)
-        return .inserted(.clipboardOnly)
+        //
+        // **戻り値を必ず見る。** `.inserted(.clipboardOnly)` は「クリップボードへ残した」
+        // という主張であって（`TextInserting` の doc）、置けていないのにそう答えると
+        // 利用者は「⌘V で貼れます」に従って取りに行き、そこには何も無い。
+        // **履歴書き込みも失敗すれば、嘘を言ったうえで発話が完全に消える**（最終レビュー A-2）。
+        guard lastResort.leave(text) else {
+            return AnchoredInsertion(outcome: .failedEverywhere, anchor: nil)
+        }
+        return AnchoredInsertion(outcome: .inserted(.clipboardOnly), anchor: nil)
     }
 
     /// 本番の組み合わせ。
@@ -91,19 +148,111 @@ public struct CompositeInserter: TextInserting {
     ///   **実測 35 ms は下限であり上限ではない**（`PasteboardInserter.defaultRestoreDelay`
     ///   の留保 2 つ）。相手が重いアプリで貼り付けが空振りするなら、ここを延ばして試す。
     public static func system(
-        accessibility: any AccessibilityProbing = SystemAccessibility(),
+        accessibility: any ReplacementCapableAccessibility = SystemAccessibility(),
         pasteboard: NSPasteboard = .general,
         sender: any PasteShortcutSending = SystemPasteShortcutSender(),
         restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
+        epoch: InsertionEpoch = InsertionEpoch(),
+        ownProcessIdentifier: pid_t = getpid(),
+        frontmostProcessIdentifier: @escaping @Sendable () -> pid_t? = {
+            SystemAccessibility.frontmostProcessIdentifier()
+        },
         isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
     ) -> CompositeInserter {
         let pasteboardInserter = PasteboardInserter(
-            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay)
+            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay,
+            ownProcessIdentifier: ownProcessIdentifier,
+            frontmostProcessIdentifier: frontmostProcessIdentifier)
         return CompositeInserter(
-            primary: AccessibilityInserter(accessibility: accessibility),
+            primary: AccessibilityInserter(
+                accessibility: accessibility, ownProcessIdentifier: ownProcessIdentifier,
+                epoch: epoch),
             fallback: pasteboardInserter,
             lastResort: pasteboardInserter,
+            epoch: epoch,
             isSecureInputEnabled: isSecureInputEnabled
         )
+    }
+}
+
+/// 挿入器と差し替え器の組。**この 2 つは必ず一緒に作る。**
+///
+/// 別々に作ると次の 2 つを間違える。どちらも黙って壊れる形の間違いである。
+///
+/// - **世代（`InsertionEpoch`）を共有しないと**、差し替えが常に「失効した」と判定され、
+///   FR-5(a) も FR-7 も一度も効かない（症状は「整形が反映されない」だけ）。
+/// - **クリップボードを共有しないと**、喪失を検知したときの退避先が
+///   ユーザーには見えない `NSPasteboard` になる（症状は「発話が消えた」）。
+public struct InsertionStack: Sendable {
+    public let inserter: CompositeInserter
+    public let replacer: TextReplacer
+    /// **この組が使っているクリップボードそのもの。**
+    ///
+    /// 自動で戻せない発話の生テキストを取り出す先（要件定義書 FR-7 の細目 3 行目）が要る。
+    /// **別の `NSPasteboard` を掴んだものを渡してはならない**——取り出したテキストが
+    /// 利用者には見えない場所へ行く（`TextReplacer.init` の注記と同じ理由）。
+    public let clipboard: any ClipboardLeaving
+
+    public init(
+        inserter: CompositeInserter, replacer: TextReplacer, clipboard: any ClipboardLeaving
+    ) {
+        self.inserter = inserter
+        self.replacer = replacer
+        self.clipboard = clipboard
+    }
+}
+
+extension CompositeInserter {
+    /// 本番の組み立て。**挿入と差し替えを、同じ世代・同じクリップボードで組む。**
+    ///
+    /// ```swift
+    /// let stack = CompositeInserter.systemStack(announcer: hud)
+    /// let inserted = await stack.inserter.insertCapturingAnchor(rawText)
+    /// // …整形を待って…
+    /// if let anchor = inserted.anchor { _ = stack.replacer.replace(anchor, with: refined) }
+    /// ```
+    ///
+    /// - Parameter announcer: 喪失を検知したときに利用者へ告げる口（HUD）。
+    ///   省略すると何も告げない。**告げなくても発話はクリップボードと履歴にある。**
+    public static func systemStack(
+        accessibility: any ReplacementCapableAccessibility = SystemAccessibility(),
+        pasteboard: NSPasteboard = .general,
+        sender: any PasteShortcutSending = SystemPasteShortcutSender(),
+        restoreDelay: Duration = PasteboardInserter.defaultRestoreDelay,
+        announcer: any ReplacementAnnouncing = SilentAnnouncer(),
+        ownProcessIdentifier: pid_t = getpid(),
+        frontmostProcessIdentifier: @escaping @Sendable () -> pid_t? = {
+            SystemAccessibility.frontmostProcessIdentifier()
+        },
+        isSecureInputEnabled: @escaping @Sendable () -> Bool = { IsSecureEventInputEnabled() }
+    ) -> InsertionStack {
+        let epoch = InsertionEpoch()
+        // **自プロセスの判定は両段へ渡す。** 一段目（AX）だけに掛けていた頃は、
+        // 設定画面を開いたまま発話すると二段目の ⌘V が自分の窓へ飛んだ
+        // （最終レビュー 視点1 の B-1 / 視点3 の指摘 1）。
+        let pasteboardInserter = PasteboardInserter(
+            pasteboard: pasteboard, sender: sender, restoreDelay: restoreDelay,
+            ownProcessIdentifier: ownProcessIdentifier,
+            frontmostProcessIdentifier: frontmostProcessIdentifier)
+        let inserter = CompositeInserter(
+            primary: AccessibilityInserter(
+                accessibility: accessibility, ownProcessIdentifier: ownProcessIdentifier,
+                epoch: epoch),
+            fallback: pasteboardInserter,
+            lastResort: pasteboardInserter,
+            epoch: epoch,
+            isSecureInputEnabled: isSecureInputEnabled
+        )
+        let replacer = TextReplacer(
+            accessibility: accessibility,
+            // **挿入器と同じ `NSPasteboard` を掴んだ砦を渡す。**
+            clipboard: pasteboardInserter,
+            announcer: announcer,
+            epoch: epoch,
+            ownProcessIdentifier: ownProcessIdentifier,
+            isSecureInputEnabled: isSecureInputEnabled
+        )
+        return InsertionStack(
+            inserter: inserter, replacer: replacer, clipboard: pasteboardInserter)
     }
 }

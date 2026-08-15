@@ -76,17 +76,46 @@ public final class AtomicJSONFile<T: Codable & Sendable>: @unchecked Sendable {
     ///   呼んでいる場合だけ。退避の要否は読み込み結果から決まるので、一度も読まずに
     ///   書いた呼び出し側は、破損ファイルを退避せずに上書きする（初期値は「退避不要」）。
     ///   ストアは init で必ず読み込んでからキャッシュを持つ形にすること。
+    /// - Important: **権限を明示する**（ディレクトリ 0700 / ファイル 0600）。
+    ///   umask 任せにしていた頃、実機の `history.json` は 0644 だった。
+    ///   **いま安全なのは親ディレクトリ（`~/Library/Application Support`）が 700 だから
+    ///   であって、このコードが守っているからではない。** 保存先は `init(rootURL:)` で
+    ///   差し替えられるので、`~/Library` の外へ置いた瞬間に保護が消える
+    ///   （最終レビュー 視点5 の P-3）。`history.json` には認識テキストが平文で入る。
     public func save(_ value: T) throws {
         try lock.withLock {
             if needsQuarantine {
                 try quarantineWithoutLocking()
                 needsQuarantine = false
             }
+            let directory = url.deletingLastPathComponent()
             try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
             try Self.makeEncoder().encode(value).write(to: url, options: .atomic)
+            // **`.atomic` は書き込みのたびに新しい実体へ差し替える**ので、
+            // 権限も毎回付け直す（`createDirectory` の attributes は既存のディレクトリには効かない）。
+            try Self.restrict(url)
+            try Self.restrict(directory)
+        }
+    }
+
+    /// **退避したファイルを消す。**
+    ///
+    /// 中身は**利用者の発話そのもの**である（`history.json` には認識テキストが平文で入る）。
+    /// 「履歴を全部消す」を押したのに退避先が残っていると、
+    /// **利用者が消したつもりのテキストがディスクに残り続ける**
+    /// （最終レビュー 視点5 の P-2）。
+    ///
+    /// - Important: 消す判断は呼び出し側が持つ。ここは「言われたら消す」だけである。
+    /// - Note: 退避が無ければ何もしない。**二度呼んでも安全。**
+    public func removeQuarantinedCopy() throws {
+        try lock.withLock {
+            let destination = Self.quarantineURL(for: url)
+            guard FileManager.default.fileExists(atPath: destination.path) else { return }
+            try FileManager.default.removeItem(at: destination)
         }
     }
 
@@ -107,11 +136,33 @@ public final class AtomicJSONFile<T: Codable & Sendable>: @unchecked Sendable {
     private func quarantineWithoutLocking() throws {
         let manager = FileManager.default
         guard manager.fileExists(atPath: url.path) else { return }
-        let destination = url.appendingPathExtension("corrupt")
+        let destination = Self.quarantineURL(for: url)
         if manager.fileExists(atPath: destination.path) {
             try manager.removeItem(at: destination)
         }
         try manager.moveItem(at: url, to: destination)
+        // **退避先の中身は発話そのものである。** 元のファイルの権限を引き継ぐので、
+        // 手編集などで緩くなっていたらここで締め直す。
+        try Self.restrict(destination)
+    }
+
+    /// 退避先。**1 スロットだけ。**
+    static func quarantineURL(for url: URL) -> URL {
+        url.appendingPathExtension("corrupt")
+    }
+
+    /// 本人だけが読み書きできる形にする。
+    ///
+    /// ディレクトリは 0700、ファイルは 0600。**置き場所に依存せず閉じる**ためで、
+    /// 親ディレクトリの権限を当てにしない。
+    private static func restrict(_ url: URL) throws {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return
+        }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: isDirectory.boolValue ? 0o700 : 0o600],
+            ofItemAtPath: url.path)
     }
 
     /// 設定・辞書・履歴のいずれも人間が読み書きできること（詳細設計書 §9.1）。

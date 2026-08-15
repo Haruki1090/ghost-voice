@@ -119,8 +119,22 @@ struct AccessibilityInserterInsertionTests {
             processIdentifier: 424_242, acceptsWrite: true
         ))
 
-        #expect(await inserter(fake).tryInsert("来週までに要件定義を完了させます。"))
+        #expect(await inserter(fake).tryInsert("来週までに要件定義を完了させます。").didInsert)
         #expect(fake.calls.writtenTexts == ["来週までに要件定義を完了させます。"])
+    }
+
+    /// **錨が取れなくても挿入は成功である。** 差し替えを諦めるだけで、テキストは入っている。
+    /// ここを `.failed` にすると、入ったテキストの上に Pasteboard 経路が二重に貼る。
+    @Test("範囲を読めない相手でも挿入そのものは成功する（錨だけが nil になる）")
+    func insertionSucceedsWithoutAnchor() async {
+        let fake = FakeAccessibility(focused: FakeAccessibility.Element(
+            role: kAXTextAreaRole as String, isSelectedTextSettable: true,
+            processIdentifier: 424_242, acceptsWrite: true
+        ))
+
+        let attempt = await inserter(fake).tryInsert("テキスト")
+        #expect(attempt.didInsert)
+        #expect(attempt.anchor == nil, "範囲が読めないのに錨を作っている")
     }
 
     @Test("書き込みが拒否されたら失敗を返す")
@@ -129,13 +143,13 @@ struct AccessibilityInserterInsertionTests {
             role: kAXTextAreaRole as String, isSelectedTextSettable: true,
             processIdentifier: 424_242, acceptsWrite: false
         ))
-        #expect(await inserter(fake).tryInsert("テキスト") == false)
+        #expect(await inserter(fake).tryInsert("テキスト").didInsert == false)
     }
 
     @Test("フォーカス要素が取れなければ書き込まずに失敗を返す")
     func failsWithoutFocus() async {
         let fake = FakeAccessibility(focused: nil)
-        #expect(await inserter(fake).tryInsert("テキスト") == false)
+        #expect(await inserter(fake).tryInsert("テキスト").didInsert == false)
         #expect(fake.calls.writtenTexts.isEmpty)
     }
 
@@ -149,7 +163,7 @@ struct AccessibilityInserterInsertionTests {
             processIdentifier: getpid(), acceptsWrite: true
         ))
 
-        #expect(await inserter(fake).tryInsert("テキスト") == false)
+        #expect(await inserter(fake).tryInsert("テキスト").didInsert == false)
         #expect(fake.calls.writtenTexts.isEmpty, "自プロセスへ書き込んでいる")
     }
 }

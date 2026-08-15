@@ -8,6 +8,12 @@
 
 **Tech Stack:** Swift 6.3 / swift-tools-version 6.3 / swift-testing / macOS 26 / `Speech`（SpeechAnalyzer）/ `FoundationModels` / `ApplicationServices`（AXUIElement）/ `CoreGraphics`（CGEventTap）/ `AVFAudio`
 
+> **この計画は完了済みのフェーズ 1 の記録である。要件はこの後に変わった。**
+> 2026-08-14 の裁定（要件定義書 §2.8.6）で **FR-5 / FR-7 / NFR-P6 / NFR-V3 が書き換わり**、
+> **NFR-P6 は NFR-P6a / NFR-P6b へ分割された。** 本文中の
+> 「キー解放 → 挿入完了 1000 ms（NFR-P6）」「Undo は整形済み履歴を戻す」といった記述は
+> **当時のものである。** 現在の正本は下の 3 冊であり、**本計画を根拠に実装してはならない。**
+
 **Spec:**
 - [docs/01-requirements.md](../../01-requirements.md)
 - [docs/02-architecture.md](../../02-architecture.md)
@@ -2060,6 +2066,9 @@ import CoreGraphics
 public struct PasteboardInserter: PrimaryInserting {
 
     /// ⌘V 送出から復元までの待ち時間。短すぎると貼付前に復元してしまう。
+    /// 【フェーズ 2 の注記】この 120 ms はフェーズ 1 時点の値である。
+    /// V-3（2026-08-14 / 実機）で不足と判明し、既定は 300 ms
+    /// （`PasteboardInserter.defaultRestoreDelay`）へ引き上げられた。詳細設計書 §6.3。
     static let restoreDelay: Duration = .milliseconds(120)
 
     private static let vKeyCode: CGKeyCode = 0x09
@@ -2964,7 +2973,11 @@ cat ~/Library/Application\ Support/GhostVoice/history.json | grep insertionMetho
 | Notion | | |
 | ターミナル | | |
 
-`clipboardOnly` が出たアプリは、`PasteboardInserter.restoreDelay`（既定 120 ms）を延ばして再試行する。
+`clipboardOnly` が出たアプリは、`PasteboardInserter.restoreDelay` を延ばして再試行する。
+
+> **【フェーズ 2 の注記】** ここに書いてあった「既定 120 ms」は現在の既定ではない。
+> **現在の既定は 300 ms**（`PasteboardInserter.defaultRestoreDelay`）で、
+> 120 ms は V-3（2026-08-14 / 実機）で不足と判明して棄却された値である。詳細設計書 §6.3。
 
 - [ ] **Step 5: 性能を確認する**
 

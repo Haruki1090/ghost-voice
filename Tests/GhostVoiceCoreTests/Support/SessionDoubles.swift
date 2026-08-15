@@ -17,10 +17,10 @@ final class CallOrder: Sendable {
 
 /// 認識器のテスト代役。
 ///
-/// **`.final` の配信と `finish()` の復帰を引き離せるようにしてある。** 実測では
-/// `.final` が `finish()` の復帰より 5〜48 ms 早く届く（詳細設計書 §10 / V-2）ので、
-/// 後段が `finish()` を待つ実装になっていないことを検査するには、この 2 つを
-/// 別々の時刻に置ける代役が要る。`finishDelay` がその隙間を作る。
+/// **`.final` の配信・結果ストリームの終端・`finish()` の復帰を、それぞれ別の時刻に
+/// 置けるようにしてある。** 後段が待つのは**終端**であり（V-12 の修正）、
+/// 復帰ではないことを検査するには 3 つを引き離せる代役が要る。
+/// `finishDelay` と `endsStreamBeforeReturning` がその隙間を作る。
 final class StubTranscriber: Transcribing, @unchecked Sendable {
 
     struct Script: Sendable {
@@ -43,9 +43,27 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
         ///
         /// **`phase = .recording` は立っているのに、まだ `emit` していない窓**を
         /// テストから作るために要る（`startRecording` は `begin()` を待ってから
-        /// `emit(.recording(...))` する）。実機では `begin()` の費用がこの窓で、
-        /// 起動後の最初の 1 発話は実測 44〜540 ms かかる（詳細設計書 §10）。
+        /// `emit(.recording(...))` する）。実機では `begin()` の費用がこの窓である
+        /// （起動時の捨て往復を入れた後は 中央値 1.0〜3.0 ms。詳細設計書 §10）。
         var beginDelay: Duration = .zero
+        /// **キー解放後に届く 2 件目の確定**（V-12）。nil なら 1 件だけ。
+        ///
+        /// 実機の肉声ではこれが起きて末尾 約 38 字が失われた（要件定義書 §2.8.4）。
+        /// 合成音声 103 秒では起きなかったので、**実音声に頼る検査では駆動できない。**
+        var secondFinalText: String?
+        /// 1 件目の確定から `secondFinalText` を流すまでの間隔。
+        ///
+        /// **0 にしてはならない。** 0 だと 2 件目が「1 件目で解けた待ちが後段へ
+        /// 戻る前」に積まれてしまい、**欠陥のある実装でもたまたま拾えてしまう。**
+        /// 後段が確実に `latestFinal` を読み終える程度に離す。
+        var secondFinalDelay: Duration = .zero
+        /// 結果ストリームを `finish()` が返るより**前**に終端するか。
+        ///
+        /// 実機の順序はこちらである（`finish()` は入力を閉じてから
+        /// `finalizeAndFinishThroughEndOfInput()` を待つ。§4.3.1）。
+        /// **後段が「`finish()` の復帰」ではなく「ストリームの終端」で進むこと**を
+        /// 検査するには、この 2 つを別々の時刻に置ける代役が要る。
+        var endsStreamBeforeReturning = false
     }
 
     private let script: Script
@@ -131,17 +149,30 @@ final class StubTranscriber: Transcribing, @unchecked Sendable {
     }
 
     func finish() async throws {
+        order?.record("transcriber.finish")
         let continuation = state.withLock { state -> AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation? in
             state.finishCount += 1
             state.fedFramesAtFinish = state.fedFrames
             return state.continuation
         }
         if script.emitsFinal { continuation?.yield(.final(script.finalText)) }
-        if script.finishDelay > .zero { try? await Task.sleep(for: script.finishDelay) }
-        if script.finishesStream {
-            continuation?.finish()
-            state.withLock { $0.continuation = nil }
+        // **2 件目の確定。** 実機ではこれが 1 件目より後に届いて末尾が失われた（V-12）。
+        if let second = script.secondFinalText {
+            if script.secondFinalDelay > .zero {
+                try? await Task.sleep(for: script.secondFinalDelay)
+            }
+            continuation?.yield(.final(second))
         }
+        if script.finishesStream, script.endsStreamBeforeReturning { closeStream(continuation) }
+        if script.finishDelay > .zero { try? await Task.sleep(for: script.finishDelay) }
+        if script.finishesStream, !script.endsStreamBeforeReturning { closeStream(continuation) }
+    }
+
+    private func closeStream(
+        _ continuation: AsyncThrowingStream<TranscriptionUpdate, Error>.Continuation?
+    ) {
+        continuation?.finish()
+        state.withLock { $0.continuation = nil }
     }
 }
 
@@ -260,6 +291,16 @@ final class RecordingInserter: TextInserting, @unchecked Sendable {
 final class SpyRefiner: Refining, @unchecked Sendable {
 
     private let calls = Mutex<[String]>([])
+    /// **渡された打ち切りの値。**
+    ///
+    /// 記録していなかった頃、`startRefinement` の
+    /// `refinementApplyMode == .afterInsert ? revisionDeadline : refinementTimeout` の
+    /// **三項を逆にする変異が全件緑のまま生き残った**（視点4 の変異 A2）。
+    /// 逆にすると (a) の分岐が 3000 ms ではなく 750 ms で打ち切られ、
+    /// **約 40 字を超える発話では整形がほぼ必ず落ちる**——
+    /// フェーズ 2 が (a) を作って解こうとした問題そのものが戻る。
+    /// **代役が記録していない引数は、何を渡しても検査が通る。**
+    private let timeoutCalls = Mutex<[Duration]>([])
     private let result: String?
     private let delay: Duration
 
@@ -269,6 +310,8 @@ final class SpyRefiner: Refining, @unchecked Sendable {
     }
 
     var refinedInputs: [String] { calls.withLock { $0 } }
+    /// 渡された打ち切り（上の注記）。
+    var refineTimeouts: [Duration] { timeoutCalls.withLock { $0 } }
     var prewarmCount: Int { prewarms.load(ordering: .relaxed) }
     private let prewarms = Atomic<Int>(0)
 
@@ -287,6 +330,7 @@ final class SpyRefiner: Refining, @unchecked Sendable {
         _ raw: String, locale: Locale, terms: [VocabularyTerm], timeout: Duration
     ) async -> String? {
         calls.withLock { $0.append(raw) }
+        timeoutCalls.withLock { $0.append(timeout) }
         guard let result else { return nil }
         return await withTimeout(timeout) { [delay] in
             try? await Task.sleep(for: delay)

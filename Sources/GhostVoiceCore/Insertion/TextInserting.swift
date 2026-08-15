@@ -30,11 +30,60 @@ public protocol PrimaryInserting: Sendable {
     /// 次の段のコストへ丸ごと上乗せされる。挿入の予算は NFR-P5 の 50 ms しかない。
     func canInsert() -> Bool
 
-    /// 挿入を試みる。成功したら true。
+    /// 挿入を試みる。
+    ///
+    /// **戻り値が `Bool` ではないのは、差し替え（FR-5(a) / FR-7）に「どのプロセスの・
+    /// どの要素の・どの範囲へ書いたか」が要るためである**（設計 codex §2.2 の表:
+    /// `Bool` では配送確認・pid・範囲・後から置換できるかを 1 つも表せない）。
+    /// 錨を返せない段は `.inserted(anchor: nil)` を返す。**挿入は成功している。**
     ///
     /// - Important: `canInsert()` が false を返した段でこれを呼んではならない。
     ///   AX 経路では対象外の要素への書き込みを意味する。
-    func tryInsert(_ text: String) async -> Bool
+    func tryInsert(_ text: String) async -> InsertionAttempt
+
+    /// **挿入する前に、「後から差し替えられる見込みか」を答える**（FR-5(a) の分岐判定）。
+    ///
+    /// **見込みであって保証ではない。** 真を返しても錨が取れないことはある
+    /// （キャレットが読めない相手など）。その場合の縮退は「整形が反映されないまま
+    /// 生テキストが残る」で、(b) の分岐で整形が打ち切られたときと同じ結末になる。
+    ///
+    /// **偽を返す側は正確でなければならない。** 偽なのに真を返すと、(a) を選んだ
+    /// 発話が整形をまったく受け取れなくなる（挿入済みなので (b) へは戻れない）。
+    ///
+    /// 既定は false。**錨を返せない段は何も実装しなくてよい。**
+    func canCaptureAnchor() -> Bool
+}
+
+extension PrimaryInserting {
+    /// 既定は「差し替えられない」。Pasteboard 経路のように範囲を持てない段はこのまま。
+    public func canCaptureAnchor() -> Bool { false }
+}
+
+/// 差し替えの錨まで返せる挿入の口。
+///
+/// **`TextInserting.insert(_:)` はここから導出する**（下の既定実装）。
+/// 2 つの経路を別々に実装すると、片方だけ直したときに挙動が割れる。
+public protocol AnchoringTextInserting: TextInserting {
+    /// テキストを挿入し、経路と**差し替えの錨**を返す。
+    func insertCapturingAnchor(_ text: String) async -> AnchoredInsertion
+
+    /// **挿入の前に、この発話を (a) の分岐へ載せてよいかを答える**（FR-5 の細目）。
+    ///
+    /// **この判定は挿入より前に要る。** 挿入してしまってから「錨が取れなかった」と
+    /// 判っても、(b)（整形を待ってから挿入する）へは戻れない——生テキストが既に
+    /// 欄にあるので、整形結果を入れる手段が差し替えしか無いためである。
+    ///
+    /// - Important: **AX の往復を伴う**（実測 0.1〜5.5 ms / 往復）。
+    ///   (a) の分岐ではこの費用が NFR-P6a の予算に乗る（合計は未実測。検証項目 V-28）。
+    /// - Note: 真を返しても錨が取れないことはある（`PrimaryInserting.canCaptureAnchor()`）。
+    func canCaptureAnchor() -> Bool
+}
+
+extension AnchoringTextInserting {
+    /// **錨を捨てるだけの薄い包み。** 挿入の手順は 1 つしかない。
+    public func insert(_ text: String) async -> InsertionOutcome {
+        await insertCapturingAnchor(text).outcome
+    }
 }
 
 /// 最後の砦。挿入が全滅したときに、発話をクリップボードへ残す。
@@ -77,10 +126,20 @@ public struct StubInserter: PrimaryInserting {
     public let calls = Calls()
     private let canInsertValue: Bool
     private let succeeds: Bool
+    private let anchor: ReplacementAnchor?
+    private let canCaptureAnchorValue: Bool?
 
-    public init(canInsert: Bool, succeeds: Bool) {
+    /// - Parameter anchor: 成功時に返す差し替えの錨。既定は nil（＝差し替えられない段）。
+    /// - Parameter canCaptureAnchor: 事前判定の答え。省略すると `anchor != nil` に従う
+    ///   （**判定と実際が食い違う相手**を作りたいときだけ明示する）。
+    public init(
+        canInsert: Bool, succeeds: Bool, anchor: ReplacementAnchor? = nil,
+        canCaptureAnchor: Bool? = nil
+    ) {
         self.canInsertValue = canInsert
         self.succeeds = succeeds
+        self.anchor = anchor
+        self.canCaptureAnchorValue = canCaptureAnchor
     }
 
     public func canInsert() -> Bool {
@@ -88,9 +147,13 @@ public struct StubInserter: PrimaryInserting {
         return canInsertValue
     }
 
-    public func tryInsert(_ text: String) async -> Bool {
+    public func canCaptureAnchor() -> Bool {
+        canCaptureAnchorValue ?? (anchor != nil)
+    }
+
+    public func tryInsert(_ text: String) async -> InsertionAttempt {
         calls.recordTryInsert(text)
-        return succeeds
+        return succeeds ? .inserted(anchor: anchor) : .failed
     }
 }
 
@@ -100,14 +163,22 @@ public struct StubInserter: PrimaryInserting {
 /// 合成器が書き込む記録が別物になる（`#expect(clipboard.left == [...])` が常に空を見る）。
 public final class StubClipboard: ClipboardLeaving {
     private let texts = Mutex<[String]>([])
+    private let succeeds: Bool
 
-    public init() {}
+    /// - Parameter succeeds: `leave` が成功したと答えるか。
+    ///   **false にできることが要る**——実装が戻り値を捨てていると、
+    ///   「クリップボードへ残した」が嘘になる経路を検査から駆動できない
+    ///   （最終レビュー A-2。常に true を返す代役しか無かったために見逃した）。
+    public init(succeeds: Bool = true) {
+        self.succeeds = succeeds
+    }
 
-    /// 残されたテキスト。
+    /// 残されたテキスト。**置けなかったものは含まない。**
     public var left: [String] { texts.withLock { $0 } }
 
     @discardableResult
     public func leave(_ text: String) -> Bool {
+        guard succeeds else { return false }
         texts.withLock { $0.append(text) }
         return true
     }

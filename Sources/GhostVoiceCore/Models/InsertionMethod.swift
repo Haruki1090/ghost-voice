@@ -9,7 +9,8 @@ public enum InsertionMethod: String, Codable, Sendable {
     case pasteboard
     /// 挿入に失敗し、クリップボードへ残すのみに留めた
     case clipboardOnly
-    /// 挿入していない。**ESC で中断された発話**がこれになる。
+    /// 挿入していない。**ESC で中断された発話**と、
+    /// **どの経路でも挿入できずクリップボードへも残せなかった発話**がこれになる。
     ///
     /// 基本設計書 §4 は「中断時、録音済み内容は破棄せず履歴に残す」と定めている。
     /// 中断された発話は一度も挿入経路を通っていないので、`.ax` / `.pasteboard` /
@@ -19,6 +20,10 @@ public enum InsertionMethod: String, Codable, Sendable {
     ///
     /// 整形も経ていないため `refinedText` は nil であり、`undoCandidate` の
     /// 対象にはならない（戻すべき挿入が存在しない）。効くのは FR-9 の再挿入だけである。
+    ///
+    /// **差し替え（FR-5(a) / FR-7）の観点でも同じである。** 差し替えハンドルは
+    /// `.ax` 経路でしか作られないので、この経路の発話を戻そうとする道が構造的に無い
+    /// （要件定義書 §2.8.6 / 詳細設計書 §8.3）。
     case notInserted
 }
 
@@ -39,16 +44,46 @@ public enum InsertionOutcome: Sendable, Equatable {
     /// 理由は `CompositeInserter.insert(_:)` を参照。
     case refusedSecureInput
 
-    /// 履歴に記録してよい経路。拒否のときは nil。
+    /// **どの経路でも挿入できず、最後の砦（クリップボードへの残置）も失敗した。**
+    ///
+    /// `.inserted(.clipboardOnly)` と混ぜてはならない。あちらは
+    /// 「クリップボードへ残した」という主張であり、利用者は ⌘V で取り出せる。
+    /// こちらは**テキストが欄にもクリップボードにも無い**——
+    /// **履歴が最後の写しである**（したがって `recordableMethod` は nil ではない）。
+    ///
+    /// 以前はこのケースが無く、`CompositeInserter` が
+    /// `lastResort.leave(text)` の戻り値を捨てて `.inserted(.clipboardOnly)` を
+    /// 返していた。**置けていなくても「⌘V で貼れます」と告げ、
+    /// 履歴書き込みも失敗すると嘘を言ったうえで発話が完全に消えた**（最終レビュー A-2）。
+    case failedEverywhere
+
+    /// 履歴に記録してよい経路。**secure input の拒否のときだけ nil。**
     ///
     /// 記録側はこれを開いてから `HistoryEntry` を作ること。
     /// ```swift
     /// guard let method = outcome.recordableMethod else { return }  // 拒否は記録しない
     /// ```
+    ///
+    /// - Important: `.failedEverywhere` は nil ではない。**テキストがどこにも無いからこそ、
+    ///   履歴に残さなければ発話が完全に消える。**
     public var recordableMethod: InsertionMethod? {
         switch self {
         case .inserted(let method): method
+        case .failedEverywhere: .notInserted
         case .refusedSecureInput: nil
+        }
+    }
+
+    /// **テキストが利用者の手元（挿入先の欄かクリップボード）にあるか。**
+    ///
+    /// 履歴へ書けなかったときの文言を分けるために要る——
+    /// `SessionFailure.historyUnavailable(insertedElsewhere:)` は
+    /// 「失うのは履歴と Undo だけ」と「発話そのものが失われた」を区別しており、
+    /// **利用者にとって意味がまったく違う。**
+    public var leftTextWithUser: Bool {
+        switch self {
+        case .inserted: true
+        case .failedEverywhere, .refusedSecureInput: false
         }
     }
 }
