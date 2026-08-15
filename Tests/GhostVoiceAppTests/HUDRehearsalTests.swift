@@ -53,8 +53,34 @@ struct HUDRehearsalTests {
     /// **既定の秒数で筋書きを一巡できる。** 一巡しないと、後ろの表示を誰も見ない。
     @Test("既定の秒数で筋書きが一巡する")
     func defaultDurationCoversOnePass() {
-        let total = HUDRehearsal.script.reduce(Duration.zero) { $0 + $1.duration }
+        let total = (HUDRehearsal.wiringScript.reduce(Duration.zero) { $0 + $1.duration })
+            + (HUDRehearsal.script.reduce(Duration.zero) { $0 + $1.duration })
         #expect(total < .seconds(AppLaunchOptions.defaultHUDRehearsalSeconds))
         #expect(total > .seconds(5))
+    }
+
+    // MARK: - 配線を通す筋書き
+
+    /// **`--hud-check` が製品の経路を 1 行も通らないままだった**（2026-08-15 の実機欠陥）。
+    ///
+    /// 素振りが `HUDPanel.render` を直に叩いていたため、`--hud-check` が緑でも
+    /// 「録音では出ない」を切り分けられなかった。**録音の入口の状態を必ず含めること。**
+    @Test("配線の筋書きは録音の状態から始まる（製品と同じ入口）")
+    func wiringScriptStartsWithRecording() {
+        let first = try? #require(HUDRehearsal.wiringScript.first)
+        #expect(first?.event == .state(.recording(volatileText: "")))
+    }
+
+    /// **音量も配線の一部である**（`levelStream()` は状態とは別の口）。
+    @Test("配線の筋書きは音量も通す")
+    func wiringScriptCoversLevel() {
+        #expect(
+            HUDRehearsal.wiringScript.contains { if case .level = $0.event { true } else { false } })
+    }
+
+    /// **`.idle` で終わらないと、素振りの後に表示が残る。**
+    @Test("配線の筋書きは待機で終わる")
+    func wiringScriptEndsIdle() {
+        #expect(HUDRehearsal.wiringScript.last?.event == .state(.idle))
     }
 }
