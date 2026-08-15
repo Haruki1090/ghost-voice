@@ -45,11 +45,16 @@ public enum HUDWindowContract {
     /// Ghost Voice は決して活性化しないので HUD が一度も見えない。
     public static let hidesOnDeactivate = false
 
-    /// **クリックも奪わない。** notch の左右は透明にしてあるが、
+    /// **クリックも奪わない。**
+    ///
+    /// 窓は島より大きい（`HUDIslandMetrics.maximumSize`）ので、**島の外はすべて透明**である。
     /// 透明でもマウスを受けると**メニューバーが押せなくなる。**
+    ///
+    /// さらに**島そのものがメニューバーの帯の一部を覆う**（`HUDIslandMetrics` の
+    /// 「引き換えにしたもの」）。ここが true である限り、**隠れている項目もそのまま押せる。**
     public static let ignoresMouseEvents = true
 
-    /// 切り欠きの左右を透かすので不透明にはできない。
+    /// 島の外を透かすので不透明にはできない。
     public static let isOpaque = false
 
     /// notch に固定する。
@@ -57,27 +62,24 @@ public enum HUDWindowContract {
 
     /// 影は落とさない（メニューバーの上に影が出る）。
     public static let hasShadow = false
-}
 
-/// HUD の寸法。**どれも実測値ではなく、見た目の決めごとである。**
-public enum HUDMetrics {
-    /// 切り欠きの下に置く中身の高さ。
+    /// **窓の出し入れを AppKit にアニメーションさせない。**
     ///
-    /// 切り欠きの帯の高さはここには無い。**画面から取る**（`safeAreaInsets.top`。
-    /// 実測 38.0。フォールバック表示では帯そのものが無いので 0）。
-    public static let contentHeight: CGFloat = 40
-    /// 畳んでいるときの幅の下限。切り欠きより狭くはならない（実測 221 pt）。
-    public static let compactWidth: CGFloat = 200
-    /// 広げたときの幅。
+    /// `NSPanel` の既定（`.utilityWindow`）は order-in のたびに**縮小＋淡入**を掛ける。
+    /// **実測（2026-08-15 / Mac15,3 / M3 / macOS 26.5.2 / `--hud-check`）**では、
+    /// その途中の窓が `CGWindowListCopyWindowInfo` に
     ///
-    /// **切り欠きの帯そのものは広がらない**（左右にはメニューバーが居る。詳細設計書 §7.2）。
-    /// 広がるのは帯より下だけなので、メニュー項目もステータス項目も隠さない。
-    public static let wideWidth: CGFloat = 460
-
-    /// 表示に応じた幅。
-    public static func width(for display: HUDDisplay) -> CGFloat {
-        display.wantsWideLayout ? wideWidth : compactWidth
-    }
+    /// ```
+    /// 641,0 521x106 alpha 1.0        ← 落ち着いた姿
+    /// 646,1 511x104 alpha 0.0005     ← 淡入の途中。**y が 1 になっている**
+    /// ```
+    ///
+    /// として現れた。**y が 1 になるのは、島が画面の一番上から 1 pt 離れるということ**である。
+    /// 切り欠きと一体に見せる形では、この 1 pt の隙間が「浮いた板」として目に付く。
+    ///
+    /// - Note: 形が変わるときのアニメーションは**別物**である（`HUDIslandMetrics.expansionSeconds`。
+    ///   SwiftUI の中で島の矩形だけが動く）。ここで止めるのは**窓そのものの出し入れ**だけ。
+    public static let animationBehavior: NSWindow.AnimationBehavior = .none
 }
 
 /// 音量バーの見せ方。**純粋な変換。**

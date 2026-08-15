@@ -362,25 +362,44 @@ public enum HUDRehearsal {
     ///
     /// 利用者が目視で確かめるもの（README の手順）:
     ///
-    /// - 切り欠きの直下に帯が出るか（V-20。**切り欠きそのものに画素があるかは未実測**）
-    /// - 切り欠きの左右のメニューバーが隠れていないか
+    /// - **1 枚の黒い島に見えるか**（切り欠きが島の中に埋まっているか。V-20。
+    ///   **切り欠きそのものに画素があるかは未実測**だが、**どちらでも島に見えるはず**である）
+    /// - **形が滑らかに広がって縮むか**（畳んだ島 ↔ 広げた島）
+    /// - **暫定テキストが複数行見えるか**（最大 `HUDIslandMetrics.volatileLineLimit` 行）
     /// - Space を切り替えても、他アプリをフルスクリーンにしても出続けるか（V-21）
     /// - 外部ディスプレイを繋いでも**内蔵**に出るか（FR-3）
     public static let script: [Step] = [
         Step(
             display: .recording(
                 HUDRecording(level: 0.02, languageBadge: "日", volatileText: "")),
-            duration: .milliseconds(700), note: "録音中（無音）"),
+            duration: .milliseconds(700), note: "録音中（無音・畳んだ島）"),
         Step(
             display: .recording(
                 HUDRecording(level: 0.12, languageBadge: "日", volatileText: "これは表示の確認です")),
-            duration: .milliseconds(700), note: "録音中（暫定テキストあり）"),
+            duration: .milliseconds(700), note: "録音中（暫定テキストあり・島が広がる）"),
         Step(
             display: .recording(
                 HUDRecording(
                     level: 0.22, languageBadge: "日",
-                    volatileText: "これは表示の確認です。切り欠きの左右にメニューバーが見えていることを確かめてください")),
+                    volatileText: "これは表示の確認です。島が 1 枚の黒い面に見えているか、切り欠きが島の中に埋まっているかを確かめてください")),
             duration: .seconds(1), note: "録音中（大音量・長い暫定テキスト）"),
+        // **複数行が見えることの確認**（利用者の「1 行分しか見えない」への対応）。
+        // 上限（`HUDIslandMetrics.volatileLineLimit` 行）を超えても
+        // **島がそれ以上高くならない**ことを、ここで目に見える形にしている。
+        Step(
+            display: .recording(
+                HUDRecording(
+                    level: 0.18, languageBadge: "日",
+                    volatileText:
+                        "行数の上限の確認です。ここから長い発話が続きます。暫定テキストは末尾を見せるので、"
+                        + "喋るほどに先頭が省略されていきます。上限を超えても島はこれ以上高くなりません。"
+                        + "画面を覆わないための決めごとです。")),
+            duration: .milliseconds(1400), note: "録音中（行数の上限。島はこれ以上高くならない）"),
+        // **縮むところを見せる。** 広がるだけでは形が変わったことが判らない。
+        Step(
+            display: .recording(
+                HUDRecording(level: 0.05, languageBadge: "日", volatileText: "")),
+            duration: .milliseconds(700), note: "録音中（無音へ戻る・島が縮む）"),
         Step(display: .processing(.finalizing), duration: .milliseconds(500), note: "確定中"),
         Step(display: .processing(.refining), duration: .milliseconds(500), note: "整形中"),
         Step(display: .processing(.inserting), duration: .milliseconds(500), note: "挿入中"),

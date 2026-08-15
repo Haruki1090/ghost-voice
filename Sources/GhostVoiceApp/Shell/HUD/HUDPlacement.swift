@@ -95,6 +95,25 @@ public struct HUDPlacement: Sendable, Equatable {
         "x \(rect.minX), y \(rect.minY), w \(rect.width), h \(rect.height)"
     }
 
+    /// **窓の矩形。表示が変わっても動かない。**
+    ///
+    /// どの表示でも収まる大きさ（`HUDIslandMetrics.maximumSize`）で作る。
+    /// **窓は透明でクリックも透かす**ので、島より大きくても見た目にも操作にも出ない。
+    /// 代わりに `setFrame` が表示の変わり目で 1 度も走らなくなる——
+    /// 動くのは SwiftUI の中の島の矩形 1 つだけになる（メインスレッドの予算。詳細設計書 §7.4）。
+    public var windowFrame: CGRect {
+        let maximum = HUDIslandMetrics.maximumSize(
+            notchWidth: notchBandWidth, bandHeight: notchBandHeight)
+        return panelFrame(
+            width: maximum.width, contentHeight: maximum.height - notchBandHeight)
+    }
+
+    /// 表示に応じた**島**の大きさ（窓ではない）。
+    public func islandSize(for display: HUDDisplay) -> CGSize {
+        HUDIslandMetrics.size(
+            for: display, notchWidth: notchBandWidth, bandHeight: notchBandHeight)
+    }
+
     /// パネルの矩形を作る。
     ///
     /// - Parameters:

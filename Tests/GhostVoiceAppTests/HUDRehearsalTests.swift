@@ -60,6 +60,45 @@ struct HUDRehearsalTests {
         #expect(total > .seconds(5))
     }
 
+    // MARK: - 島（形が変わること）
+
+    /// **形が変わることがダイナミックアイランドの要点である。**
+    ///
+    /// 筋書きが広げた島しか出さなければ、利用者は「広がる／縮む」を一度も見ない。
+    /// **広げた島から畳んだ島へ戻る並びが少なくとも 1 度あること**を固定する。
+    @Test("素振りは島が広がるところと縮むところを両方見せる")
+    func scriptShowsTheIslandGrowAndShrink() {
+        let widths = HUDRehearsal.script.map {
+            HUDIslandMetrics.width(for: $0.display, notchWidth: 221)
+        }
+        var grew = false
+        var shrank = false
+        for (previous, next) in zip(widths, widths.dropFirst()) {
+            if next > previous { grew = true }
+            if next < previous { shrank = true }
+        }
+        #expect(grew, "島が広がるところが筋書きに無い: \(widths)")
+        #expect(shrank, "島が縮むところが筋書きに無い: \(widths)")
+    }
+
+    /// **行数の上限を超える長さの暫定テキストを 1 度は出す。**
+    ///
+    /// 上限（`HUDIslandMetrics.volatileLineLimit` 行）を置いたのは
+    /// 「長い発話で画面を覆わない」ためであり、**効いていることは目視でしか判らない。**
+    /// 見せる材料が筋書きに無ければ、誰も確かめられない。
+    @Test("素振りは行数の上限を超える長さの暫定テキストを出す")
+    func scriptShowsTextLongerThanTheLineLimit() {
+        let longest =
+            HUDRehearsal.script.compactMap { step -> Int? in
+                if case .recording(let recording) = step.display {
+                    return recording.volatileText.count
+                }
+                return nil
+            }.max() ?? 0
+        // **文字数の線は要件値ではない。** 「3 行に収まりきらない量」の目安である。
+        #expect(longest > 60, "行数の上限を確かめられる長さの暫定テキストが無い（最長 \(longest) 文字）")
+    }
+
     // MARK: - 配線を通す筋書き
 
     /// **`--hud-check` が製品の経路を 1 行も通らないままだった**（2026-08-15 の実機欠陥）。
