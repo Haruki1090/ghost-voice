@@ -356,20 +356,82 @@ open "/Applications/Ghost Voice.app"
 
 ### V-34: 発話の途中の終了要求で発話が失われないか
 
-#### 【防御済み・確認のみ】
+#### 【実施済み（2026-08-15 / M3 / macOS 26.5.2）。ただし実発話の 1 回は残っている】
 
-**何を確かめるのか。** 録音中に終了要求（⌘Q / SIGTERM）が来たとき、**進行中の発話を
-最後まで見届けてから終了するか。**
+**何を確かめるのか。** 終了要求（⌘Q / SIGTERM / `osascript` の quit / ログアウト）が
+来たとき、**進行中の発話を最後まで見届けてから終了するか。**
 
 **なぜ重要か。** 挿入の途中でプロセスが落ちると、**⌘V の送出後・クリップボードの復元前**で
 テキストがどこにも残らない。**発話が消える経路である。**
 
 **防御の形**: `applicationShouldTerminate` が `.terminateLater` を返し、
 `GhostVoiceCore.Shutdown.perform` が待機へ戻るまで待ってからホットキーを止める
-（**CLI と同じ 1 つの実装**）。`--shell-only` では発話が無いのでこの経路を通らない——
-**実発話でしか確認できない。**
+（**CLI と同じ 1 つの実装**）。
 
-#### 手順
+> #### この項目の前提が一度崩れた（`bug-term`。2026-08-15）
+>
+> **「`--shell-only` では発話が無いのでこの経路を通らない——実発話でしか確認できない」**
+> と書いてあったため、**この項目は実バンドルで一度も測られないまま出荷された。**
+> その結果、利用者の実機で **`Ghost Voice.app` が `SIGTERM` でも `pkill` でも
+> 終了しなくなった**（`kill -9` しか効かない）。発話は 1 つも抱えていなかった。
+>
+> 原因はシグナルの受け口が `DispatchSource(queue: .main)` だったこと。
+> ハンドラが**メインキューのブロックとして**走り、その中で `.terminateLater` の
+> 入れ子のランループへ入るので、**返事を出す `Task`（＝メインキュー）が永久に走らない。**
+> libdispatch はメインキュー排出中の再入を拒む（`MainRunLoopHop` の注記に実測表がある）。
+>
+> **この文書の書き方そのものが欠陥の温床だった。** そこで
+> **マイクにもキー監視にも触らずにこの経路を通す入口 `--shutdown-check` を足した。**
+> 以下の手順はそれを使う。
+
+#### 手順 A: 終了要求が効くか（**TCC に触れない。何度でも回せる**）
+
+```bash
+Scripts/make-app.sh --debug --output /tmp/gv-check
+# 抱えていないときの終了
+open -n "/tmp/gv-check/Ghost Voice.app" --args --shutdown-check=0
+# 発話を 3 秒抱えたまま終了要求を受ける
+open -n "/tmp/gv-check/Ghost Voice.app" --args --shutdown-check=3
+```
+
+起動したら、別のターミナルから終了要求を送って**所要時間を測る**:
+
+```bash
+PID=$(pgrep -f "gv-check/Ghost Voice.app/Contents/MacOS/GhostVoice" | head -1)
+time kill -TERM $PID                        # SIGTERM
+osascript -e 'tell application id "com.haruki1090.GhostVoice" to quit'   # ⌘Q・ログアウト相当
+/usr/bin/log show --last 2m --info --debug \
+  --predicate "subsystem == \"com.haruki1090.GhostVoice\" AND processIdentifier == $PID" \
+  --style compact
+```
+
+**判定**:
+
+- `--shutdown-check=0`: **1 秒以内に終わること**
+- `--shutdown-check=3`: **約 3 秒待ってから終わること**（＝抱えていた発話を見届けた）
+- ログに `[終了] 進行中の発話を待っています…` → `[素振り] run() が戻りました` →
+  `[終了] Ghost Voice を終了しました。` が**この順で並ぶこと**
+
+**実測（2026-08-15 / M3 / macOS 26.5.2 / debug ビルドの実バンドル）**:
+
+| 終了要求 | 修正前 | 修正後 `=0` | 修正後 `=3` |
+|---|---|---|---|
+| `SIGTERM`（`kill -TERM` / `pkill`） | **終わらない**（30 秒待って `kill -9`） | 0.13 秒 | 3.15 秒 |
+| `SIGINT`（Ctrl-C 相当） | **終わらない** | 0.18 秒 | 3.16 秒 |
+| `osascript` の quit（＝ログアウト・⌘Q と同じ Apple Event 経路） | 0.24 秒（**効いていた**） | 0.23 秒 | 3.34 秒 |
+| ⌘Q（メニューバー項目「Ghost Voice を終了」） | **未実測** | **未実測** | **未実測** |
+
+> **⌘Q が未実測な理由。** `LSUIElement` なのでアプリは活性化せず、⌘Q が届くのは
+> **メニューバーのメニューを開いている間だけ**である。打鍵の送出には `CGEvent.post` が要り、
+> 利用者の実機では禁止されている。**経路としては `osascript` と同じ**
+> （どちらもメニュー動作・Apple Event というランループのイベント配送から
+> `NSApp.terminate(nil)` を呼ぶ）ため、この欠陥の影響は受けない——
+> 実際、修正前でも `osascript` は効いていた。
+
+#### 手順 B: 実発話での 1 回（**これは今も実発話でしか測れない**）
+
+手順 A は「終了の段取りが通ること」を測る。**本物の確定・整形・挿入が
+猶予の中で完走することは、実発話でしか測れない。**
 
 ```bash
 open "/Applications/Ghost Voice.app"

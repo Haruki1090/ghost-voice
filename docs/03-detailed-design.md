@@ -99,6 +99,10 @@ ghost-voice/
 │   │   ├── GhostVoiceAppMain.swift     Main/main.swift が委譲する実体（NSApplication.run() を呼ぶ）
 │   │   ├── GhostVoiceAppDelegate.swift 起動と終了の順序。**終了は素通ししない**（§13 の V-34）
 │   │   ├── AppSessionRuntime.swift    常駐セッションの持ち主。終了は Core の段取りを通す
+│   │   ├── MainRunLoopHop.swift       メインへ仕事を渡す唯一の作法。**DispatchQueue.main.async
+│   │   │                              を使ってはならない**（§13 の V-34。実機で 17 分止まった）
+│   │   ├── ShutdownRehearsal.swift    終了の素振り（--shutdown-check）。マイクにもキー監視にも
+│   │   │                              触らずに「発話を抱えたままの終了」を通す
 │   │   ├── AppPermissions.swift       許可の**要求**と設定ペインを開くこと
 │   │   │                              （**照会は Core の PermissionInquiry**）
 │   │   ├── AppPermissionGuidance.swift 権限の案内（許可の相手は Ghost Voice 自身）
@@ -3254,7 +3258,7 @@ PTT の 1 発話は数秒であり、確定までのレイテンシは V-2 の�
 | V-31 | **実マイク・肉声での M2（現行定義: キー解放 → 結果ストリームの終端）と NFR-P3** | 利用者が実施（V-3 / V-4 と同じ機会） | **未実施。** 代役（フィクスチャ音声の実時間再生）での実測は 中央値 75.9 ms（低負荷）／ 82.5 ms（負荷下）、最大 155.1 ms（§10）。**保守的な上限 199 ms は NFR-P3（200 ms）の 1 ms 手前**だが、これは別々の計測の最悪値を足した値で、同時に起こることは確認していない。**121 字級の長い肉声で、暫定表示の末尾と挿入テキストの末尾が一致することを併せて見る**（V-12 の修正が実機で効いているかの確認）。手順は引き渡し手順書（`docs/04-handover-verification.md`）の段 4 と同じ |
 | V-32 | **起動直後に押した場合の M1a**（捨て往復の残りを待つ経路） | 利用者が実施（V-9 と同じ機会。`GHOST_VOICE_MIC_TESTS=1`） | **未実施。** 起動時の捨て往復は `finalizeTask` の枠に入れてあり、**起動直後の押下だけが `drainFinalizeTask()` でその残りを待つ**（§10）。捨て往復の各要素は測ってある（`begin()` 中央値 37.2 ms（低負荷）／ 158.5 ms（負荷下）、入力ゼロの `finish()` 中央値 0.33 / 0.73 ms）が、**M1a の計測区間（キー押下 → タップ武装）には実マイクが要る**ため、起動直後に押した実際の M1a は未計測である |
 | V-33 | **ad-hoc 署名 + DR 固定（`-r='designated => identifier "…"'`）でも許可が残るか** | OSS 公開の前（証明書を持たない人の経路） | **未実施。** tccd が与えた DR をそのまま許可レコードの csreq に使うのか、独自に cdhash を含む要件を組み立てるのかが判っていない（`TCC.db` はフルディスクアクセスが無く読めない）。**残らないなら `--allow-adhoc` の警告文を「開発中の一時的な手段」に書き換える** |
-| V-34 | **発話の途中の終了要求（⌘Q / SIGTERM）で発話が失われないか（`.app` 版）** | V-19 の後 | **未実施。** `applicationShouldTerminate` は `.terminateLater` を返し、`GhostVoiceCore.Shutdown.perform` が待機へ戻るまで待ってからホットキーを止める（**CLI と同じ 1 つの実装**。門を持たない分、待つ根拠は `isBusy` だけ）。**器だけの起動（`--shell-only`）では発話が無いのでこの経路を通らない。** 実発話で確認が要る |
+| V-34 | **発話の途中の終了要求（⌘Q / SIGTERM）で発話が失われないか（`.app` 版）** | V-19 の後 | **一部実施（2026-08-15 / M3 / macOS 26.5.2）。** `applicationShouldTerminate` は `.terminateLater` を返し、`GhostVoiceCore.Shutdown.perform` が待機へ戻るまで待ってからホットキーを止める（**CLI と同じ 1 つの実装**。門を持たない分、待つ根拠は `isBusy` だけ）。**この項目が「実発話でしか通らない」とされていたため実バンドルで一度も測られず、`SIGTERM` でも `pkill` でも終了しない `.app` が出荷された**（`bug-term`。受け口が `DispatchSource(queue: .main)` で、メインキュー排出中に `.terminateLater` の入れ子のランループへ入り、返事を出す `Task` が永久に走らなかった）。**受け口を専用キューへ移し、メインへは `MainRunLoopHop`（`CFRunLoopPerformBlock`）で渡すよう直した。** 実測: SIGTERM / SIGINT / `osascript` の quit いずれも効き、発話を抱えていなければ 0.13〜0.23 秒、3 秒抱えていれば 3.15〜3.34 秒で終了する（`--shutdown-check` で測る。手順は引き渡し検証 §段 2）。**残り: 実発話での 1 回と、⌘Q の実打鍵**（`CGEvent.post` を使えないため未実測。経路は `osascript` と同じ） |
 | V-38 | **HUD の音量バーの振れ幅が肉声に合うか** | HUD の実機確認時 | **未実施。** 満振れとみなす RMS（`HUDLevelMeter.fullScaleRMS = 0.2`）は**実測値ではない**——肉声の RMS がどの範囲に収まるかを測っていない（マイクの許可が要る）。振れないか、すぐ振り切れるならこの数だけを直す。**外れても失うのは見た目だけ**である |
 | V-39 | **HUD を出した状態での M1a / M2**（HUD の描画が PTT の反応を鈍らせていないか） | V-19 の後（マイクとキー監視の許可が要る） | **未実施。** ランループ検証で「**メインスレッドを塞ぐと配送が p50 0.045 ms → 12.8 ms へ悪化する**」ことは実測されている。HUD 側は間引き（50 ms）・変化が無ければ再描画しない・継続アニメーションを置かない、で**悪化させうる経路を塞いだだけ**であり、**実際に悪化していないことは測っていない。** 測り方は既存の M1a / M2 の計測を HUD ありで回して、HUD 無し（`--shell-only` 相当）と比べる |
 | V-40 | **ディスプレイの抜き差しで HUD が付いていくか** | HUD の実機確認時 | **未実施。** `NSApplication.didChangeScreenParametersNotification` を購読して再配置する実装は入れてあるが、**通知が実際に来ることを確かめていない**（抜き差しの操作が要る）。来なければ HUD が古い座標に出続けるだけで、**挿入は壊れない。** 外部ディスプレイを抜き差しし、内蔵の切り欠きに出続けることを見る |

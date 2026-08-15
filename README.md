@@ -114,7 +114,15 @@ open ".build/app/Ghost Voice.app"                          # 通常起動
 open ".build/app/Ghost Voice.app" --args --shell-only      # 器だけ
 open ".build/app/Ghost Voice.app" --args --hud-check=60    # HUD の目視確認（60 秒）
 open ".build/app/Ghost Voice.app" --args --window-check=16 # 窓のフォーカスの確認
+open ".build/app/Ghost Voice.app" --args --shutdown-check=3 # 終了要求が効くかの確認
 ```
+
+`--shell-only` / `--hud-check` / `--window-check` / `--shutdown-check` は
+**マイクにもキー監視にも触らない**（TCC のダイアログが出る余地が無い）。
+
+`--shutdown-check=<秒>` は「その秒数だけ発話を抱えている」ことにして終了要求を待つ。
+`SIGTERM` / `osascript` の quit を送り、**抱えている間は終わらないこと**と
+**抱えていなければすぐ終わること**を測る（引き渡し検証 V-34）。
 
 起動時の案内（権限の 4 項目など）は**標準エラーと unified log の両方**へ出る。
 Finder から起動すると標準エラーはどこにも出ないので、こちらで読む:
